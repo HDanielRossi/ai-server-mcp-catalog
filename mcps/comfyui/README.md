@@ -1,10 +1,21 @@
 # ComfyUI MCP
 
-Estado: pendiente de selección.
+## Estado
 
-Objetivos:
+Activo.
 
-- enviar workflows mediante la API de ComfyUI;
-- consultar la cola;
-- recuperar resultados;
-- no modificar modelos ni custom nodes sin confirmación.
+## Objetivos
+
+- consultar estado del servidor ComfyUI;
+- listar nodos y modelos;
+- validar workflows;
+- ejecutar workflows;
+- consultar cola y resultados;
+- operar en modo remoto cuando ComfyUI corre dentro de Docker.
+
+## Instalación
+
+```bash
+./scripts/install-comfyui.sh
+
+
