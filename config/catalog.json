@@ -1,0 +1,31 @@
+{
+  "catalog_version": "0.1.0",
+  "target": "Ubuntu Server + Claude Code",
+  "mcps": [
+    {
+      "name": "filesystem",
+      "status": "active",
+      "risk": "medium"
+    },
+    {
+      "name": "github",
+      "status": "active",
+      "risk": "medium"
+    },
+    {
+      "name": "docker",
+      "status": "verify",
+      "risk": "high"
+    },
+    {
+      "name": "ssh",
+      "status": "planned",
+      "risk": "high"
+    },
+    {
+      "name": "comfyui",
+      "status": "planned",
+      "risk": "medium"
+    }
+  ]
+}
