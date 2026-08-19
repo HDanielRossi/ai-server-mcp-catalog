@@ -655,3 +655,43 @@ Operational rule confirmed:
 - After creating an implementation task through `pipeline_bridge`, default must stop and report the task ID.
 - Review must be created later, only after implementation has completed.
 - Correction must be created later, only after a completed reviewer task explicitly reports `CHANGES REQUIRED`.
+
+## qwen3.8:27b realistic pipeline validation: Flask ready endpoint
+
+Validated on:
+
+- Repository: `/opt/ai/projects/hermes-realistic-smoke`
+- Local model: `qwen3.8:27b`
+- Implementation task: `t_13a1c209`
+- Feature: `GET /ready`
+
+Implementation result:
+
+- `coder-claude` implemented `GET /ready` in `app.py`.
+- The endpoint returns JSON `{"ready": true}`.
+- `tests/test_app.py` includes `test_ready()`.
+- The test verifies `response.status_code == 200`.
+- The test verifies `response.get_json() == {"ready": True}`.
+- Pytest reported `4 passed`.
+
+Expected diff shape:
+
+- `app.py` modified.
+- `tests/test_app.py` modified.
+- No dependency files changed.
+- No documentation/configuration files changed.
+
+Pipeline validation:
+
+- `default/Discord` created only the implementation task.
+- `default/Discord` did not execute implementation directly.
+- `default/Discord` did not create review/correction in the same response.
+- `coder-claude` completed the implementation task.
+- `reviewer` completed formal review through `review_bridge`.
+- Final review verdict: `PASS`.
+
+Safety conclusion:
+
+The Hermes pipeline remains valid after switching the local model to `qwen3.8:27b`.
+
+The new local model respects the orchestrator/tool boundary, supports the planner/pipeline bridge flow, and works with the isolated reviewer workflow on a realistic non-critical Flask repository.
