@@ -49,6 +49,16 @@ else
 fi
 
 echo
+echo "5b) reviewer should NOT expose Memory:"
+if reviewer tools --summary | grep -q 'Memory'; then
+  echo "FAIL: reviewer exposes Memory"
+  reviewer tools --summary | sed -n '1,120p'
+  exit 1
+else
+  echo "OK: reviewer Memory tool not exposed"
+fi
+
+echo
 echo "6) repo cleanliness:"
 for repo in /opt/ai/projects/agent-pipeline-test /opt/ai/projects/ai-server-mcp-catalog; do
   echo
