@@ -173,7 +173,6 @@ Expected reviewer tools:
 ```text
 clarify
 kanban
-memory
 review_bridge
 ```
 
@@ -182,6 +181,25 @@ Mandatory rule:
 ```text
 The reviewer must not complete a Kanban review task with PASS or CHANGES REQUIRED unless the same session contains a successful mcp__review_bridge__collect call.
 ```
+
+## Reviewer memory isolation
+
+The reviewer profile must not expose or use Memory during review tasks.
+
+Expected reviewer tools:
+
+```text
+clarify
+kanban
+review_bridge
+```
+
+Isolation requirements:
+
+- Memory must not appear in `reviewer tools --summary`.
+- The reviewer must use only `mcp__review_bridge__collect` for review evidence.
+- The reviewer must not use `mcp__review_bridge__read_resource` or `mcp__review_bridge__list_resources`.
+- The reviewer must not save, search, or persist memory during reviews.
 
 ## Default async boundary
 
