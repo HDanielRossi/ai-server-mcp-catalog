@@ -63,6 +63,17 @@ Responsibilities:
 - Preserve the workflow ownership under default.
 ```
 
+Important review idempotency rule:
+
+```text
+Review task idempotency must include implementation_task_id.
+
+Correct:
+key = stable_key(str(path), feature, f"review:{implementation_task_id}")
+```
+
+This prevents a review task created after a correction from accidentally reusing an older review task for the same feature.
+
 ### coder-claude
 
 Implementation worker.
@@ -172,6 +183,20 @@ Mandatory rule:
 The reviewer must not complete a Kanban review task with PASS or CHANGES REQUIRED unless the same session contains a successful mcp__review_bridge__collect call.
 ```
 
+## Default async boundary
+
+Default owns orchestration but must not execute worker responsibilities directly.
+
+Rules:
+
+```text
+- After creating an implementation task through pipeline_bridge, default must not call claude_bridge or review_bridge directly.
+- After creating a review task through pipeline_bridge, default must not call review_bridge directly.
+- Default may create a correction task only after a reviewer Kanban task has actually completed and its latest summary or result explicitly contains CHANGES REQUIRED.
+- Default must not create a correction task from its own direct evidence collection, parent summaries, assumptions, or incomplete worker state.
+- If implementation or review is still ready, todo, running, or pending, default must stop and report the real task IDs instead of continuing the workflow in the same Discord response.
+```
+
 ## Validated workflow behavior
 
 The pipeline has been validated with these development cases:
@@ -181,6 +206,7 @@ power    → implementation + review PASS
 square   → implementation + review CHANGES REQUIRED + correction + review PASS
 cube     → implementation + review PASS
 subtract → implementation + review PASS using isolated review_bridge
+modulo   → implementation + premature review + correction + final review PASS
 ```
 
 ## Full pipeline validation: subtract helper
@@ -277,6 +303,280 @@ Safety result:
 Reviewer is structurally isolated from direct terminal/file/code execution and validates through review_bridge evidence.
 ```
 
+## Review task body hardening
+
+pipeline_bridge review tasks must include explicit review_bridge evidence requirements.
+
+Required review task body language:
+
+```text
+- Use mcp__review_bridge__collect before giving any verdict.
+- Do not complete from parent summaries, recent work history, task text, memory, or assumptions alone.
+- Use this workdir for review_bridge: <workdir>
+- Use changed_paths from the implementation parent metadata when available.
+- If changed_paths are not available, use the files explicitly authorized by the implementation task or planner output.
+- If the changed files cannot be identified, block the task instead of guessing.
+- Run verification through review_bridge using:
+  .venv/bin/python -m pytest -q
+- Verify tests and scoped diff from review_bridge evidence.
+- If review_bridge is unavailable or fails, block the task and include the exact error.
+```
+
+Smoke validation:
+
+```text
+review_bridge_body_smoke_001
+```
+
+Smoke result:
+
+```text
+reviewer used mcp__review_bridge__collect
+pytest: 9 passed
+reviewer completed with PASS
+reviewer did not use Tool — terminal
+```
+
+## Full pipeline validation after pipeline_bridge review hardening: modulo helper
+
+Validated on:
+
+```text
+/opt/ai/projects/agent-pipeline-test
+```
+
+Feature:
+
+```text
+add_modulo_function
+```
+
+Initial implementation task:
+
+```text
+t_0c41d5b0
+```
+
+Initial review task:
+
+```text
+t_4d6a828e
+```
+
+Correction task:
+
+```text
+t_934dcfd9
+```
+
+Final review task after retry:
+
+```text
+t_0c8d7115
+```
+
+Final implementation result:
+
+```text
+modulo(a, b) added to app.py
+test_modulo() added to tests/test_app.py
+pytest: 10 passed
+review verdict: PASS
+```
+
+Exact implementation:
+
+```python
+def modulo(a, b):
+    return a % b
+```
+
+Exact tests:
+
+```python
+def test_modulo():
+    assert modulo(10, 3) == 1
+    assert modulo(14, 7) == 0
+    assert modulo(-10, 3) == 2
+    assert modulo(10.5, 4) == 2.5
+```
+
+Reviewer evidence path:
+
+```text
+reviewer
+→ mcp__review_bridge__collect
+→ kanban_complete
+```
+
+Final reviewer evidence:
+
+```text
+git status:
+ M app.py
+ M tests/test_app.py
+
+scoped diff:
+ app.py
+ tests/test_app.py
+
+pytest:
+ 10 passed in 0.01s
+```
+
+Safety validation:
+
+```text
+reviewer used mcp__review_bridge__collect
+reviewer did not use Tool — terminal
+review task body included mandatory review_bridge evidence requirements
+reviewer completed with PASS
+```
+
+Issues discovered during this test:
+
+```text
+1. Discord/default initially advanced the workflow too far in one response.
+2. A first review was created before the implementation had actually completed.
+3. pipeline_bridge review idempotency needed to include implementation_task_id to avoid review task reuse after correction.
+4. One reviewer run crashed with pid not alive, but retry completed successfully.
+```
+
+Current conclusion:
+
+```text
+The pipeline can complete implementation, correction, and final review with isolated reviewer evidence after retry.
+```
+
+## Known failure modes and fixes
+
+### 1. Fake tool-call text in Discord
+
+Symptom:
+
+```text
+Discord prints tool names such as mcpplanner_bridgerun or mcppipeline_bridgecreate_implementation_task as plain text.
+```
+
+Expected behavior:
+
+```text
+The exported session must show real Tool entries:
+Tool — mcp__planner_bridge__run
+Tool — mcp__pipeline_bridge__create_implementation_task
+```
+
+Fix:
+
+```text
+Add Real Tool Use Enforcement to default SOUL.
+Restart hermes-gateway.service.
+Run /reset in Discord.
+Verify exported session contains real Tool entries.
+```
+
+### 2. Default advances the pipeline too far
+
+Symptom:
+
+```text
+default creates implementation, review, correction, and another review in the same Discord response without waiting for workers.
+```
+
+Risk:
+
+```text
+reviewer may review before coder-claude has completed implementation.
+default may create correction from stale or incomplete state.
+```
+
+Fix:
+
+```text
+Add Async Kanban Boundary to default SOUL.
+Default must stop after creating worker tasks and report real task IDs.
+Default must only create correction after a completed reviewer task explicitly reports CHANGES REQUIRED.
+```
+
+### 3. Review idempotency collision
+
+Symptom:
+
+```text
+A review created after a correction reuses an older review task for the same feature.
+```
+
+Cause:
+
+```text
+create_review_task used a stable key based only on workdir + feature + review.
+```
+
+Fix:
+
+```python
+key = stable_key(str(path), feature, f"review:{implementation_task_id}")
+```
+
+### 4. Reviewer direct terminal use
+
+Symptom:
+
+```text
+Exported reviewer session shows:
+Tool — terminal
+```
+
+Fix:
+
+```text
+Disable terminal, file, code_execution, web, browser, delegation, todo, skills, session_search, and context_engine for reviewer.
+Connect review_bridge explicitly to reviewer profile.
+Add mandatory evidence rule to reviewer SOUL.
+```
+
+### 5. Reviewer completes without evidence
+
+Symptom:
+
+```text
+Reviewer completes with PASS but the exported session has no mcp__review_bridge__collect call.
+```
+
+Fix:
+
+```text
+Add Mandatory Evidence Before Verdict rule to reviewer SOUL.
+Reviewer must block if review_bridge is unavailable.
+Reviewer must not call kanban_complete unless the same session contains mcp__review_bridge__collect.
+```
+
+### 6. Reviewer crash
+
+Symptom:
+
+```text
+Kanban task status: blocked
+Run outcome: crashed
+Error: pid <pid> not alive
+```
+
+Observed example:
+
+```text
+t_2b2e7799 blocked
+run 53 crashed
+pid 60147 not alive
+```
+
+Fix:
+
+```text
+Check journalctl and dmesg for OOM or process kill.
+If no system-level error appears, create a clean retry review task with a new feature name and the same implementation_task_id.
+Do not commit until retry review completes with PASS.
+```
+
 ## Operational rule before using on production repositories
 
 Before moving this pipeline to a production or critical repository, run one safe task in a non-critical repo and verify:
@@ -288,6 +588,8 @@ Before moving this pipeline to a production or critical repository, run one safe
 - tests pass
 - git diff is scoped to authorized files
 - only expected files are modified
+- default does not execute worker responsibilities directly
+- review task idempotency includes implementation_task_id
 ```
 
 ## Current status
@@ -296,4 +598,7 @@ Before moving this pipeline to a production or critical repository, run one safe
 The Hermes development pipeline is validated in the laboratory repo.
 The reviewer isolation issue was found and corrected.
 The reviewer now collects evidence through review_bridge before completing.
+pipeline_bridge review task bodies now explicitly require review_bridge evidence.
+pipeline_bridge review idempotency was corrected to include implementation_task_id.
+The modulo validation confirmed implementation, correction, and final review with isolated reviewer evidence.
 ```
