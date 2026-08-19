@@ -23,6 +23,17 @@ Before using Hermes on a real repository, verify:
 - No automatic push is allowed.
 - No reset, revert, merge, rebase, force-push, dependency install, or history rewrite is allowed unless explicitly authorized.
 
+## Per-task production checklist
+
+- confirmar branch dedicada
+- confirmar working tree limpio antes de empezar
+- confirmar contrato Hermes del repo
+- confirmar archivos permitidos
+- confirmar comando de test
+- confirmar que default sólo crea implementation task y se detiene
+- confirmar review obligatoria antes de commit
+- confirmar que no hay push automático
+
 ## Recommended branch naming
 
 Use a dedicated branch per Hermes task:
