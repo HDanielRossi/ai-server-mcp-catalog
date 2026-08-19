@@ -602,3 +602,56 @@ pipeline_bridge review task bodies now explicitly require review_bridge evidence
 pipeline_bridge review idempotency was corrected to include implementation_task_id.
 The modulo validation confirmed implementation, correction, and final review with isolated reviewer evidence.
 ```
+
+## Discord/default async boundary validation: noop async smoke
+
+Validated on:
+
+- Repository: `/opt/ai/projects/agent-pipeline-test`
+- Feature: `add-noop-async-smoke`
+- Discord/default session: `20260819_093821_c78a5172`
+- Implementation task: `t_768b2a09`
+
+Purpose:
+
+- Verify that default/Discord creates only the implementation task.
+- Verify that default/Discord does not advance to review, correction, or final review in the same response.
+
+Expected default/Discord behavior:
+
+1. Call `mcp__planner_bridge__run`.
+2. Call `mcp__pipeline_bridge__create_implementation_task`.
+3. Return the real implementation task ID.
+4. Stop.
+
+Observed evidence:
+
+- `Tool — mcp__planner_bridge__run`
+- `Tool — mcp__pipeline_bridge__create_implementation_task`
+- `t_768b2a09`
+
+Negative evidence:
+
+- No `Tool — mcp__review_bridge__collect`
+- No `create_review_task`
+- No `create_correction_task`
+- No `kanban_complete`
+
+Implementation result:
+
+- `coder-claude` completed `t_768b2a09`.
+- `noop_async_smoke` was added to `app.py`.
+- A pytest test using `asyncio.run(noop_async_smoke())` was added.
+- Pytest reported `11 passed`.
+
+Safety conclusion:
+
+The default async boundary is validated.
+
+Discord/default can be used as the main pipeline entry point without immediately advancing into review or correction in the same response.
+
+Operational rule confirmed:
+
+- After creating an implementation task through `pipeline_bridge`, default must stop and report the task ID.
+- Review must be created later, only after implementation has completed.
+- Correction must be created later, only after a completed reviewer task explicitly reports `CHANGES REQUIRED`.
