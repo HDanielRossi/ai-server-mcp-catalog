@@ -149,6 +149,22 @@ Responsibilities:
 - Report git status after tests.
 ```
 
+## Review archive bridge
+
+The reviewer remains read-only and does not write files. After a review has already completed, `review_archive_bridge` can persist the resulting review artifact with:
+
+```text
+mcp__review_archive_bridge__persist_review_artifact
+```
+
+The bridge writes only inside `.ai/reviews/`. It does not execute the review, modify code, commit, or push.
+
+For example, persisting review task `t_1bf0c4e1` generated:
+
+```text
+.ai/reviews/20260819_220453-t_1bf0c4e1.md
+```
+
 ## Reviewer isolation
 
 The reviewer profile is intentionally isolated from broad execution tools.
