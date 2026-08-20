@@ -59,6 +59,24 @@ else
 fi
 
 echo
+echo "5c) global/default SHOULD expose review_archive_bridge:"
+if grep -nA8 -B2 'review_archive_bridge:' ~/.hermes/config.yaml; then
+  echo "OK: global/default has review_archive_bridge"
+else
+  echo "FAIL: global/default missing review_archive_bridge"
+  exit 1
+fi
+
+echo
+echo "5d) reviewer should NOT expose review_archive_bridge:"
+if grep -n 'review_archive_bridge:' ~/.hermes/profiles/reviewer/config.yaml; then
+  echo "FAIL: reviewer exposes review_archive_bridge"
+  exit 1
+else
+  echo "OK: reviewer does not expose review_archive_bridge"
+fi
+
+echo
 echo "6) repo cleanliness:"
 for repo in /opt/ai/projects/agent-pipeline-test /opt/ai/projects/ai-server-mcp-catalog; do
   echo
