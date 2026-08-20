@@ -52,19 +52,18 @@ Recommended path inside the target repo:
 
     .ai/hermes/repo-contract.md
 
-The contract should define:
+Preflight v2 requires `.ai/hermes/repo-contract.md` before using Hermes in a repository. Preflight fails if the file is missing or does not contain every required section.
 
-- Project purpose.
-- Safe work areas.
-- Forbidden work areas.
-- Test command.
-- Build command if applicable.
-- Lint command if applicable.
-- Deployment restrictions.
-- Files that Hermes may modify.
-- Files that Hermes must not modify.
-- Review criteria.
-- Rollback plan.
+The contract must contain these required sections:
+
+- Repository identity
+- Allowed paths
+- Forbidden paths
+- Test command
+- Review requirements
+- Commit policy
+- Push policy
+- Rollback procedure
 
 Use this template from the catalog:
 
@@ -152,6 +151,8 @@ Before starting a Hermes task on a real repo, run:
 
 The preflight checks:
 
+- `.ai/hermes/repo-contract.md` exists.
+- The contract contains every required section.
 - Path is inside /opt/ai/projects.
 - Directory is a Git repo.
 - Working tree is clean.

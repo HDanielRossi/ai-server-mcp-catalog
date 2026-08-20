@@ -1,20 +1,20 @@
 # Hermes Repository Contract
 
-## Repository
+## Repository identity
 
 /opt/ai/projects/ai-server-mcp-catalog
 
-## Project purpose
+### Project purpose
 
 This repository documents and maintains the local MCP/Hermes pipeline catalog for the AI server.
 
 It contains documentation, onboarding material, installation scripts, and validation scripts for Hermes, MCP tools, ComfyUI MCP, GitHub MCP, filesystem MCP, Docker MCP, planner_bridge, pipeline_bridge, claude_bridge, and review_bridge.
 
-## Risk level
+### Risk level
 
 medium
 
-## Allowed work areas
+## Allowed paths
 
 Hermes may modify only these areas unless explicitly authorized by the human operator:
 
@@ -24,7 +24,13 @@ Hermes may modify only these areas unless explicitly authorized by the human ope
 - scripts/hermes-repo-preflight.sh
 - README.md if present
 
-## Forbidden work areas
+### First safe task
+
+Hermes may perform a documentation-only task, such as improving wording in docs/production-repo-onboarding.md or adding a small checklist section to docs/hermes-pipeline.md.
+
+The first task must not modify runtime scripts, Hermes configs, MCP servers, systemd services, Docker Compose files, or production repositories.
+
+## Forbidden paths
 
 Hermes must not modify:
 
@@ -52,19 +58,9 @@ Project-specific forbidden areas:
 
 ./scripts/audit-hermes-pipeline-hardening.sh
 
-## Build command
+Build command: none
 
-none
-
-## Lint command
-
-none
-
-## First safe task
-
-Hermes may perform a documentation-only task, such as improving wording in docs/production-repo-onboarding.md or adding a small checklist section to docs/hermes-pipeline.md.
-
-The first task must not modify runtime scripts, Hermes configs, MCP servers, systemd services, Docker Compose files, or production repositories.
+Lint command: none
 
 ## Review requirements
 
@@ -84,9 +80,11 @@ Hermes workers must not commit.
 
 Human operator commits only after review PASS.
 
+## Push policy
+
 No push without explicit human approval.
 
-## Rollback plan
+## Rollback procedure
 
 Preferred non-destructive commands:
 

@@ -1,6 +1,6 @@
 # Hermes Repository Contract
 
-## Repository
+## Repository identity
 
 Absolute path inside /opt/ai/projects:
 
@@ -19,14 +19,14 @@ Choose one:
     high
     production-critical
 
-## Allowed work areas
+## Allowed paths
 
 Hermes may modify only:
 
 - <file or directory>
 - <file or directory>
 
-## Forbidden work areas
+## Forbidden paths
 
 Hermes must not modify:
 
@@ -82,9 +82,11 @@ Hermes workers must not commit.
 
 Human operator commits only after review PASS.
 
+## Push policy
+
 No push without explicit human approval.
 
-## Rollback plan
+## Rollback procedure
 
 Preferred non-destructive commands:
 

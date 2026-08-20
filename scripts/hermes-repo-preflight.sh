@@ -31,12 +31,46 @@ cd "$REAL_REPO"
 echo "===== HERMES REPO PREFLIGHT ====="
 echo "repo=$REAL_REPO"
 
+CONTRACT_FILE=".ai/hermes/repo-contract.md"
+
 echo
-echo "1) Branch:"
+echo "1) Hermes repository contract:"
+if [[ ! -f "$CONTRACT_FILE" ]]; then
+  echo "FAIL: missing Hermes repository contract: .ai/hermes/repo-contract.md"
+  exit 1
+fi
+
+REQUIRED_SECTIONS=(
+  "Repository identity"
+  "Allowed paths"
+  "Forbidden paths"
+  "Test command"
+  "Review requirements"
+  "Commit policy"
+  "Push policy"
+  "Rollback procedure"
+)
+
+MISSING_COUNT=0
+for section in "${REQUIRED_SECTIONS[@]}"; do
+  if ! grep -Fqx "## $section" "$CONTRACT_FILE"; then
+    echo "FAIL: contract missing required section: $section"
+    MISSING_COUNT=$((MISSING_COUNT + 1))
+  fi
+done
+
+if [[ $MISSING_COUNT -gt 0 ]]; then
+  exit 1
+fi
+
+echo "OK: Hermes repository contract exists and contains all required sections"
+
+echo
+echo "2) Branch:"
 git branch --show-current
 
 echo
-echo "2) Git status:"
+echo "3) Git status:"
 STATUS="$(git status --short)"
 if [[ -n "$STATUS" ]]; then
   echo "$STATUS"
@@ -46,16 +80,16 @@ fi
 echo "OK: working tree clean"
 
 echo
-echo "3) Last commits:"
+echo "4) Last commits:"
 git log --oneline -5
 
 echo
-echo "4) Test command:"
+echo "5) Test command:"
 echo "$TEST_COMMAND"
 bash -lc "$TEST_COMMAND"
 
 echo
-echo "5) Hermes hardening audit:"
+echo "6) Hermes hardening audit:"
 cd /opt/ai/projects/ai-server-mcp-catalog
 ./scripts/audit-hermes-pipeline-hardening.sh
 
