@@ -149,6 +149,8 @@ Responsibilities:
 - Report git status after tests.
 ```
 
+For reviews of the audit script itself, `review_bridge` allows `./scripts/audit-hermes-pipeline-hardening.sh` as an authorized `test_command`.
+
 ## Review archive bridge
 
 The reviewer remains read-only and does not write files. After a review has already completed, `review_archive_bridge` can persist the resulting review artifact with:

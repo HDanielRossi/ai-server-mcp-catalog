@@ -77,6 +77,71 @@ else
 fi
 
 echo
+echo "5e) review_bridge SHOULD authorize the hardening audit test command:"
+if python3 - <<'PY'
+import ast, sys
+
+PATH = "/usr/local/lib/review-bridge-mcp/server.py"
+EXPECTED = "./scripts/audit-hermes-pipeline-hardening.sh"
+
+def fail(msg):
+    print(f"FAIL detail: {msg}")
+    sys.exit(1)
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        source = f.read()
+except OSError as e:
+    fail(f"cannot read {PATH}: {e}")
+
+try:
+    tree = ast.parse(source, filename=PATH)
+except SyntaxError as e:
+    fail(f"cannot parse {PATH}: {e}")
+
+def string_literals(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        out = []
+        for elt in node.elts:
+            out.extend(string_literals(elt))
+        return out
+    if isinstance(node, ast.Dict):
+        out = []
+        for val in node.values:
+            out.extend(string_literals(val))
+        return out
+    return []
+
+found = False
+for node in ast.walk(tree):
+    name = None
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+        value = node.value
+    elif isinstance(node, ast.AnnAssign) and node.annotation is not None and node.value is not None:
+        targets = [node.target]
+        value = node.value
+    else:
+        continue
+    for target in targets:
+        if isinstance(target, ast.Name) and target.id == "ALLOWED_TEST_COMMANDS":
+            found = True
+            if EXPECTED in string_literals(value):
+                sys.exit(0)
+if not found:
+    fail("ALLOWED_TEST_COMMANDS assignment not found")
+sys.exit(1)
+PY
+then
+  echo "OK: review_bridge authorizes the Hermes pipeline hardening audit test command"
+else
+  echo "FAIL: review_bridge does not authorize the Hermes pipeline hardening audit test command"
+  exit 1
+fi
+
+echo
 echo "6) repo cleanliness:"
 for repo in /opt/ai/projects/agent-pipeline-test /opt/ai/projects/ai-server-mcp-catalog; do
   echo
