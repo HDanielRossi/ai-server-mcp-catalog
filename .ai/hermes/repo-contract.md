@@ -22,13 +22,15 @@ Hermes may modify only these areas unless explicitly authorized by the human ope
 - templates/
 - scripts/audit-hermes-pipeline-hardening.sh
 - scripts/hermes-repo-preflight.sh
+- scripts/hermes-pipeline-controller.py
+- tests/ for tests of the catalog's internal tooling, such as tests/test_hermes_pipeline_controller.py
 - README.md if present
 
 ### First safe task
 
-Hermes may perform a documentation-only task, such as improving wording in docs/production-repo-onboarding.md or adding a small checklist section to docs/hermes-pipeline.md.
+Hermes may perform local, testable development of scripts/hermes-pipeline-controller.py and its tests under tests/, or a documentation task such as improving wording in docs/production-repo-onboarding.md or adding a small checklist section to docs/hermes-pipeline.md. pipeline_controller is repository-local, testable tooling at this stage and is not an active runtime component: it must not be installed, deployed, or wired as an active runtime.
 
-The first task must not modify runtime scripts, Hermes configs, MCP servers, systemd services, Docker Compose files, or production repositories.
+The first task must not modify live Hermes configs, MCP servers, systemd services, Docker Compose files, or production repositories.
 
 ## Forbidden paths
 
@@ -47,6 +49,8 @@ Hermes must not modify:
 - Docker Compose production files
 - repository history
 - files outside the explicit task scope
+
+Specifically, and without weakening anything above: no installation or modification under /usr/local/; no changes under ~/.hermes/ or to live Hermes configuration; no systemd changes; no Docker production configuration changes; no automatic commit, push, merge, or deploy.
 
 Project-specific forbidden areas:
 
