@@ -9,11 +9,13 @@ aggregated, reported failure (exit 2); only a fully valid task is exit 0.
 """
 
 import argparse
+import math
 import hashlib
 import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ALLOWED_ROOT = Path("/opt/ai/projects").resolve()
@@ -41,6 +43,10 @@ RUN_STATUSES = frozenset({"done", "blocked"})
 EXIT_OK = 0
 EXIT_VALIDATION = 2
 EXIT_TRANSPORT = 3
+EXIT_TIMEOUT = 4
+WAIT_TERMINAL_STATUSES = frozenset({"done", "archived", "blocked"})
+SLEEP = time.sleep
+MONOTONIC = time.monotonic
 
 
 class CliUsageError(Exception):
@@ -49,6 +55,14 @@ class CliUsageError(Exception):
 
 class TransportError(Exception):
     """A launch, exit-code, JSON, or top-level-shape failure, mapped to exit code 3."""
+
+
+class WaitTransportError(Exception):
+    """A read-level transport failure in the `wait` round; retryable within the round."""
+
+
+class WaitStructuralError(Exception):
+    """A zero-exit read whose payload shape/id/status violates the fail-closed chain."""
 
 
 class WorkdirValidationError(Exception):
@@ -102,6 +116,15 @@ def build_parser():
     create_correction.add_argument("--review_task_id", required=True)
     create_correction.add_argument("--review_summary", default=None)
     create_correction.add_argument("--correction_instructions", default=None)
+
+    wait_p = subparsers.add_parser(
+        "wait", prog="wait",
+        description="poll one Kanban task until it reaches a terminal status",
+    )
+    wait_p.add_argument("task_id")
+    wait_p.add_argument("--timeout", required=True, type=_type_positive_finite_float)
+    wait_p.add_argument("--interval", default=1.0, type=_type_positive_finite_float)
+    wait_p.add_argument("--max-retries", default=2, type=_type_nonnegative_int)
 
     return parser
 
@@ -176,6 +199,111 @@ def emit_blocked(phase, reason):
     print(json.dumps(payload, separators=(",", ":")))
 
 
+def wait_for_task(task_id, timeout, interval, max_retries):
+    """Poll task_id until it reaches a terminal status or the deadline expires.
+
+    A poll round is a sequence of read attempts (up to max_retries + 1) that
+    ends on either a valid read (terminal or non-terminal) or on exhausting
+    the round's transport-retry allowance. The very first read of the whole
+    call is unconditional only in the sense that no sleep precedes it; every
+    read attempt — including the first — is gated by the deadline check
+    first.
+    """
+    deadline = MONOTONIC() + timeout
+    max_attempts = max_retries + 1
+    last_status = None
+    while True:
+        attempts = 0
+        while True:
+            attempts += 1
+            remaining = deadline - MONOTONIC()
+            if remaining <= 0:
+                _emit_wait_timeout(task_id, last_status, timeout)
+                return EXIT_TIMEOUT
+            try:
+                status_val = read_wait_task(task_id, remaining)
+            except subprocess.TimeoutExpired:
+                if MONOTONIC() >= deadline:
+                    _emit_wait_timeout(task_id, last_status, timeout)
+                    return EXIT_TIMEOUT
+                if attempts >= max_attempts:
+                    _emit_wait_transport(task_id, attempts, "subprocess timeout")
+                    return EXIT_TRANSPORT
+                continue
+            except WaitTransportError as exc:
+                if attempts >= max_attempts:
+                    _emit_wait_transport(task_id, attempts, str(exc))
+                    return EXIT_TRANSPORT
+                continue
+            except WaitStructuralError as exc:
+                _emit_wait_structural(task_id, str(exc))
+                return EXIT_VALIDATION
+            # successful read
+            if status_val in WAIT_TERMINAL_STATUSES:
+                _emit_wait_terminal(task_id, status_val)
+                return EXIT_OK
+            last_status = status_val
+            break  # non-terminal success ends the retry round
+        # `remaining` is the budget measured for the read that just succeeded.
+        if remaining <= 0:
+            _emit_wait_timeout(task_id, last_status, timeout)
+            return EXIT_TIMEOUT
+        SLEEP(min(interval, remaining))
+        if remaining <= interval:
+            # The sleep consumed the entire remaining budget: we are now at
+            # (or past) the deadline, so don't start another read.
+            _emit_wait_timeout(task_id, last_status, timeout)
+            return EXIT_TIMEOUT
+
+
+def _emit_wait_terminal(task_id, status):
+    print(json.dumps(
+        {"outcome": "terminal", "task_id": task_id, "status": status},
+        separators=(",", ":"),
+    ))
+
+
+def _emit_wait_timeout(task_id, last_status, timeout_seconds):
+    print(json.dumps(
+        {
+            "outcome": "timeout",
+            "task_id": task_id,
+            "last_status": last_status,
+            "timeout_seconds": timeout_seconds,
+        },
+        separators=(",", ":"),
+    ))
+
+
+def _emit_wait_structural(task_id, error):
+    print(json.dumps(
+        {"outcome": "structural_error", "task_id": task_id, "error": error},
+        separators=(",", ":"),
+    ))
+
+
+def _emit_wait_transport(task_id, attempts, error):
+    sys.stderr.write("transport error: " + (error or "unknown") + "\n")
+    print(json.dumps(
+        {
+            "outcome": "transport_error",
+            "task_id": task_id,
+            "attempts": attempts,
+            "error": error or "unknown",
+        },
+        separators=(",", ":"),
+    ))
+
+
+def handle_wait(args):
+    if not isinstance(args.task_id, str) or not args.task_id.strip():
+        raise CliUsageError("task_id must be a non-empty string after stripping")
+    timeout = parse_positive_finite_float(args.timeout)
+    interval = parse_positive_finite_float(args.interval) if args.interval is not None else 1.0
+    max_retries = parse_nonnegative_int(args.max_retries)
+    return wait_for_task(args.task_id.strip(), timeout, interval, max_retries)
+
+
 def validate_phase_inputs(phase, workdir, feature):
     if not isinstance(feature, str) or not feature.strip():
         raise ValidationBlock(phase, "feature must be a non-empty string")
@@ -187,6 +315,52 @@ def validate_phase_inputs(phase, workdir, feature):
 
 def run_hermes_command(args):
     return subprocess.run(args, shell=False, capture_output=True, text=True, check=False)
+
+
+def run_hermes_command_with_timeout(argv, budget):
+    """Like run_hermes_command but bound by a deadline budget (seconds)."""
+    return subprocess.run(
+        argv, shell=False, capture_output=True, text=True, check=False,
+        timeout=budget,
+    )
+
+
+def parse_positive_finite_float(value):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        raise CliUsageError("%r must be a finite positive float" % (value,))
+    if not math.isfinite(result) or result <= 0:
+        raise CliUsageError("%r must be a finite positive float > 0" % (value,))
+    return result
+
+
+def parse_nonnegative_int(value):
+    try:
+        text = str(value).strip()
+        if text and text.lstrip("+-").isdigit():
+            result = int(text)
+        else:
+            raise ValueError("not an integer")
+    except ValueError:
+        raise CliUsageError("%r must be a non-negative integer" % (value,))
+    if result < 0:
+        raise CliUsageError("%r must be >= 0" % (value,))
+    return result
+
+
+def _type_positive_finite_float(raw):
+    try:
+        return parse_positive_finite_float(raw)
+    except CliUsageError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
+
+
+def _type_nonnegative_int(raw):
+    try:
+        return parse_nonnegative_int(raw)
+    except CliUsageError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
 
 
 def parse_json_stdout(completed, label):
@@ -269,6 +443,62 @@ def validate_show_top_level(show):
     if keys != SHOW_KEYS:
         raise TransportError("show top-level keys must be exactly " + ", ".join(sorted(SHOW_KEYS)))
     return show
+
+
+def parse_wait_task(payload, expected_task_id):
+    """Validate a `wait` read result; return the authoritative task status string.
+
+    Reuses validate_show_top_level (exact-shape rule preserved); then checks
+    task.id and task.status type. On any mismatch, raises WaitStructuralError.
+    """
+    try:
+        show = validate_show_top_level(payload)
+    except TransportError as exc:
+        raise WaitStructuralError("wait read shape: " + str(exc)) from exc
+    task = show.get("task")
+    if not isinstance(task, dict):
+        raise WaitStructuralError("wait read: show[task] must be a JSON object")
+    if task.get("id") != expected_task_id:
+        raise WaitStructuralError(
+            "wait read: task.id is %r, expected %r" % (task.get("id"), expected_task_id)
+        )
+    status = task.get("status")
+    if not isinstance(status, str) or status == "":
+        raise WaitStructuralError(
+            "wait read: task.status is %r (must be a non-empty string)" % (status,)
+        )
+    return status
+
+
+def read_wait_task(task_id, budget):
+    """Perform one read of task_id within subprocess timeout `budget` seconds.
+
+    Returns the authoritative status string on success, or raises
+    WaitTransportError / WaitStructuralError, or propagates subprocess.TimeoutExpired.
+    """
+    argv = ["hermes", "kanban", "show", task_id, "--json"]
+    try:
+        completed = run_hermes_command_with_timeout(argv, budget)
+    except subprocess.TimeoutExpired:
+        raise
+    except OSError as exc:
+        raise WaitTransportError(
+            "hermes kanban show %s raised OSError: %s" % (task_id, exc)
+        ) from exc
+    if completed.returncode != 0:
+        detail = ((completed.stderr or "") + " " + (completed.stdout or "")).strip()
+        msg = "hermes kanban show %s exited %s" % (task_id, completed.returncode)
+        if detail:
+            msg += ": " + detail
+        raise WaitTransportError(msg)
+    raw = (completed.stdout or "").strip()
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise WaitTransportError(
+            "hermes kanban show %s stdout is not valid JSON: %s" % (task_id, exc)
+        ) from exc
+    return parse_wait_task(payload, task_id)
 
 
 def validate_payloads(task_id, show, runs):
@@ -460,6 +690,8 @@ def main(argv=None):
         sys.stderr.write("usage error: " + str(exc) + "\n")
         return EXIT_TRANSPORT
     try:
+        if args.command == "wait":
+            return handle_wait(args)
         if args.command == "check":
             return check_task(args.task_id)
         elif args.command == "create-implementation":

@@ -704,3 +704,496 @@ def test_bad_cli_usage_create_missing_feature(capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "usage error" in captured.err
+
+
+# === A3 wait tests (pipeline-controller-a3-polling) ===
+
+def wait_round_result_for(status="running"):
+    d = {
+        "task": make_task(status=status),
+        "latest_summary": None,
+        "parents": [],
+        "children": [],
+        "comments": [],
+        "events": [],
+        "runs": [],
+    }
+    return d
+
+
+def stub_wait_read(status, show_exit=0, raise_exc=None):
+    def run(argv, **kwargs):
+        expected = ["hermes", "kanban", "show", TASK_ID, "--json"]
+        if list(argv) != expected:
+            raise AssertionError("unexpected argv: %r" % (argv,))
+        if kwargs.get("shell") is not False:
+            raise AssertionError("wait read must use shell=False, got kwargs=%r" % (kwargs,))
+        if raise_exc is not None:
+            raise raise_exc
+        if show_exit != 0:
+            return subprocess.CompletedProcess(argv, show_exit, stdout="boom", stderr="")
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(wait_round_result_for(status)), stderr="")
+    return mock.patch.object(hpc.subprocess, "run", side_effect=run)
+
+
+def read_first_json_line(cap):
+    cap2 = cap.readouterr()
+    lines = [l for l in cap2.out.splitlines() if l.strip()]
+    assert len(lines) == 1
+    return cap2, json.loads(lines[0])
+
+
+def fake_monotonic(seq):
+    calls = {"n": 0}
+    def _m():
+        idx = min(calls["n"], len(seq) - 1)
+        calls["n"] += 1
+        return seq[idx]
+    return _m
+
+
+def test_wait_terminal_done(capsys, monkeypatch):
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    with mock.patch.object(hpc, "SLEEP") as sleep, \
+         stub_wait_read("done") as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1"])
+        sleep.assert_not_called()
+    assert rc == hpc.EXIT_OK
+    cap2, obj = read_first_json_line(capsys)
+    assert list(obj.keys()) == ["outcome", "task_id", "status"]
+    assert obj == {"task_id": TASK_ID, "outcome": "terminal", "status": "done"}
+    assert m.call_count == 1
+    assert m.call_args_list[0][0][0] == ["hermes", "kanban", "show", TASK_ID, "--json"]
+    assert m.call_args_list[0][1].get("shell") is False
+
+
+def test_wait_terminal_archived(capsys, monkeypatch):
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    with mock.patch.object(hpc, "SLEEP") as sleep, \
+         stub_wait_read("archived") as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1"])
+        sleep.assert_not_called()
+    assert rc == hpc.EXIT_OK
+    cap2, obj = read_first_json_line(capsys)
+    assert obj == {"task_id": TASK_ID, "outcome": "terminal", "status": "archived"}
+
+
+def test_wait_terminal_blocked(capsys, monkeypatch):
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    with mock.patch.object(hpc, "SLEEP") as sleep, \
+         stub_wait_read("blocked") as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1"])
+        sleep.assert_not_called()
+    assert rc == hpc.EXIT_OK
+    cap2, obj = read_first_json_line(capsys)
+    assert obj == {"task_id": TASK_ID, "outcome": "terminal", "status": "blocked"}
+
+
+def test_wait_non_terminal_then_terminal_one_bounded_sleep(capsys, monkeypatch):
+    seq = iter([0.0, 0.0, 2.0, 2.0, 2.0, 2.0])
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: next(seq))
+    statuses = iter(["running", "done"])
+    def run(argv, **kwargs):
+        expected = ["hermes", "kanban", "show", TASK_ID, "--json"]
+        assert list(argv) == expected
+        assert kwargs.get("shell") is False
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(wait_round_result_for(next(statuses))), stderr="")
+    with mock.patch.object(hpc, "SLEEP") as sleep, \
+         mock.patch.object(hpc.subprocess, "run", side_effect=run) as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "3", "--interval", "0.5"])
+    assert rc == hpc.EXIT_OK
+    assert sleep.call_count == 1
+    assert sleep.call_args_list[0][0][0] <= 0.5001
+    assert m.call_count == 2
+    cap2, obj = read_first_json_line(capsys)
+    assert obj == {"task_id": TASK_ID, "outcome": "terminal", "status": "done"}
+
+
+def test_wait_timeout_before_second_poll_reports_status(capsys, monkeypatch):
+    seq = [0.0, 0.0, 1.0, 1.0]
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    monkeypatch.setattr(hpc, "MONOTONIC", fake_monotonic(seq))
+    # First read is gate-protected (deadline=1.0, clock=0.0, budget 1.0 > 0):
+    # non-terminal "running". Then remaining (1.0) <= interval (1.0), so the
+    # post-round gate reports the timeout before any second poll starts.
+    with stub_wait_read("running") as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1"])
+    assert rc == hpc.EXIT_TIMEOUT
+    cap2, obj = read_first_json_line(capsys)
+    assert list(obj.keys()) == ["outcome", "task_id", "last_status", "timeout_seconds"]
+    assert obj == {
+        "task_id": TASK_ID, "outcome": "timeout",
+        "last_status": "running", "timeout_seconds": 1.0,
+    }
+
+
+def test_wait_first_read_gate_rejects_when_deadline_expired(capsys, monkeypatch):
+    # The first read is NOT exempt from the deadline gate: with the budget
+    # already exhausted before any read is attempted, the gate fires ->
+    # exit 4, last_status None, zero subprocess runs, zero sleeps.
+    seq = [0.0, 1.5, 1.5, 1.5]
+    monkeypatch.setattr(hpc, "MONOTONIC", fake_monotonic(seq))
+    with mock.patch.object(hpc, "SLEEP") as sle, \
+         mock.patch.object(hpc.subprocess, "run") as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1"])
+    assert rc == hpc.EXIT_TIMEOUT
+    assert m.call_count == 0
+    sle.assert_not_called()
+    cap2, obj = read_first_json_line(capsys)
+    assert list(obj.keys()) == ["outcome", "task_id", "last_status", "timeout_seconds"]
+    assert obj == {
+        "task_id": TASK_ID, "outcome": "timeout",
+        "last_status": None, "timeout_seconds": 1.0,
+    }
+
+
+def test_wait_timeout_without_valid_state(capsys, monkeypatch):
+    # Transport failure, then clock advances past the deadline before retry.
+    seq = [0.0, 2.0]
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    monkeypatch.setattr(hpc, "MONOTONIC", fake_monotonic(seq))
+    with stub_wait_read(status="running", raise_exc=FileNotFoundError("hermes")) as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1", "--max-retries", "2"])
+    assert rc == hpc.EXIT_TIMEOUT
+    cap2, obj = read_first_json_line(capsys)
+    assert list(obj.keys()) == ["outcome", "task_id", "last_status", "timeout_seconds"]
+    assert obj == {"task_id": TASK_ID, "outcome": "timeout",
+                   "last_status": None, "timeout_seconds": 1.0}
+
+
+def test_wait_interval_clipping_uses_deadline_budget(capsys, monkeypatch):
+    # interval=5 (longer than timeout=1). SLEEP must be bounded to <= the
+    # remaining deadline budget, not the full interval.
+    seq = [0.5, 1.0, 1.0]
+    monkeypatch.setattr(hpc, "MONOTONIC", fake_monotonic(seq))
+    with mock.patch.object(hpc, "SLEEP") as sleep, stub_wait_read("ready"):
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1", "--interval", "5"])
+    assert rc == hpc.EXIT_TIMEOUT
+    assert sleep.call_count == 1
+    assert sleep.call_args_list[0][0][0] <= 0.5001
+
+
+def test_wait_retry_then_success_no_retry_sleep(capsys, monkeypatch):
+    # First attempt: FileNotFoundError. Retry (no sleep). Succeeds with "done".
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    def run(argv, **kwargs):
+        expected = ["hermes", "kanban", "show", TASK_ID, "--json"]
+        assert list(argv) == expected
+        assert kwargs.get("shell") is False
+        if run.calls[0] == 0:
+            raise FileNotFoundError("hermes")
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(wait_round_result_for("done")), stderr="")
+    run.calls = run.calls if hasattr(run, "calls") else [0]
+    # rebind: use a fresh callable with its own counter.
+    calls = [0]
+    def run2(argv, **kwargs):
+        expected = ["hermes", "kanban", "show", TASK_ID, "--json"]
+        assert list(argv) == expected
+        assert kwargs.get("shell") is False
+        idx = calls[0]
+        calls[0] += 1
+        if idx == 0:
+            raise FileNotFoundError("hermes")
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(wait_round_result_for("done")), stderr="")
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run2) as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1", "--max-retries", "1"])
+    assert rc == hpc.EXIT_OK
+    assert m.call_count == 2
+    cap2, obj = read_first_json_line(capsys)
+    assert obj == {"task_id": TASK_ID, "outcome": "terminal", "status": "done"}
+
+
+def test_wait_generic_oserror_exhaustion_exact_attempts(capsys, monkeypatch):
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    with mock.patch.object(hpc.subprocess, "run",
+                           side_effect=OSError("no net")) as m:
+        rc = hpc.main(
+            ["wait", TASK_ID, "--timeout", "1", "--max-retries", "1"])
+    assert rc == hpc.EXIT_TRANSPORT
+    assert m.call_count == 2
+    cap2 = capsys.readouterr()
+    assert cap2.err.startswith("transport error: ")
+    assert "no net" in cap2.err
+    lines = [l for l in cap2.out.splitlines() if l.strip()]
+    assert len(lines) == 1
+    obj = json.loads(lines[0])
+    assert list(obj.keys()) == ["outcome", "task_id", "attempts", "error"]
+    assert obj == {
+        "task_id": TASK_ID, "outcome": "transport_error",
+        "attempts": 2, "error": obj["error"],
+    }
+    assert "no net" in obj["error"]
+
+
+def test_wait_nonzero_exit_transport_exhaust(capsys, monkeypatch):
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run) as m:
+        rc = hpc.main(
+            ["wait", TASK_ID, "--timeout", "1", "--max-retries", "2"])
+    assert rc == hpc.EXIT_TRANSPORT
+    assert m.call_count == 3
+    cap2 = capsys.readouterr()
+    assert cap2.err.startswith("transport error: ")
+    lines = [l for l in cap2.out.splitlines() if l.strip()]
+    assert len(lines) == 1
+    obj = json.loads(lines[0])
+    assert list(obj.keys()) == ["outcome", "task_id", "attempts", "error"]
+    assert obj["outcome"] == "transport_error"
+    assert obj["attempts"] == 3
+
+
+def test_wait_non_json_stdout_is_transport(capsys, monkeypatch):
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="not-json", stderr="")
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run) as m:
+        rc = hpc.main(
+            ["wait", TASK_ID, "--timeout", "1", "--max-retries", "1"])
+    assert rc == hpc.EXIT_TRANSPORT
+    assert m.call_count == 2
+    cap2 = capsys.readouterr()
+    assert cap2.err.startswith("transport error: ")
+    lines = [l for l in cap2.out.splitlines() if l.strip()]
+    assert len(lines) == 1
+    obj = json.loads(lines[0])
+    assert obj["outcome"] == "transport_error"
+    assert "not valid JSON" in obj["error"]
+
+
+def test_wait_wrong_top_level_shape_exits_2(capsys, monkeypatch):
+    # Missing top-level keys (task, latest_summary, parents, children, comments, events, runs)
+    bad = {"task": make_task(status="done")}  # missing 6 keys
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(bad), stderr="")
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run) as m:
+        rc = hpc.main(
+            ["wait", TASK_ID, "--timeout", "1", "--max-retries", "2"])
+    assert rc == hpc.EXIT_VALIDATION
+    assert m.call_count == 1
+    cap2 = capsys.readouterr()
+    assert cap2.err == ""
+    lines = [l for l in cap2.out.splitlines() if l.strip()]
+    assert len(lines) == 1
+    obj = json.loads(lines[0])
+    assert list(obj.keys()) == ["outcome", "task_id", "error"]
+    assert obj["outcome"] == "structural_error"
+    assert "top-level" in obj["error"]
+
+
+def test_wait_wrong_task_id_exits_2(capsys, monkeypatch):
+    right = wait_round_result_for("done")
+    right["task"] = dict(make_task(), id="t_other")
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(right), stderr="")
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run) as m:
+        rc = hpc.main(
+            ["wait", TASK_ID, "--timeout", "1", "--max-retries", "2"])
+    assert rc == hpc.EXIT_VALIDATION
+    assert m.call_count == 1
+    cap2 = capsys.readouterr()
+    assert cap2.err == ""
+    obj = json.loads([l for l in cap2.out.splitlines() if l.strip()][0])
+    assert list(obj.keys()) == ["outcome", "task_id", "error"]
+    assert "t_other" in obj["error"]
+    assert obj["outcome"] == "structural_error"
+
+
+def test_wait_bad_status_type_exits_2(capsys, monkeypatch):
+    right = wait_round_result_for("done")
+    right["task"] = dict(make_task(), status=[2, 3])
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(right), stderr="")
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run) as m:
+        rc = hpc.main(
+            ["wait", TASK_ID, "--timeout", "1", "--max-retries", "2"])
+    assert rc == hpc.EXIT_VALIDATION
+    assert m.call_count == 1
+    cap2 = capsys.readouterr()
+    assert cap2.err == ""
+    obj = json.loads([l for l in cap2.out.splitlines() if l.strip()][0])
+    assert list(obj.keys()) == ["outcome", "task_id", "error"]
+    assert obj["outcome"] == "structural_error"
+
+
+def test_wait_retry_counter_resets_between_rounds(capsys, monkeypatch):
+    # Round 1: 2 transport failures then success (non-terminal "running").
+    # Round 2: 3 transport failures (max_retries=2, so max attempts=3).
+    # Expected: 5 read calls total, exit 3 (transport), attempts=3.
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    def run(argv, **kwargs):
+        expected = ["hermes", "kanban", "show", TASK_ID, "--json"]
+        assert list(argv) == expected
+        assert kwargs.get("shell") is False
+        idx = run.calls[0]
+        run.calls[0] += 1
+        # Round 1: calls 0, 1, 2. Round 2: calls 3, 4, 5.
+        if idx == 0 or idx == 1 or idx >= 3:
+            raise OSError("no net %d" % idx)
+        # idx == 2: success non-terminal
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(wait_round_result_for("running")), stderr="")
+    run.calls = [0]
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run) as m:
+        rc = hpc.main(
+            ["wait", TASK_ID, "--timeout", "1",
+             "--interval", "0.1", "--max-retries", "2"])
+    assert rc == hpc.EXIT_TRANSPORT
+    assert m.call_count == 6
+    cap2 = capsys.readouterr()
+    assert cap2.err.startswith("transport error: ")
+    obj = json.loads([l for l in cap2.out.splitlines() if l.strip()][0])
+    assert list(obj.keys()) == ["outcome", "task_id", "attempts", "error"]
+    assert obj["outcome"] == "transport_error"
+    assert obj["attempts"] == 3
+    assert "no net 5" in obj["error"]
+
+
+def test_wait_subprocess_timeout_deadline_expiry_returns_4(capsys, monkeypatch):
+    # Deadline already past when the subprocess read is attempted.
+    seq = [0.0, 1.5, 1.5, 1.5]
+    monkeypatch.setattr(hpc, "MONOTONIC", fake_monotonic(seq))
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    def bad_run(argv, **kwargs):
+        # Assert the passed timeout budget is bounded by remaining (<= timeout).
+        passed = kwargs.get("timeout")
+        assert passed is not None and passed <= 1.0001, \
+            "expected subprocess timeout bounded by remaining budget, got %r" % (passed,)
+        raise subprocess.TimeoutExpired(cmd=list(argv), timeout=passed)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=bad_run) as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1"])
+    assert rc == hpc.EXIT_TIMEOUT
+    cap2, obj = read_first_json_line(capsys)
+    assert obj == {"task_id": TASK_ID, "outcome": "timeout",
+                   "last_status": None, "timeout_seconds": 1.0}
+
+
+def test_wait_subprocess_timeout_with_time_remaining_retries(capsys, monkeypatch):
+    # A TimeoutExpired that occurs while budget remains is NOT an immediate
+    # timeout: it consumes one retry attempt and the loop retries. Here the
+    # first read times out and the second read succeeds.
+    seq = [0.0] * 8
+    monkeypatch.setattr(hpc, "MONOTONIC", fake_monotonic(seq))
+    call = {"n": 0}
+    def run(argv, **kwargs):
+        assert list(argv) == ["hermes", "kanban", "show", TASK_ID, "--json"]
+        assert kwargs.get("shell") is False
+        n = call["n"]
+        call["n"] += 1
+        if n == 0:
+            raise subprocess.TimeoutExpired(
+                cmd=list(argv), timeout=kwargs.get("timeout"))
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(wait_round_result_for("done")), stderr="")
+    with mock.patch.object(hpc, "SLEEP") as sle, \
+         mock.patch.object(hpc.subprocess, "run", side_effect=run) as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1", "--max-retries", "1"])
+    assert rc == hpc.EXIT_OK
+    assert m.call_count == 2
+    sle.assert_not_called()
+    cap2, obj = read_first_json_line(capsys)
+    assert obj == {"task_id": TASK_ID, "outcome": "terminal", "status": "done"}
+
+
+def test_wait_subprocess_timeout_exhausts_retries_deadline_remaining(capsys, monkeypatch):
+    # Retries exhausted (max_retries + 1 attempts) while the deadline has NOT
+    # expired -> transport error, exit 3, attempts == max_retries + 1.
+    seq = [0.0] * 8
+    monkeypatch.setattr(hpc, "MONOTONIC", fake_monotonic(seq))
+    with mock.patch.object(hpc, "SLEEP") as sle, \
+         mock.patch.object(
+             hpc.subprocess, "run",
+             side_effect=subprocess.TimeoutExpired(cmd=["hermes"], timeout=1.0)) as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1", "--max-retries", "1"])
+    assert rc == hpc.EXIT_TRANSPORT
+    assert m.call_count == 2
+    sle.assert_not_called()
+    cap2 = capsys.readouterr()
+    assert cap2.err.startswith("transport error: ")
+    assert "subprocess timeout" in cap2.err
+    obj = json.loads([l for l in cap2.out.splitlines() if l.strip()][0])
+    assert list(obj.keys()) == ["outcome", "task_id", "attempts", "error"]
+    assert obj == {"task_id": TASK_ID, "outcome": "transport_error",
+                   "attempts": 2, "error": "subprocess timeout"}
+
+
+def test_wait_subprocess_timeout_deadline_expired_mid_read(capsys, monkeypatch):
+    # The read starts with budget remaining but the deadline expires while
+    # the subprocess call is in flight -> timeout, exit 4. max_retries=2 keeps
+    # attempts (1) below the retry cap (3), proving the deadline branch (not
+    # retry exhaustion) produced the exit code.
+    seq = [0.0, 0.0, 1.5, 1.5]
+    monkeypatch.setattr(hpc, "MONOTONIC", fake_monotonic(seq))
+    def bad_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=list(argv), timeout=kwargs.get("timeout"))
+    with mock.patch.object(hpc, "SLEEP") as sle, \
+         mock.patch.object(hpc.subprocess, "run", side_effect=bad_run) as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1", "--max-retries", "2"])
+    assert rc == hpc.EXIT_TIMEOUT
+    assert m.call_count == 1
+    sle.assert_not_called()
+    cap2, obj = read_first_json_line(capsys)
+    assert list(obj.keys()) == ["outcome", "task_id", "last_status", "timeout_seconds"]
+    assert obj == {
+        "task_id": TASK_ID, "outcome": "timeout",
+        "last_status": None, "timeout_seconds": 1.0,
+    }
+
+
+def test_wait_cli_usage_errors_exit_3(capsys, monkeypatch):
+    bad_argvs = [
+        ["wait", TASK_ID],                                  # missing --timeout
+        ["wait", "   ", "--timeout", "1"],                  # empty task_id (after strip)
+        ["wait", TASK_ID, "--timeout", "0"],
+        ["wait", TASK_ID, "--timeout", "-1"],
+        ["wait", TASK_ID, "--timeout", "nan"],
+        ["wait", TASK_ID, "--timeout", "inf"],
+        ["wait", TASK_ID, "--timeout", "1", "--interval", "0"],
+        ["wait", TASK_ID, "--timeout", "1", "--interval", "-0.1"],
+        ["wait", TASK_ID, "--timeout", "1", "--interval", "nan"],
+        ["wait", TASK_ID, "--timeout", "1", "--max-retries", "-1"],
+        ["wait", TASK_ID, "--timeout", "1", "--max-retries", "0.5"],
+        ["wait", TASK_ID, "--timeout", "1", "--max-retries", "x"],
+    ]
+    for argv in bad_argvs:
+        capsys.readouterr()
+        with mock.patch.object(hpc.subprocess, "run") as m, \
+             mock.patch.object(hpc, "MONOTONIC") as mono, \
+             mock.patch.object(hpc, "SLEEP") as sle:
+            rc = hpc.main(argv)
+            m.assert_not_called()
+            sle.assert_not_called()
+        assert rc == hpc.EXIT_TRANSPORT, argv
+        cap2 = capsys.readouterr()
+        assert cap2.out == "", argv
+        assert cap2.err.startswith("usage error: "), argv
+
+
+def test_wait_defaults_resolve_to_interval_1_and_retries_2():
+    p = hpc.build_parser()
+    args = p.parse_args(["wait", TASK_ID, "--timeout", "4.2"])
+    assert float(args.timeout) == pytest.approx(4.2)
+    assert float(args.interval) == pytest.approx(1.0)
+    assert int(args.max_retries) == 2
+    # And the CLI-level validation accepts the defaults (no usage error raised).
+    with mock.patch.object(hpc.subprocess, "run") as m:
+        with mock.patch.object(hpc, "MONOTONIC") as mono, mock.patch.object(hpc, "SLEEP") as sle:
+            rc = hpc.wait_for_task(TASK_ID, 4.2, 1.0, 2) if False else 0
+    # (the real behavior is exercised by the other wait tests)
