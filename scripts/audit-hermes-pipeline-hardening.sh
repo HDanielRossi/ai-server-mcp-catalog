@@ -1,154 +1,406 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+# A3.5 hardening invariant audit. Layer A: repository/template invariants. Layer B: installed-runtime invariants (read-only probes). Accumulates all failures.
+set -u
+set -o pipefail
 
-echo "===== PIPELINE HARDENING AUDIT ====="
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
+cd "$REPO_DIR"
+
+FAILURES=()
+
+check_ok() {
+  echo "OK: $1"
+}
+
+check_fail() {
+  echo "FAIL: $1"
+  FAILURES+=("$1")
+}
+
+grep_ok() {
+  local file="$1"
+  shift
+  local needle
+  for needle in "$@"; do
+    if ! grep -qF -- "$needle" "$file" 2>/dev/null; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+grep_absent() {
+  local file="$1"
+  local needle="$2"
+  ! grep -qF -- "$needle" "$file" 2>/dev/null
+}
+
+require_file_nonempty() {
+  local file="$1"
+  if [[ -s "$REPO_DIR/$file" ]]; then
+    check_ok "$file exists and is non-empty"
+  else
+    check_fail "$file missing or empty"
+  fi
+}
+
+echo "===== A3.5 HARDENING AUDIT: repository/template + installed-runtime invariants ====="
 
 echo
-echo "1) pipeline_bridge review idempotency:"
-if grep -n 'review:{implementation_task_id}' /usr/local/lib/pipeline-bridge-mcp/server.py; then
-  echo "OK: review idempotency includes implementation_task_id"
+echo "1) template and test file existence:"
+require_file_nonempty "templates/review_bridge_server.py"
+require_file_nonempty "templates/reviewer-SOUL.md"
+require_file_nonempty "templates/pipeline_bridge_server.py"
+require_file_nonempty "templates/claude_bridge_server.py"
+require_file_nonempty "tests/test_review_bridge_template.py"
+require_file_nonempty "tests/test_pipeline_bridge_template.py"
+require_file_nonempty "tests/test_claude_bridge_template.py"
+
+echo
+echo "2) docs A3.5 marker:"
+DOCS_FILE="$REPO_DIR/docs/hermes-pipeline.md"
+if [[ -s "$DOCS_FILE" ]] && grep -qF -- "A3.5" "$DOCS_FILE" 2>/dev/null; then
+  check_ok "docs/hermes-pipeline.md exists and contains A3.5 marker"
 else
-  echo "FAIL: missing review idempotency fix"
-  exit 1
+  check_fail "docs/hermes-pipeline.md missing or missing A3.5 marker"
 fi
 
 echo
-echo "2) global/default config should NOT expose review_bridge:"
-if grep -nA8 -B4 'review_bridge' ~/.hermes/config.yaml; then
-  echo "FAIL: global/default config exposes review_bridge"
-  exit 1
+echo "3) review template (templates/review_bridge_server.py):"
+REVIEW_FILE="$REPO_DIR/templates/review_bridge_server.py"
+REVIEW_STRINGS=(
+  'DEFAULT_TEST_COMMAND = "__skip__"'
+  '__skip__'
+  'MAX_CONTENT_WINDOW_LINES = 200'
+  'DEFAULT_INCLUDE_DIFF = False'
+  'DEFAULT_INCLUDE_REPO_EVIDENCE = True'
+  'not-requested'
+  'SKIPPED'
+  '/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q'
+  './scripts/audit-hermes-pipeline-hardening.sh'
+  'ALLOWED_TEST_COMMANDS'
+  'def collect_evidence'
+  'include_diff requires'
+  'ReviewBridgeError'
+)
+for s in "${REVIEW_STRINGS[@]}"; do
+  if grep_ok "$REVIEW_FILE" "$s"; then
+    check_ok "review template contains: $s"
+  else
+    check_fail "review template missing: $s"
+  fi
+done
+
+echo
+echo "4) reviewer template (templates/reviewer-SOUL.md):"
+REVIEWER_FILE="$REPO_DIR/templates/reviewer-SOUL.md"
+REVIEWER_STRINGS=(
+  'If test_command is __skip__, do not invent or substitute another command'
+  'If tests are required by the acceptance criteria but no valid explicit test command is available, block the task instead of guessing'
+  '200 lines'
+  'exactly one file'
+  'No parallel collects'
+  'about 8'
+  'ONE deterministic correction'
+)
+for s in "${REVIEWER_STRINGS[@]}"; do
+  if grep_ok "$REVIEWER_FILE" "$s"; then
+    check_ok "reviewer template contains: $s"
+  else
+    check_fail "reviewer template missing: $s"
+  fi
+done
+
+echo
+echo "5) pipeline template (templates/pipeline_bridge_server.py):"
+PIPELINE_FILE="$REPO_DIR/templates/pipeline_bridge_server.py"
+PIPELINE_STRINGS=(
+  'def stable_key'
+  '"implementation"'
+  'review:'
+  'correction:'
+  'implementation_task_id'
+  'review_task_id'
+  'If test_command is __skip__, do not invent or substitute another command'
+  'If tests are required by the acceptance criteria but no valid explicit test command is available,'
+  'block the task instead of guessing'
+  'PipelineBridgeError'
+)
+for s in "${PIPELINE_STRINGS[@]}"; do
+  if grep_ok "$PIPELINE_FILE" "$s"; then
+    check_ok "pipeline template contains: $s"
+  else
+    check_fail "pipeline template missing: $s"
+  fi
+done
+
+echo
+echo "6) claude template (templates/claude_bridge_server.py):"
+CLAUDE_FILE="$REPO_DIR/templates/claude_bridge_server.py"
+CLAUDE_STRINGS=(
+  'CALL_BUDGET_THRESHOLD = 4'
+  'PROJECTS_ROOT = "/opt/ai/projects"'
+  '--print'
+  '--output-format'
+  'json'
+  '--no-session-persistence'
+  '--max-budget-usd'
+  'duration_ms'
+  'duration_api_ms'
+  'num_turns'
+  'total_cost_usd'
+  'session_id'
+  'subtype'
+  'is_error'
+  'iterations'
+  'modelUsage'
+  'input_tokens'
+  'cache_creation_input_tokens'
+  'cache_read_input_tokens'
+  'output_tokens'
+  'fcntl'
+  'flock'
+  'os.fsync'
+  'os.replace'
+  'LedgerCorruptionError'
+  'BudgetExhaustedError'
+  'task_id'
+  'realpath'
+)
+for s in "${CLAUDE_STRINGS[@]}"; do
+  if grep_ok "$CLAUDE_FILE" "$s"; then
+    check_ok "claude template contains: $s"
+  else
+    check_fail "claude template missing: $s"
+  fi
+done
+
+CLAUDE_ABSENT_STRINGS=(
+  'app.py'
+  'tests/test_app.py'
+  'shell=True'
+)
+for s in "${CLAUDE_ABSENT_STRINGS[@]}"; do
+  if grep_absent "$CLAUDE_FILE" "$s"; then
+    check_ok "claude template does not contain: $s"
+  else
+    check_fail "claude template must not contain: $s"
+  fi
+done
+
+echo
+echo "7) docs (docs/hermes-pipeline.md):"
+DOCS_STRINGS=(
+  'reviewer'
+  'A3.5'
+  'threshold'
+  '__skip__'
+  'not-requested'
+  'SKIPPED'
+  '200'
+  '/opt/ai/projects'
+  'shell=False'
+  'no token cap'
+  '/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q'
+  'bash scripts/audit-hermes-pipeline-hardening.sh'
+  'operator'
+)
+for s in "${DOCS_STRINGS[@]}"; do
+  if grep_ok "$DOCS_FILE" "$s"; then
+    check_ok "docs contains: $s"
+  else
+    check_fail "docs missing: $s"
+  fi
+done
+
+if grep -qiF -- "repo-only" "$DOCS_FILE" 2>/dev/null; then
+  check_ok "docs contains: REPO-ONLY (case-insensitive)"
 else
-  echo "OK: no global review_bridge found"
+  check_fail "docs missing: REPO-ONLY (case-insensitive)"
 fi
 
 echo
-echo "3) reviewer profile SHOULD expose review_bridge:"
-if grep -nA8 -B4 'review_bridge' ~/.hermes/profiles/reviewer/config.yaml; then
-  echo "OK: reviewer has review_bridge"
-else
-  echo "FAIL: reviewer review_bridge missing"
-  exit 1
-fi
+echo "===== SECTION B: installed runtime invariants (read-only probes) ====="
 
-echo
-echo "4) default SOUL async boundary:"
-if grep -nA12 -B3 'Async Kanban Boundary\|After creating an implementation task' ~/.hermes/SOUL.md; then
-  echo "OK: default async boundary found"
-else
-  echo "FAIL: default async boundary missing"
-  exit 1
-fi
+RUNTIME_FILES=(
+  "/usr/local/lib/pipeline-bridge-mcp/server.py"
+  "/usr/local/lib/review-bridge-mcp/server.py"
+  "$HOME/.hermes/config.yaml"
+  "$HOME/.hermes/SOUL.md"
+  "$HOME/.hermes/profiles/reviewer/config.yaml"
+  "$HOME/.hermes/profiles/reviewer/SOUL.md"
+)
+RUNTIME_PRESENT=0
+for f in "${RUNTIME_FILES[@]}"; do
+  if [[ -f "$f" ]]; then
+    RUNTIME_PRESENT=1
+    break
+  fi
+done
 
-echo
-echo "5) reviewer SOUL mandatory evidence:"
-if grep -nA12 -B3 'Mandatory Evidence Before Verdict\|mcp__review_bridge__collect' ~/.hermes/profiles/reviewer/SOUL.md; then
-  echo "OK: reviewer mandatory evidence rule found"
+if [[ ${RUNTIME_PRESENT} -eq 0 ]]; then
+  echo "SKIPPED: Hermes runtime not detected on this host (no installed bridge server.py, no ~/.hermes runtime files). Section B not executed."
 else
-  echo "FAIL: reviewer mandatory evidence rule missing"
-  exit 1
-fi
+  echo "Runtime present — executing installed-runtime invariant checks (read-only)."
 
-echo
-echo "5b) reviewer should NOT expose Memory:"
-if reviewer tools --summary | grep -q 'Memory'; then
-  echo "FAIL: reviewer exposes Memory"
-  reviewer tools --summary | sed -n '1,120p'
-  exit 1
-else
-  echo "OK: reviewer Memory tool not exposed"
-fi
+  echo
+  echo "8) installed pipeline_bridge review idempotency:"
+  if grep -qF -- 'review:{implementation_task_id}' /usr/local/lib/pipeline-bridge-mcp/server.py 2>/dev/null; then
+    check_ok "installed pipeline_bridge review idempotency includes implementation_task_id"
+  else
+    check_fail "installed pipeline_bridge missing review idempotency fix (review:{implementation_task_id})"
+  fi
 
-echo
-echo "5c) global/default SHOULD expose review_archive_bridge:"
-if grep -nA8 -B2 'review_archive_bridge:' ~/.hermes/config.yaml; then
-  echo "OK: global/default has review_archive_bridge"
-else
-  echo "FAIL: global/default missing review_archive_bridge"
-  exit 1
-fi
+  echo
+  echo "9) global/default config must NOT expose review_bridge:"
+  if grep -qF -- 'review_bridge' "$HOME/.hermes/config.yaml" 2>/dev/null; then
+    check_fail "global/default config exposes review_bridge"
+  else
+    check_ok "global/default config does not expose review_bridge"
+  fi
 
-echo
-echo "5d) reviewer should NOT expose review_archive_bridge:"
-if grep -n 'review_archive_bridge:' ~/.hermes/profiles/reviewer/config.yaml; then
-  echo "FAIL: reviewer exposes review_archive_bridge"
-  exit 1
-else
-  echo "OK: reviewer does not expose review_archive_bridge"
-fi
+  echo
+  echo "10) reviewer profile must expose review_bridge:"
+  if grep -qF -- 'review_bridge' "$HOME/.hermes/profiles/reviewer/config.yaml" 2>/dev/null; then
+    check_ok "reviewer profile exposes review_bridge"
+  else
+    check_fail "reviewer profile does not expose review_bridge"
+  fi
 
-echo
-echo "5e) review_bridge SHOULD authorize the hardening audit test command:"
-if python3 - <<'PY'
+  echo
+  echo "11) default SOUL async kanban boundary:"
+  if grep -qE -- 'Async Kanban Boundary|After creating an implementation task' "$HOME/.hermes/SOUL.md" 2>/dev/null; then
+    check_ok "default SOUL contains async kanban boundary"
+  else
+    check_fail "default SOUL missing async kanban boundary"
+  fi
+
+  echo
+  echo "12) reviewer SOUL mandatory evidence requirement:"
+  if grep -qF -- 'Mandatory Evidence' "$HOME/.hermes/profiles/reviewer/SOUL.md" 2>/dev/null || grep -qF -- 'mcp__review_bridge__collect' "$HOME/.hermes/profiles/reviewer/SOUL.md" 2>/dev/null; then
+    check_ok "reviewer SOUL contains mandatory evidence / mcp__review_bridge__collect requirement"
+  else
+    check_fail "reviewer SOUL missing mandatory evidence requirement"
+  fi
+
+  echo
+  echo "13) reviewer must NOT expose Memory:"
+  REVIEWER_TOOLS_OUT=""
+  REVIEWER_TOOLS_RC=0
+  REVIEWER_TOOLS_OUT="$(
+    timeout -k 5 20 script -qefc 'reviewer tools --summary' /dev/null </dev/null 2>&1
+  )" || REVIEWER_TOOLS_RC=$?
+  if [[ ${REVIEWER_TOOLS_RC} -eq 124 || ${REVIEWER_TOOLS_RC} -eq 137 ]]; then
+    check_fail "reviewer tools --summary timed out (exit ${REVIEWER_TOOLS_RC})"
+  elif [[ ${REVIEWER_TOOLS_RC} -ne 0 ]]; then
+    check_fail "reviewer tools --summary exited nonzero (exit ${REVIEWER_TOOLS_RC})"
+  elif [[ -z "${REVIEWER_TOOLS_OUT//[[:space:]]/}" ]]; then
+    check_fail "reviewer tools --summary produced no output (probe failed)"
+  elif printf '%s\n' "$REVIEWER_TOOLS_OUT" | grep -q -- 'Memory'; then
+    check_fail "reviewer exposes Memory"
+  else
+    check_ok "reviewer does not expose Memory"
+  fi
+
+  echo
+  echo "14) global/default must expose review_archive_bridge:"
+  if grep -qF -- 'review_archive_bridge:' "$HOME/.hermes/config.yaml" 2>/dev/null; then
+    check_ok "global/default exposes review_archive_bridge"
+  else
+    check_fail "global/default missing review_archive_bridge"
+  fi
+
+  echo
+  echo "15) reviewer must NOT expose review_archive_bridge:"
+  if grep -qF -- 'review_archive_bridge:' "$HOME/.hermes/profiles/reviewer/config.yaml" 2>/dev/null; then
+    check_fail "reviewer exposes review_archive_bridge"
+  else
+    check_ok "reviewer does not expose review_archive_bridge"
+  fi
+
+  echo
+  echo "16) installed review_bridge ALLOWED_TEST_COMMANDS authorizes the audit test command:"
+  python3 - <<'PY'
 import ast, sys
 
 PATH = "/usr/local/lib/review-bridge-mcp/server.py"
 EXPECTED = "./scripts/audit-hermes-pipeline-hardening.sh"
 
-def fail(msg):
-    print(f"FAIL detail: {msg}")
-    sys.exit(1)
-
 try:
     with open(PATH, "r", encoding="utf-8") as f:
         source = f.read()
-except OSError as e:
-    fail(f"cannot read {PATH}: {e}")
-
-try:
     tree = ast.parse(source, filename=PATH)
-except SyntaxError as e:
-    fail(f"cannot parse {PATH}: {e}")
+except (OSError, SyntaxError):
+    sys.exit(2)
 
 def string_literals(node):
+    out = []
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return [node.value]
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        out = []
         for elt in node.elts:
             out.extend(string_literals(elt))
-        return out
-    if isinstance(node, ast.Dict):
-        out = []
+    elif isinstance(node, ast.Dict):
+        for key in node.keys:
+            if key is not None:
+                out.extend(string_literals(key))
         for val in node.values:
             out.extend(string_literals(val))
-        return out
-    return []
+    return out
+
+def assignment_pairs(node):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            yield target, node.value
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        yield node.target, node.value
 
 found = False
 for node in ast.walk(tree):
-    name = None
-    if isinstance(node, ast.Assign):
-        targets = node.targets
-        value = node.value
-    elif isinstance(node, ast.AnnAssign) and node.annotation is not None and node.value is not None:
-        targets = [node.target]
-        value = node.value
-    else:
-        continue
-    for target in targets:
+    for target, value in assignment_pairs(node):
         if isinstance(target, ast.Name) and target.id == "ALLOWED_TEST_COMMANDS":
             found = True
             if EXPECTED in string_literals(value):
                 sys.exit(0)
 if not found:
-    fail("ALLOWED_TEST_COMMANDS assignment not found")
+    sys.exit(2)
 sys.exit(1)
 PY
-then
-  echo "OK: review_bridge authorizes the Hermes pipeline hardening audit test command"
-else
-  echo "FAIL: review_bridge does not authorize the Hermes pipeline hardening audit test command"
-  exit 1
+  ALLOWED_CHECK_RC=$?
+  if [[ ${ALLOWED_CHECK_RC} -eq 0 ]]; then
+    check_ok "installed review_bridge authorizes the Hermes pipeline hardening audit test command"
+  elif [[ ${ALLOWED_CHECK_RC} -eq 2 ]]; then
+    check_fail "cannot read/parse installed review_bridge server.py or ALLOWED_TEST_COMMANDS not found"
+  else
+    check_fail "installed review_bridge does not authorize the Hermes pipeline hardening audit test command"
+  fi
+
+  echo
+  echo "17) pipeline repo status/cleanliness:"
+  for repo in /opt/ai/projects/agent-pipeline-test /opt/ai/projects/ai-server-mcp-catalog; do
+    if [[ -d "$repo/.git" || -f "$repo/.git" ]]; then
+      echo "--- git status --short ($repo) ---"
+      git -C "$repo" status --short
+      check_ok "repository status reported for $repo"
+    else
+      check_fail "pipeline repository missing: $repo"
+    fi
+  done
 fi
 
 echo
-echo "6) repo cleanliness:"
-for repo in /opt/ai/projects/agent-pipeline-test /opt/ai/projects/ai-server-mcp-catalog; do
-  echo
-  echo "===== $repo ====="
-  cd "$repo"
-  git status --short
-done
+if [[ ${#FAILURES[@]} -eq 0 ]]; then
+  echo "PASS"
+  exit 0
+fi
 
-echo
-echo "PASS: Hermes pipeline hardening audit completed successfully."
+echo "FAIL"
+echo "Failed checks:"
+i=0
+for f in "${FAILURES[@]}"; do
+  i=$((i + 1))
+  echo "  $i) $f"
+done
+echo "Total fails: ${#FAILURES[@]}"
+exit 1

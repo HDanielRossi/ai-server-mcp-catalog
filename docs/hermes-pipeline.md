@@ -731,3 +731,120 @@ Safety conclusion:
 The Hermes pipeline remains valid after switching the local model to `qwen3.8:27b`.
 
 The new local model respects the orchestrator/tool boundary, supports the planner/pipeline bridge flow, and works with the isolated reviewer workflow on a realistic non-critical Flask repository.
+
+## A3.5 — Agent resource & bridge hardening (repository-only artifacts)
+
+- SCOPE: The A3.5 implementation artifacts (templates and tests) are repository-only; installation of them remains operator-only. This task changes NO live bridge, NO installed reviewer SOUL, NO systemd service, NO Docker, NO host configuration. Live installation/deployment happens later ONLY by the human operator, after review PASS. The audit script itself has TWO layers: Section A checks repository/template invariants and Section B checks installed-runtime invariants via read-only probes.
+
+### Artifacts
+
+- `templates/review_bridge_server.py` — bounded, read-only review evidence collection logic.
+- `templates/reviewer-SOUL.md` — verbatim-installable reviewer policy template.
+- `templates/pipeline_bridge_server.py` — deterministic, idempotent pipeline task-creation logic.
+- `templates/claude_bridge_server.py` — hardened, budget-bounded Claude CLI bridge.
+- `tests/test_review_bridge_template.py` — tests for the review evidence template.
+- `tests/test_pipeline_bridge_template.py` — tests for the pipeline task-creation template.
+- `tests/test_claude_bridge_template.py` — tests for the Claude CLI bridge template.
+- `scripts/audit-hermes-pipeline-hardening.sh` — two-layer invariant audit for all of the above: Section A repository/template invariants and Section B installed-runtime invariants (read-only probes of the installed runtime).
+
+### Invariant audit (`scripts/audit-hermes-pipeline-hardening.sh`)
+
+Two aggregated layers, reported as a single PASS/FAIL:
+
+- Section A — repository/template invariants: file-existence plus required/forbidden content checks for the four templates, the three test suites, and the docs. Purely repository-local; no host state is read (REPO-ONLY: this Section A layer probes no installed runtime).
+- Section B — installed-runtime invariants: read-only probes of the installed runtime (`/usr/local/lib/pipeline-bridge-mcp/server.py`, `/usr/local/lib/review-bridge-mcp/server.py`, `~/.hermes/SOUL.md`, `~/.hermes/config.yaml`, `~/.hermes/profiles/reviewer/config.yaml`, `~/.hermes/profiles/reviewer/SOUL.md`, and a read-only `reviewer tools --summary` probe). These preserve the previously validated hardening guarantees: installed pipeline_bridge review idempotency (`review:{implementation_task_id}`); global/default config does NOT expose `review_bridge` while the reviewer profile DOES; the default SOUL contains the "Async Kanban Boundary"; the reviewer SOUL contains the mandatory-evidence / `mcp__review_bridge__collect` requirement; the reviewer does NOT expose Memory; global/default DOES expose `review_archive_bridge` while the reviewer does NOT; the installed review_bridge `ALLOWED_TEST_COMMANDS` contains `./scripts/audit-hermes-pipeline-hardening.sh`; and repository status/cleanliness reporting for the pipeline repositories.
+- All Section B probes are read-only: they modify no runtime files and the audit installs, restarts, or repairs nothing.
+- Section B reports a clearly marked SKIPPED only when the Hermes runtime itself is not installed/present on the host; an individual failing invariant is always FAILED and is never downgraded to SKIPPED.
+- On the iamex production AI server the runtime is installed, so both layers execute and the audit must finish PASS.
+
+### Review evidence bridge (`templates/review_bridge_server.py`)
+
+Defaults:
+
+- `test_command` defaults to `"__skip__"`.
+- `changed_paths` defaults to an empty string (normalizes to an empty list).
+- `include_diff` defaults to `False`.
+- `include_repo_evidence` defaults to `True`.
+
+Bounds and behavior:
+
+- `MAX_CONTENT_WINDOW_LINES = 200` bounds any requested content window to at most 200 lines.
+- Each content-window request covers exactly one file — one file per content window.
+- When no content window is requested, `content_window` is reported as `"not-requested"` and the file content field is reported as `"SKIPPED"`.
+- `include_diff=true` requires at least one changed path, or evidence collection is rejected.
+- The allowed test commands are exactly these three, verbatim:
+  - `__skip__`
+  - `/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q`
+  - `./scripts/audit-hermes-pipeline-hardening.sh`
+- `__skip__` is an EXPLICIT no-test request — no substitution for any other command is ever made.
+
+### Reviewer policy (`templates/reviewer-SOUL.md`)
+
+- Review is read-only: the reviewer never edits code and never writes files.
+- A successful `review_bridge` collect must complete before any verdict is issued — no verdict from assumption, memory, or an unfulfilled collect.
+- Content windows are bounded to at most 200 lines, and each collect covers exactly one file per window.
+- No parallel collects.
+- About 8 successful collects maximum per review.
+- If a collect fails, the reviewer may make one deterministic correction and retry; if that also fails, it must stop and block, including the exact error text received.
+- The reviewer must block when the changed files for the workflow item cannot be identified — never guess paths.
+- The two verbatim test-command discipline rules:
+
+  "If test_command is __skip__, do not invent or substitute another command"
+
+  "If tests are required by the acceptance criteria but no valid explicit test command is available, block the task instead of guessing"
+
+### Pipeline bridge (`templates/pipeline_bridge_server.py`)
+
+Idempotency keys are produced by `stable_key(workdir, feature, role)` using exactly these three role formulas:
+
+- implementation → `stable_key(workdir, feature, "implementation")`
+- review → `stable_key(workdir, feature, "review:{implementation_task_id}")`
+- correction → `stable_key(workdir, feature, "correction:{review_task_id}")`
+
+Embedding the parent task ID (`implementation_task_id` for review, `review_task_id` for correction) directly into the key means two independent runs targeting different parent tasks can never collide on the same key, while repeated calls for the same parent task always resolve to the same key — this is what makes task creation idempotent instead of merely deduplicated by chance. Missing or empty parent IDs (`implementation_task_id` for review tasks, `review_task_id` for correction tasks) are rejected outright.
+
+### Claude bridge (`templates/claude_bridge_server.py`)
+
+- Public API: `run(workdir, task_id, prompt, ...)`.
+- Call budget threshold: `CALL_BUDGET_THRESHOLD = 4`. Calls 1-2 are tagged `normal`. Call 3 succeeds but is tagged `exceptional`/`budget-warning`. Call 4 and any later call are rejected with `BudgetExhaustedError` and NO subprocess invocation occurs.
+- Budget accounting is per-`task_id`.
+- A cross-process lock (`fcntl.flock`) on a stable lock file (`ledger.lock`) guards every ledger read/write.
+- Ledger writes are atomic: temp-file write + `os.fsync` + `os.replace`.
+- Fail-closed: a malformed, wrong-schema, or corrupt ledger raises `LedgerCorruptionError` and is never reset or repaired.
+- A reserved call is consumed (recorded against the budget) even when the subprocess invocation, JSON parsing, or telemetry validation step subsequently fails.
+- Telemetry is persisted per accepted call with every one of these fields: `duration_ms`, `duration_api_ms`, `num_turns`, `total_cost_usd`, `session_id`, `subtype`, `is_error`, `iterations`, `modelUsage`, `usage.input_tokens`, `usage.cache_creation_input_tokens`, `usage.cache_read_input_tokens`, `usage.output_tokens`, `usage.iterations`.
+
+### Paths
+
+- `workdir` must be an existing strict-descendant directory of `/opt/ai/projects` — the root itself is rejected.
+- `changed_paths` entries must be relative, must not contain `..`, and must resolve inside `workdir` (a symlink-escape attempt is rejected).
+
+### Subprocess safety
+
+- The Claude CLI argv is passed as a list, never a string, with `shell=False` (never `shell=True`).
+- `cwd` is the validated, realpath-resolved `workdir`.
+- Required Claude flags: `--print`, `--output-format`, `json`, `--no-session-persistence`.
+- `--max-budget-usd` is appended only when the caller passes an explicit non-`None` value.
+- there is no token cap and no default hard dollar cap — telemetry is persist-only and never itself enforces a budget.
+
+### No repo assumptions
+
+The templates make no `app.py` or `tests/test_app.py` (or any other specific framework/layout) assumption — they operate purely on caller-supplied paths and identifiers.
+
+### Verification
+
+Both commands below must pass:
+
+```
+/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q
+bash scripts/audit-hermes-pipeline-hardening.sh
+```
+
+Expected exit behavior:
+
+- `/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q` exits 0 with all tests passing.
+- `bash scripts/audit-hermes-pipeline-hardening.sh` prints `PASS` and exits 0, or prints a `FAIL` listing and exits 1.
+
+### Operator
+
+Live installation of any of the above templates is excluded from this task and may occur later only through the human operator, after review PASS.
