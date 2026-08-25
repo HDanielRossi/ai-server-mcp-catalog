@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Repo-only, versioned copy of the installed /usr/local/bin/planner-bridge.
+#
+# A3.5.0 bootstrap: adds repeatable --context-file <relative-path> support
+# so callers can hand the planner explicit repository context in addition to
+# the existing automatic bounded snapshot below. Explicit context is
+# additive: the automatic snapshot is unchanged. This script is the
+# filesystem/security enforcement boundary for explicit context files.
+
+MAX_CONTEXT_FILES=12
+MAX_CONTEXT_FILE_BYTES=262144
+MAX_CONTEXT_TOTAL_BYTES=524288
+
+usage() {
+  echo "Usage: planner-bridge <workdir> <prompt> [--context-file <relative-path> ...]"
+}
+
+if [[ $# -lt 2 ]]; then
+  usage
+  exit 2
+fi
+
+WORKDIR="$1"
+USER_PROMPT="$2"
+shift 2
+
+CONTEXT_FILES=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --context-file)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for --context-file"
+        exit 2
+      fi
+      CONTEXT_FILES+=("$2")
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1"
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [[ ${#CONTEXT_FILES[@]} -gt $MAX_CONTEXT_FILES ]]; then
+  echo "Too many --context-file entries: ${#CONTEXT_FILES[@]} (max $MAX_CONTEXT_FILES)"
+  exit 2
+fi
+
+if [[ ! -d "$WORKDIR" ]]; then
+  echo "Invalid workdir: $WORKDIR"
+  exit 2
+fi
+
+REAL_WORKDIR="$(realpath "$WORKDIR")"
+ALLOWED_ROOT="/opt/ai/projects"
+
+case "$REAL_WORKDIR" in
+  "$ALLOWED_ROOT"/*) ;;
+  *)
+    echo "Refusing workdir outside $ALLOWED_ROOT: $REAL_WORKDIR"
+    exit 2
+    ;;
+esac
+
+cd "$REAL_WORKDIR"
+
+# ===== EXPLICIT CONTEXT VALIDATION =====
+# Every --context-file is fully validated (existence, regular-file, containment
+# after symlink resolution, per-file size) BEFORE any content is read and
+# BEFORE planner-codex is ever invoked. A failed validation exits non-zero
+# and planner-codex does not run.
+
+CONTEXT_REAL_PATHS=()
+CONTEXT_TOTAL_BYTES=0
+
+if [[ ${#CONTEXT_FILES[@]} -gt 0 ]]; then
+  for cf in "${CONTEXT_FILES[@]}"; do
+    if [[ "$cf" == /* ]]; then
+      echo "Explicit context file must be relative, got absolute path: $cf"
+      exit 2
+    fi
+
+    CANDIDATE="$REAL_WORKDIR/$cf"
+
+    if [[ ! -e "$CANDIDATE" ]]; then
+      echo "Explicit context file does not exist: $cf"
+      exit 2
+    fi
+
+    if [[ -d "$CANDIDATE" ]]; then
+      echo "Explicit context file is a directory, not a regular file: $cf"
+      exit 2
+    fi
+
+    REAL_CF="$(realpath -e "$CANDIDATE" 2>/dev/null)" || {
+      echo "Explicit context file could not be resolved: $cf"
+      exit 2
+    }
+
+    case "$REAL_CF" in
+      "$REAL_WORKDIR"/*) ;;
+      *)
+        echo "Explicit context file escapes workdir: $cf"
+        exit 2
+        ;;
+    esac
+
+    if [[ ! -f "$REAL_CF" ]]; then
+      echo "Explicit context file is not a regular file: $cf"
+      exit 2
+    fi
+
+    CF_BYTES="$(stat -c%s "$REAL_CF")"
+    if [[ "$CF_BYTES" -gt $MAX_CONTEXT_FILE_BYTES ]]; then
+      echo "Explicit context file exceeds ${MAX_CONTEXT_FILE_BYTES} bytes: $cf ($CF_BYTES bytes)"
+      exit 2
+    fi
+
+    CONTEXT_TOTAL_BYTES=$((CONTEXT_TOTAL_BYTES + CF_BYTES))
+    if [[ "$CONTEXT_TOTAL_BYTES" -gt $MAX_CONTEXT_TOTAL_BYTES ]]; then
+      echo "Explicit context files exceed total ${MAX_CONTEXT_TOTAL_BYTES} bytes"
+      exit 2
+    fi
+
+    CONTEXT_REAL_PATHS+=("$REAL_CF")
+  done
+fi
+
+SNAPSHOT="$(mktemp)"
+trap 'rm -f "$SNAPSHOT"' EXIT
+
+{
+  echo "===== VERIFIED_WORKDIR ====="
+  pwd
+
+  echo
+  echo "===== GIT_STATUS ====="
+  git status --short --branch 2>&1 || true
+
+  echo
+  echo "===== GIT_LAST_COMMITS ====="
+  git log --oneline -5 2>&1 || true
+
+  echo
+  echo "===== TOP_LEVEL_TREE ====="
+  find . -maxdepth 3 \
+    -not -path './.git/*' \
+    -not -path './.venv/*' \
+    -not -path './__pycache__/*' \
+    -not -path './.pytest_cache/*' \
+    -type f | sort | sed 's#^\./##' | head -200
+
+  for f in PROJECT.md ARCHITECTURE.md DECISIONS.md TODO.md README.md .ai/README.md .ai/hermes/repo-contract.md app.py tests/test_app.py docs/production-repo-onboarding.md docs/hermes-pipeline.md templates/hermes-repo-contract.md scripts/audit-hermes-pipeline-hardening.sh scripts/hermes-repo-preflight.sh; do
+    if [[ -f "$f" ]]; then
+      echo
+      echo "===== FILE: $f ====="
+      if [[ "$f" == *.md ]]; then
+        echo "----- MARKDOWN_HEADINGS: $f -----"
+        grep -nE '^(#|##|###) ' "$f" 2>&1 || true
+        echo "----- CONTENT: $f -----"
+        sed -n '1,700p' "$f"
+      else
+        sed -n '1,260p' "$f"
+      fi
+    fi
+  done
+} > "$SNAPSHOT"
+
+# ===== EXPLICIT CONTEXT SNAPSHOT (complete, unbounded per file up to the
+# limits enforced above; user-supplied order preserved) =====
+EXPLICIT_CONTEXT_BLOCK=""
+if [[ ${#CONTEXT_FILES[@]} -gt 0 ]]; then
+  EXPLICIT_CONTEXT_BLOCK="$(
+    for i in "${!CONTEXT_FILES[@]}"; do
+      cf="${CONTEXT_FILES[$i]}"
+      real_cf="${CONTEXT_REAL_PATHS[$i]}"
+      cf_bytes="$(stat -c%s "$real_cf")"
+      cf_sha="$(sha256sum "$real_cf" | awk '{print $1}')"
+      echo "===== EXPLICIT_CONTEXT_BEGIN ====="
+      echo "path=$cf"
+      echo "bytes=$cf_bytes"
+      echo "sha256=$cf_sha"
+      cat "$real_cf"
+      echo
+      echo "===== EXPLICIT_CONTEXT_END ====="
+    done
+  )"
+fi
+
+EXPLICIT_CONTEXT_SECTION=""
+if [[ -n "$EXPLICIT_CONTEXT_BLOCK" ]]; then
+  EXPLICIT_CONTEXT_SECTION="
+
+Explicit context files (verbatim, complete, in the order supplied):
+$EXPLICIT_CONTEXT_BLOCK"
+fi
+
+PROMPT="$(cat <<PROMPT_EOF
+You are planner-codex running through planner-bridge.
+
+Hard constraints:
+- Do not use Kanban.
+- Do not create tasks.
+- Do not modify files.
+- Do not claim to inspect anything outside the provided snapshot and explicit context files.
+- The verified workdir is exactly: $REAL_WORKDIR
+- Preserve this path exactly. Never rewrite it as /opt/ai-projects or any other variant.
+- Use only the context snapshot and explicit context files below.
+- If the snapshot and explicit context files are insufficient, return NEED_MORE_CONTEXT with the exact relative files or exact read-only commands needed.
+
+User planning request:
+$USER_PROMPT
+
+Context snapshot:
+$(cat "$SNAPSHOT")$EXPLICIT_CONTEXT_SECTION
+PROMPT_EOF
+)"
+
+# Do not pass PROMPT through argv. Linux limits the size of any single argv
+# element (MAX_ARG_STRLEN, typically 131072 bytes), which is smaller than the
+# explicit-context contract. Feed the complete prompt over stdin instead.
+#
+# The tiny Python runner reproduces `planner-codex` semantics without modifying
+# Hermes itself:
+#   1. cd to the verified workdir (equivalent to `--in`)
+#   2. install `-p planner-codex` in sys.argv before importing hermes_cli.main
+#      so _apply_profile_override() selects the profile before profile-sensitive
+#      imports
+#   3. read the complete prompt from stdin
+#   4. invoke Hermes' normal one-shot cleanup/exit path with the same toolsets
+PLANNER_CODEX_PYTHON="${PLANNER_CODEX_PYTHON:-/home/hdgr/.hermes/hermes-agent/venv/bin/python3}"
+
+if [[ ! -x "$PLANNER_CODEX_PYTHON" ]]; then
+  echo "planner-codex Python runtime is not executable: $PLANNER_CODEX_PYTHON" >&2
+  exit 1
+fi
+
+RUNNER_CODE='import os
+import sys
+
+workdir = sys.argv[1]
+os.chdir(workdir)
+
+# Must precede importing hermes_cli.main: that module applies the profile
+# override during import, before profile-sensitive Hermes modules are loaded.
+sys.argv = ["hermes", "-p", "planner-codex"]
+
+from hermes_cli.main import _run_and_exit_oneshot
+
+prompt = sys.stdin.read()
+_run_and_exit_oneshot(
+    prompt,
+    toolsets="clarify,context_engine,memory",
+)
+'
+
+printf '%s' "$PROMPT" | "$PLANNER_CODEX_PYTHON" -c "$RUNNER_CODE" "$REAL_WORKDIR"

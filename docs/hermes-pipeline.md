@@ -848,3 +848,64 @@ Expected exit behavior:
 ### Operator
 
 Live installation of any of the above templates is excluded from this task and may occur later only through the human operator, after review PASS.
+
+## A3.5.0 — Planner explicit-context bootstrap (repository-only artifacts)
+
+- SCOPE: bootstrap exception, repository-only. `templates/planner_bridge_server.py` and `scripts/planner-bridge` are versioned copies of the installed planner-bridge MCP server and wrapper, extended with an explicit-context feature. No runtime deployment occurs as part of this repository implementation — the live `/usr/local/lib/planner-bridge-mcp/server.py` and `/usr/local/bin/planner-bridge` are unchanged and continue serving traffic exactly as before. Installing this bootstrap live is a separate, human-authorized rollout that happens later, after review PASS.
+- WHY: the production planner bridge cannot currently obtain explicit repository context needed to plan its own repair. Its live wrapper builds a fixed, truncated automatic snapshot (bounded `find`/`sed` excerpts of a short allowlist of files) with no way for a caller to hand it additional, complete, caller-chosen file content.
+
+### Artifacts
+
+- `templates/planner_bridge_server.py` — versioned MCP server; a real, directly installable `mcp.server.MCPServer` adapter (not a pure-helper template).
+- `scripts/planner-bridge` — versioned, hardened wrapper; the filesystem/security enforcement boundary for explicit context files.
+- `tests/test_planner_bridge_template.py` — installability/regression tests for the MCP server template.
+- `tests/test_planner_bridge_wrapper.py` — regression tests for the wrapper, substituting a harmless fake Python transport executable through `PLANNER_CODEX_PYTHON` (never the real Hermes planner/model).
+
+### API: `run(workdir, prompt, context_files=None)`
+
+- Backward compatible: existing callers supplying only `workdir` and `prompt` are unaffected — `context_files` is additive and optional.
+- The automatic bounded snapshot (git status, git log, top-level tree, a short allowlist of doc/script files, each bounded by `head -200` / `sed -n '1,700p'` or `1,260p'`) is unchanged and still always runs.
+- `context_files` accepts `None` or a list of relative path strings, at most `MAX_CONTEXT_FILES = 12` entries; validated before any subprocess is started. The wrapper is invoked with argv (never `shell=True`): `/usr/local/bin/planner-bridge <workdir> <prompt> --context-file <path> --context-file <path> ...`.
+- Explicit files may be tracked or untracked in git — the wrapper checks the filesystem, not git status.
+
+### Explicit context security contract (enforced by `scripts/planner-bridge`, before the Hermes planner one-shot runs)
+
+- Each `--context-file` must be relative (absolute paths are rejected), must resolve (via `realpath -e`) to a regular file, and that resolved path must remain inside the canonicalized workdir — this single check rejects both `..` traversal and any symlink whose target escapes the workdir. A symlink is permitted only when its resolved target stays inside the workdir.
+- Limits: `MAX_CONTEXT_FILES = 12`, `MAX_CONTEXT_FILE_BYTES = 262144` (256 KiB per file), `MAX_CONTEXT_TOTAL_BYTES = 524288` (512 KiB combined). All limits are enforced before the Hermes planner one-shot is invoked; a failed validation exits non-zero and the planner never runs. No file is ever silently truncated — a file over the limit is rejected outright.
+- The automatically selected snapshot keeps its existing bounded `sed`/`head` behavior unchanged; this feature does not make the automatic snapshot unbounded.
+
+### Explicit context snapshot format
+
+Each accepted file is embedded completely, in the order supplied on the command line, with unambiguous boundaries:
+
+```
+===== EXPLICIT_CONTEXT_BEGIN =====
+path=<requested relative path>
+bytes=<exact byte count>
+sha256=<sha256>
+<complete file contents>
+===== EXPLICIT_CONTEXT_END =====
+```
+
+### Temporary context files
+
+Callers that need to stage an explicit context file that isn't already part of the project tree can use the repository's own already-`.gitignore`d `tmp/` directory as a relative-path scratch location (e.g. `--context-file tmp/notes.md`) — it resolves inside the workdir like any other relative path and requires no additional allowlisting.
+
+### Prompt transport and `MAX_ARG_STRLEN`
+
+The original wrapper delivered the complete assembled prompt as one `-z "$PROMPT"` argv element. During A3.5.0 bootstrap verification, a real-repository probe with a 118982-byte explicit context bundle plus the normal automatic snapshot reproduced Linux `MAX_ARG_STRLEN`: `execve()` failed with `Argument list too long` before planner execution. A small-workdir test had previously hidden this integration failure.
+
+A3.5.0 therefore does not transport the assembled prompt through argv. `scripts/planner-bridge` keeps all filesystem validation and snapshot construction in the wrapper, then pipes the complete prompt over stdin to a small Python runner selected by `PLANNER_CODEX_PYTHON` (defaulting to the Hermes Agent venv Python). Only small control values such as the verified workdir and runner source remain in argv.
+
+The runner changes to the verified workdir, installs `sys.argv = ["hermes", "-p", "planner-codex"]` before importing `hermes_cli.main`, and therefore reuses Hermes' normal early `_apply_profile_override()` behavior: the planner profile's `HERMES_HOME` is selected before profile-sensitive configuration, dotenv, MCP, and other imports occur. It then reads the complete prompt with `sys.stdin.read()` and invokes Hermes' normal `_run_and_exit_oneshot()` path with `clarify,context_engine,memory`.
+
+This transport removes the single-argv-size bottleneck without weakening the explicit-context limits: `MAX_CONTEXT_FILES = 12`, `MAX_CONTEXT_FILE_BYTES = 262144`, and `MAX_CONTEXT_TOTAL_BYTES = 524288` remain the accepted-input contract. The wrapper regression suite includes a >100 KiB explicit-context case using the normal repository snapshot so the previously observed `MAX_ARG_STRLEN` failure cannot be hidden by an artificially small workdir.
+
+### Verification
+
+Both commands below must pass, in addition to the existing verification commands above:
+
+```
+/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q tests/test_planner_bridge_template.py tests/test_planner_bridge_wrapper.py
+bash scripts/audit-hermes-pipeline-hardening.sh
+```

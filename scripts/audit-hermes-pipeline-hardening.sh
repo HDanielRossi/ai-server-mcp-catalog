@@ -53,9 +53,13 @@ require_file_nonempty "templates/review_bridge_server.py"
 require_file_nonempty "templates/reviewer-SOUL.md"
 require_file_nonempty "templates/pipeline_bridge_server.py"
 require_file_nonempty "templates/claude_bridge_server.py"
+require_file_nonempty "templates/planner_bridge_server.py"
+require_file_nonempty "scripts/planner-bridge"
 require_file_nonempty "tests/test_review_bridge_template.py"
 require_file_nonempty "tests/test_pipeline_bridge_template.py"
 require_file_nonempty "tests/test_claude_bridge_template.py"
+require_file_nonempty "tests/test_planner_bridge_template.py"
+require_file_nonempty "tests/test_planner_bridge_wrapper.py"
 
 echo
 echo "2) docs A3.5 marker:"
@@ -190,6 +194,95 @@ for s in "${CLAUDE_ABSENT_STRINGS[@]}"; do
 done
 
 echo
+echo "6a) planner-bridge MCP server template (templates/planner_bridge_server.py) — A3.5.0 bootstrap:"
+PLANNER_SERVER_FILE="$REPO_DIR/templates/planner_bridge_server.py"
+PLANNER_SERVER_STRINGS=(
+  'from mcp.server import MCPServer'
+  'MCPServer("planner-bridge")'
+  '@mcp.tool()'
+  'def run(workdir: str, prompt: str, context_files'
+  'context_files: list[str] | None = None'
+  'MAX_CONTEXT_FILES'
+  '--context-file'
+  'if __name__ == "__main__":'
+  'mcp.run()'
+  'WRAPPER_PATH = "/usr/local/bin/planner-bridge"'
+)
+for s in "${PLANNER_SERVER_STRINGS[@]}"; do
+  if grep_ok "$PLANNER_SERVER_FILE" "$s"; then
+    check_ok "planner-bridge server template contains: $s"
+  else
+    check_fail "planner-bridge server template missing: $s"
+  fi
+done
+
+PLANNER_SERVER_ABSENT_STRINGS=(
+  'shell=True'
+)
+for s in "${PLANNER_SERVER_ABSENT_STRINGS[@]}"; do
+  if grep_absent "$PLANNER_SERVER_FILE" "$s"; then
+    check_ok "planner-bridge server template does not contain: $s"
+  else
+    check_fail "planner-bridge server template must not contain: $s"
+  fi
+done
+
+echo
+echo "6b) planner-bridge wrapper (scripts/planner-bridge) — A3.5.0 explicit-context bootstrap:"
+PLANNER_WRAPPER_FILE="$REPO_DIR/scripts/planner-bridge"
+PLANNER_WRAPPER_STRINGS=(
+  'set -Eeuo pipefail'
+  'ALLOWED_ROOT="/opt/ai/projects"'
+  '--context-file'
+  'MAX_CONTEXT_FILES=12'
+  'MAX_CONTEXT_FILE_BYTES=262144'
+  'MAX_CONTEXT_TOTAL_BYTES=524288'
+  'must be relative'
+  'escapes workdir'
+  'does not exist'
+  'realpath -e'
+  '===== EXPLICIT_CONTEXT_BEGIN ====='
+  '===== EXPLICIT_CONTEXT_END ====='
+  'path=$cf'
+  'bytes=$cf_bytes'
+  'sha256=$cf_sha'
+  'sha256sum'
+  'clarify,context_engine,memory'
+  'PLANNER_CODEX_PYTHON='
+  'sys.argv = ["hermes", "-p", "planner-codex"]'
+  'prompt = sys.stdin.read()'
+  'from hermes_cli.main import _run_and_exit_oneshot'
+  'printf '\''%s'\'' "$PROMPT" | "$PLANNER_CODEX_PYTHON"'
+)
+for s in "${PLANNER_WRAPPER_STRINGS[@]}"; do
+  if grep_ok "$PLANNER_WRAPPER_FILE" "$s"; then
+    check_ok "planner-bridge wrapper contains: $s"
+  else
+    check_fail "planner-bridge wrapper missing: $s"
+  fi
+done
+
+PLANNER_WRAPPER_ABSENT_STRINGS=(
+  '-z "$PROMPT"'
+  '--oneshot "$PROMPT"'
+  'exec planner-codex'
+)
+
+for s in "${PLANNER_WRAPPER_ABSENT_STRINGS[@]}"; do
+  if grep_absent "$PLANNER_WRAPPER_FILE" "$s"; then
+    check_ok "planner-bridge wrapper does not contain legacy giant-argv transport: $s"
+  else
+    check_fail "planner-bridge wrapper must not contain legacy giant-argv transport: $s"
+  fi
+done
+
+if [[ -x "$PLANNER_WRAPPER_FILE" ]]; then
+  check_ok "scripts/planner-bridge is executable"
+else
+  check_fail "scripts/planner-bridge is not executable (expected mode 100755)"
+fi
+
+echo
 echo "7) docs (docs/hermes-pipeline.md):"
 DOCS_STRINGS=(
   'reviewer'
@@ -207,6 +300,26 @@ DOCS_STRINGS=(
   'operator'
 )
 for s in "${DOCS_STRINGS[@]}"; do
+  if grep_ok "$DOCS_FILE" "$s"; then
+    check_ok "docs contains: $s"
+  else
+    check_fail "docs missing: $s"
+  fi
+done
+
+echo
+echo "7a) docs A3.5.0 planner explicit-context bootstrap markers:"
+DOCS_A350_STRINGS=(
+  'A3.5.0'
+  'context_files'
+  '--context-file'
+  'MAX_CONTEXT_FILES'
+  'MAX_CONTEXT_FILE_BYTES'
+  'MAX_CONTEXT_TOTAL_BYTES'
+  'EXPLICIT_CONTEXT_BEGIN'
+  'EXPLICIT_CONTEXT_END'
+)
+for s in "${DOCS_A350_STRINGS[@]}"; do
   if grep_ok "$DOCS_FILE" "$s"; then
     check_ok "docs contains: $s"
   else
