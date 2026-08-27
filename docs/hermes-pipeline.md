@@ -749,13 +749,17 @@ The new local model respects the orchestrator/tool boundary, supports the planne
 
 ### Invariant audit (`scripts/audit-hermes-pipeline-hardening.sh`)
 
-Two aggregated layers, reported as a single PASS/FAIL:
+The audit is split into explicit, mutually exclusive modes (A3.5.1d):
 
-- Section A — repository/template invariants: file-existence plus required/forbidden content checks for the four templates, the three test suites, and the docs. Purely repository-local; no host state is read (REPO-ONLY: this Section A layer probes no installed runtime).
-- Section B — installed-runtime invariants: read-only probes of the installed runtime (`/usr/local/lib/pipeline-bridge-mcp/server.py`, `/usr/local/lib/review-bridge-mcp/server.py`, `~/.hermes/SOUL.md`, `~/.hermes/config.yaml`, `~/.hermes/profiles/reviewer/config.yaml`, `~/.hermes/profiles/reviewer/SOUL.md`, and a read-only `reviewer tools --summary` probe). These preserve the previously validated hardening guarantees: installed pipeline_bridge review idempotency (`review:{implementation_task_id}`); global/default config does NOT expose `review_bridge` while the reviewer profile DOES; the default SOUL contains the "Async Kanban Boundary"; the reviewer SOUL contains the mandatory-evidence / `mcp__review_bridge__collect` requirement; the reviewer does NOT expose Memory; global/default DOES expose `review_archive_bridge` while the reviewer does NOT; the installed review_bridge `ALLOWED_TEST_COMMANDS` contains `./scripts/audit-hermes-pipeline-hardening.sh`; and repository status/cleanliness reporting for the pipeline repositories.
-- All Section B probes are read-only: they modify no runtime files and the audit installs, restarts, or repairs nothing.
-- Section B reports a clearly marked SKIPPED only when the Hermes runtime itself is not installed/present on the host; an individual failing invariant is always FAILED and is never downgraded to SKIPPED.
-- On the iamex production AI server the runtime is installed, so both layers execute and the audit must finish PASS.
+- `--repo-only` — repository/template invariants only: file-existence plus required/forbidden content checks for the four templates, the test suites, and the docs. Purely repository-local; no installed/live runtime is read, and this mode never fails merely because live runtime state differs from or is missing relative to the repository templates. Bare invocation (`bash scripts/audit-hermes-pipeline-hardening.sh`, no flags) is an alias for `--repo-only`.
+- `--runtime` — installed/live runtime invariants only (read-only probes) of `/usr/local/lib/pipeline-bridge-mcp/server.py`, `/usr/local/lib/review-bridge-mcp/server.py`, `~/.hermes/SOUL.md`, `~/.hermes/config.yaml`, `~/.hermes/profiles/reviewer/config.yaml`, `~/.hermes/profiles/reviewer/SOUL.md`, a read-only `reviewer tools --summary` probe, and pipeline-repository status/cleanliness reporting. These preserve the previously validated hardening guarantees: installed pipeline_bridge review idempotency (`review:{implementation_task_id}`); global/default config does NOT expose `review_bridge` while the reviewer profile DOES; the default SOUL contains the "Async Kanban Boundary"; the reviewer SOUL contains the mandatory-evidence / `mcp__review_bridge__collect` requirement; the reviewer does NOT expose Memory; global/default DOES expose `review_archive_bridge` while the reviewer does NOT; and the installed review_bridge `ALLOWED_TEST_COMMANDS` contains `./scripts/audit-hermes-pipeline-hardening.sh`. Unlike the previous single-script behavior, `--runtime` FAILS (exit 1) when the live runtime is missing or non-compliant instead of silently reporting SKIPPED — a missing live file is a runtime finding, not something to tolerate.
+- `--all` — runs `--repo-only` then `--runtime`, with clearly labeled `SECTION: REPO-ONLY` and `SECTION: RUNTIME` output, and fails if either suite fails.
+- `-h` / `--help` prints usage and exits 0. An unknown flag, or more than one mode flag (including the same mode flag repeated), is a usage error: exit 2.
+- All runtime probes remain read-only: they modify no runtime files and the audit installs, restarts, or repairs nothing.
+- The live runtime root read by `--runtime`/`--all` is `${AUDIT_RUNTIME_ROOT:-<real live paths>}`: unset (the normal case) means the real documented live paths above; setting `AUDIT_RUNTIME_ROOT` redirects those same checks at a fixture root (layout: `usr/local/lib/pipeline-bridge-mcp/server.py`, `usr/local/lib/review-bridge-mcp/server.py`, `home/.hermes/config.yaml`, `home/.hermes/SOUL.md`, `home/.hermes/profiles/reviewer/config.yaml`, `home/.hermes/profiles/reviewer/SOUL.md`) for hermetic testing. The `reviewer tools --summary` probe and the pipeline-repository status/cleanliness reporting inspect true host-only state (an installed CLI and sibling project repositories) and print SKIPPED under an `AUDIT_RUNTIME_ROOT` override, since a fixture cannot supply either.
+- Developers should run `--repo-only` (or bare) during development, before any runtime rollout, since it never depends on what is or isn't installed on the host. Operators should run `--runtime` to validate a deployed/live installation. `--all` is appropriate for a full pre-production or periodic check on a host where the runtime is expected to already be installed.
+- Repository audit success (`--repo-only` PASS) does NOT imply the runtime has been installed or deployed; runtime rollout of any template remains a separate, human-authorized operation performed later by the operator.
+- On the iamex production AI server the runtime is installed, so `--all` (or `--runtime`) executes real checks against it and must finish PASS.
 
 ### Review evidence bridge (`templates/review_bridge_server.py`)
 
@@ -843,11 +847,11 @@ bash scripts/audit-hermes-pipeline-hardening.sh
 Expected exit behavior:
 
 - `/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q` exits 0 with all tests passing.
-- `bash scripts/audit-hermes-pipeline-hardening.sh` prints `PASS` and exits 0, or prints a `FAIL` listing and exits 1.
+- `bash scripts/audit-hermes-pipeline-hardening.sh` (bare == `--repo-only`) prints `PASS` and exits 0, or prints a `FAIL` listing and exits 1.
 
 ### Operator
 
-Live installation of any of the above templates is excluded from this task and may occur later only through the human operator, after review PASS.
+Live installation of any of the above templates is excluded from this task and may occur later only through the human operator, after review PASS. See "Invariant audit" above for `--runtime`/`--all`, the operator-facing modes used to validate that installation once it happens; repository audit success never implies that installation occurred.
 
 ## A3.5.0 — Planner explicit-context bootstrap (repository-only artifacts)
 

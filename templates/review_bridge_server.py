@@ -1,16 +1,33 @@
 """Repo-only template for bounded, read-only review evidence collection.
 
 This module is a template: it is copied and installed by the operator into
-its running location. It is pure logic with no side effects and imports
-nothing that is network-dependent or live-bridge-dependent. Stdlib only
-(json, os, re); no subprocess, no sockets, no HTTP clients.
+its running location. It doubles as a real, executable MCP runtime adapter:
+importing it is pure and side-effect free (no subprocess, no sockets, no
+server startup), but running it as `__main__` starts an MCP server (name
+"review-bridge") exposing a single `collect` tool that gathers bounded,
+fresh, read-only review evidence.
 
-All functions are deterministic: identical inputs always produce identical
-outputs. There is no use of time, randomness, network, or subprocess.
+The deterministic, pure-logic helpers below (normalize_changed_paths,
+validate_test_command, validate_content_window, collect_evidence) remain
+side-effect free and are reused by the real `collect` entrypoint for input
+validation before any subprocess is spawned. All subprocess invocation is
+argv-list only (never shell=True), bounded by
+DEFAULT_COLLECT_TIMEOUT_SECONDS, never mutates git state, and never touches
+the network.
 """
 
 import re
+import shlex
+import subprocess
+from pathlib import Path
 
+from mcp.server import MCPServer
+
+
+ALLOWED_ROOT = Path("/opt/ai/projects").resolve()
+DEFAULT_COLLECT_TIMEOUT_SECONDS = 60
+MAX_CONTENT_WINDOW_BYTES = 20_000
+MAX_CAPTURED_OUTPUT_CHARS = 4_000
 
 DEFAULT_TEST_COMMAND = "__skip__"
 MAX_CONTENT_WINDOW_LINES = 200
@@ -137,3 +154,252 @@ def collect_evidence(
         "diff": "requested" if include_diff else "not-requested",
         "status": "ok",
     }
+
+
+# --- real, read-only evidence collection -----------------------------------
+
+
+def validate_workdir(workdir):
+    """Resolve and validate the reviewed workdir before any subprocess is spawned.
+
+    Mirrors pipeline_bridge_server.validate_workdir: rejects a non-absolute
+    path before resolving it, requires the resolved path to exist and be a
+    directory, and requires it to remain inside ALLOWED_ROOT (rejecting
+    `..`/symlink escapes via Path.resolve()).
+    """
+    if not isinstance(workdir, str) or not workdir:
+        raise ReviewBridgeError("workdir must be a non-empty string")
+    if not Path(workdir).is_absolute():
+        raise ReviewBridgeError("workdir must be an absolute path")
+    resolved = Path(workdir).resolve()
+    if not (resolved.exists() and resolved.is_dir()):
+        raise ReviewBridgeError(f"workdir does not exist or is not a directory: {resolved}")
+    try:
+        resolved.relative_to(ALLOWED_ROOT)
+    except ValueError:
+        raise ReviewBridgeError(f"workdir is outside the allowed root {ALLOWED_ROOT}: {resolved}")
+    return resolved
+
+
+def _resolve_changed_path(relative_changed_path, resolved_workdir):
+    """Resolve a single, already-normalized relative changed_path and require it to stay inside resolved_workdir."""
+    resolved = (resolved_workdir / relative_changed_path).resolve()
+    try:
+        resolved.relative_to(resolved_workdir)
+    except ValueError:
+        raise ReviewBridgeError(f"changed_path escapes workdir: {relative_changed_path}")
+    return resolved
+
+
+def _truncate_output(text, max_chars=MAX_CAPTURED_OUTPUT_CHARS):
+    if text is None:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n...[truncated to {max_chars} chars]"
+
+
+def _run_argv(argv, cwd, timeout=DEFAULT_COLLECT_TIMEOUT_SECONDS):
+    """Run argv as a bounded, read-only subprocess (shell=False, no shell interpolation).
+
+    Never raises on timeout or a non-zero exit status: both are captured as a
+    structured record (command, exit_code, timed_out, stdout, stderr) so a
+    caller can report a structured error instead of crashing.
+    """
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "command": list(argv),
+            "exit_code": None,
+            "timed_out": True,
+            "stdout": "",
+            "stderr": "",
+        }
+    return {
+        "command": list(argv),
+        "exit_code": completed.returncode,
+        "timed_out": False,
+        "stdout": _truncate_output(completed.stdout),
+        "stderr": _truncate_output(completed.stderr),
+    }
+
+
+def _verify_git_repo(resolved_workdir):
+    """Confirm resolved_workdir is inside a git work tree; fail closed with an explicit error otherwise."""
+    record = _run_argv(["git", "rev-parse", "--is-inside-work-tree"], resolved_workdir)
+    if record["timed_out"] or record["exit_code"] != 0 or record["stdout"].strip() != "true":
+        raise ReviewBridgeError(f"workdir is not a usable git repository: {resolved_workdir}")
+    return record
+
+
+def _git_status(resolved_workdir):
+    return _run_argv(["git", "status", "--short"], resolved_workdir)
+
+
+def _git_diff_name_only(resolved_workdir, relative_changed_path):
+    return _run_argv(["git", "diff", "--name-only", "--", relative_changed_path], resolved_workdir)
+
+
+def _git_diff(resolved_workdir, relative_changed_path):
+    return _run_argv(["git", "diff", "--", relative_changed_path], resolved_workdir)
+
+
+def _git_diff_check(resolved_workdir, relative_changed_path):
+    return _run_argv(["git", "diff", "--check", "--", relative_changed_path], resolved_workdir)
+
+
+def _read_content_window(resolved_path, start_line, end_line):
+    """Read a bounded window of resolved_path: at most (end_line - start_line + 1) lines,
+    capped overall at MAX_CONTENT_WINDOW_LINES lines and MAX_CONTENT_WINDOW_BYTES bytes.
+    Never reads or returns a full-file dump. Returns None if the path is missing or not a file.
+    """
+    if not resolved_path.exists() or not resolved_path.is_file():
+        return None
+
+    lines = []
+    total_bytes = 0
+    with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
+        for line_number, line in enumerate(f, start=1):
+            if line_number < start_line:
+                continue
+            if line_number > end_line:
+                break
+            total_bytes += len(line.encode("utf-8"))
+            if total_bytes > MAX_CONTENT_WINDOW_BYTES:
+                lines.append(f"...[truncated at {MAX_CONTENT_WINDOW_BYTES} bytes]")
+                break
+            lines.append(line)
+
+    return "".join(lines)
+
+
+def _run_test_command(validated_test_command, resolved_workdir, timeout=DEFAULT_COLLECT_TIMEOUT_SECONDS):
+    """Execute an already-allowlist-validated test_command read-only, as an argv list."""
+    if validated_test_command == DEFAULT_TEST_COMMAND:
+        return {"command": validated_test_command, "skipped": True}
+
+    argv = shlex.split(validated_test_command)
+    record = _run_argv(argv, resolved_workdir, timeout=timeout)
+    record["skipped"] = False
+    return record
+
+
+def collect(workdir, changed_path=None, test_command=None, content_window=None):
+    """Collect bounded, fresh, read-only review evidence for a single review session.
+
+    All inputs (workdir containment, changed_path containment, test_command
+    allowlist membership, content_window shape) are validated up front,
+    fail-closed, before any subprocess or filesystem read is attempted.
+
+    Evidence gathered (all read-only, argv-list subprocess, shell=False,
+    bounded by DEFAULT_COLLECT_TIMEOUT_SECONDS, no git mutation, no network):
+      - git repository validation (`git rev-parse --is-inside-work-tree`);
+      - `git status --short` for the whole workdir;
+      - when changed_path is supplied: a scoped `git diff --name-only`,
+        `git diff`, and `git diff --check`, all restricted to changed_path;
+      - when changed_path is supplied: a bounded content window of that one
+        file, capped at MAX_CONTENT_WINDOW_LINES lines (200) and
+        MAX_CONTENT_WINDOW_BYTES bytes (20,000) -- never a full-file or
+        full-repository dump, and never more than one file per call;
+      - when test_command is supplied: validated against ALLOWED_TEST_COMMANDS
+        and, if valid, executed read-only with a bounded exit code and
+        truncated stdout/stderr captured as evidence.
+    """
+    resolved_workdir = validate_workdir(workdir)
+
+    relative_changed_path = None
+    resolved_changed_path = None
+    validated_window = None
+    if changed_path is not None:
+        normalized = normalize_changed_paths(changed_path)
+        if len(normalized) != 1:
+            raise ReviewBridgeError("changed_path must resolve to exactly one path")
+        relative_changed_path = normalized[0]
+        resolved_changed_path = _resolve_changed_path(relative_changed_path, resolved_workdir)
+        if content_window is not None:
+            validated_window = validate_content_window([relative_changed_path], content_window)
+    elif content_window is not None:
+        raise ReviewBridgeError("content_window requires changed_path to be supplied")
+
+    validated_test_command = None
+    if test_command is not None:
+        validated_test_command = validate_test_command(test_command)
+
+    # All inputs are validated; only now do we touch the filesystem/subprocess.
+
+    repo_check = _verify_git_repo(resolved_workdir)
+    status = _git_status(resolved_workdir)
+
+    evidence = {
+        "workdir": str(resolved_workdir),
+        "repo_check": repo_check,
+        "git_status": status,
+        "changed_path": relative_changed_path,
+        "diff_name_only": None,
+        "diff": None,
+        "diff_check": None,
+        "content_window": None,
+        "test_result": None,
+        "status": "ok",
+    }
+
+    if relative_changed_path is not None:
+        evidence["diff_name_only"] = _git_diff_name_only(resolved_workdir, relative_changed_path)
+        evidence["diff"] = _git_diff(resolved_workdir, relative_changed_path)
+        evidence["diff_check"] = _git_diff_check(resolved_workdir, relative_changed_path)
+
+        if validated_window is not None:
+            start_line = validated_window["start_line"]
+            end_line = validated_window["end_line"]
+        else:
+            start_line = 1
+            end_line = MAX_CONTENT_WINDOW_LINES
+
+        evidence["content_window"] = {
+            "path": relative_changed_path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "content": _read_content_window(resolved_changed_path, start_line, end_line),
+        }
+
+    if validated_test_command is not None:
+        evidence["test_result"] = _run_test_command(validated_test_command, resolved_workdir)
+
+    return evidence
+
+
+# --- MCP runtime adapter -----------------------------------------------
+#
+# Instantiating MCPServer and registering the tool below is pure Python
+# object construction: it performs no I/O, starts no server, and spawns no
+# subprocess. The server only actually starts when run as __main__.
+
+mcp_server = MCPServer("review-bridge")
+
+
+@mcp_server.tool(name="collect")
+def _tool_collect(workdir, changed_path=None, test_command=None, content_window=None):
+    """Return bounded, fresh, read-only review evidence for workdir.
+
+    Read-only: never mutates git state, never touches the network. Evidence
+    includes git status, and -- when changed_path is supplied -- a scoped
+    diff, diff --check, and a bounded content window of that single file
+    (at most MAX_CONTENT_WINDOW_LINES lines / MAX_CONTENT_WINDOW_BYTES
+    bytes; never a full-file or full-repository dump). When test_command is
+    supplied it must be one of ALLOWED_TEST_COMMANDS and is executed
+    read-only with a bounded timeout.
+    """
+    return collect(workdir, changed_path, test_command, content_window)
+
+
+if __name__ == "__main__":
+    mcp_server.run()
