@@ -229,6 +229,77 @@ def test_runtime_catches_missing_live_runtime(tmp_path):
     assert expected_missing_path in result.stdout
 
 
+# 8a) check 16 (installed review_bridge ALLOWED_TEST_COMMANDS) A3.5.1d.1:
+# the static AST probe must see through frozenset({...}) / set({...}) /
+# list([...]) / tuple((...)) literal container constructors, since the real
+# review_bridge template defines ALLOWED_TEST_COMMANDS as
+# frozenset({...}), not a bare set/list/tuple display.
+CHECK16_OK_MSG = "installed review_bridge authorizes the Hermes pipeline hardening audit test command"
+CHECK16_FAIL_MSG = "installed review_bridge does not authorize the Hermes pipeline hardening audit test command"
+
+
+def _build_runtime_fixture_with_review_server(tmp_path, review_server_source):
+    root = _build_runtime_fixture(tmp_path, compliant=True)
+    review_server = root / "usr" / "local" / "lib" / "review-bridge-mcp" / "server.py"
+    review_server.write_text(review_server_source, encoding="utf-8")
+    return root
+
+
+def test_check16_authorizes_frozenset_literal_positive(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture_with_review_server(
+        tmp_path,
+        'ALLOWED_TEST_COMMANDS = frozenset(\n'
+        '    {\n'
+        '        "__skip__",\n'
+        '        "/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q",\n'
+        '        "./scripts/audit-hermes-pipeline-hardening.sh",\n'
+        '    }\n'
+        ')\n',
+    )
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 0
+    assert "PASS" in result.stdout
+    assert CHECK16_OK_MSG in result.stdout
+
+
+def test_check16_rejects_frozenset_literal_missing_command_negative(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture_with_review_server(
+        tmp_path,
+        'ALLOWED_TEST_COMMANDS = frozenset(\n'
+        '    {\n'
+        '        "__skip__",\n'
+        '        "/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q",\n'
+        '    }\n'
+        ')\n',
+    )
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "FAIL" in result.stdout
+    assert CHECK16_FAIL_MSG in result.stdout
+
+
+def test_check16_does_not_unwrap_arbitrary_call_safety(tmp_path):
+    """A string appearing inside an arbitrary (non-whitelisted) call's
+    literal argument must not be treated as authorized: only frozenset/set/
+    list/tuple constructor calls are unwrapped."""
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture_with_review_server(
+        tmp_path,
+        'ALLOWED_TEST_COMMANDS = some_wrapper(\n'
+        '    {\n'
+        '        "__skip__",\n'
+        '        "./scripts/audit-hermes-pipeline-hardening.sh",\n'
+        '    }\n'
+        ')\n',
+    )
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "FAIL" in result.stdout
+    assert CHECK16_FAIL_MSG in result.stdout
+
+
 # 9) --all includes both repo and runtime sections; either failure fails --all.
 def test_all_output_contains_both_section_labels(tmp_path):
     fixture = _build_repo_fixture(tmp_path)

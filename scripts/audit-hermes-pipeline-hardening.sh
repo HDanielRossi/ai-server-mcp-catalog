@@ -596,10 +596,27 @@ try:
 except (OSError, SyntaxError):
     sys.exit(2)
 
+LITERAL_CONTAINER_CALLS = ("frozenset", "set", "list", "tuple")
+
 def string_literals(node):
     out = []
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return [node.value]
+    if isinstance(node, ast.Call):
+        # Narrowly unwrap literal container constructors such as
+        # frozenset({...}) / set({...}) / list([...]) / tuple((...)) so
+        # their single literal argument can still be inspected statically.
+        # Anything else (arbitrary calls) is deliberately left opaque: we
+        # do not want a string appearing anywhere inside an arbitrary call
+        # to be mistaken for an authorized literal.
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in LITERAL_CONTAINER_CALLS
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            out.extend(string_literals(node.args[0]))
+        return out
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         for elt in node.elts:
             out.extend(string_literals(elt))
