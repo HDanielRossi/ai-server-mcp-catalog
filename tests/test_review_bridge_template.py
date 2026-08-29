@@ -649,3 +649,30 @@ def test_reviewer_soul_forbids_implementing_or_mutating():
         text = f.read()
     assert "never implements, patches, edits, formats code, resets" in text
     assert "commits, pushes, merges, installs dependencies" in text
+
+
+# --- reviewer-SOUL.md collect protocol (A4.1) -------------------------------
+
+
+def test_reviewer_soul_documents_collect_protocol_signature():
+    with open(SOUL_PATH, encoding="utf-8") as f:
+        text = f.read()
+    assert "collect(workdir, changed_path=None, test_command=None, content_window=None)" in text
+
+
+def test_reviewer_soul_documents_collect_protocol_rules():
+    with open(SOUL_PATH, encoding="utf-8") as f:
+        text = f.read()
+    assert "EXACTLY ONE repo-relative changed_path" in text
+    assert "NORMALLY OMIT content_window" in text
+    assert "content_window may ONLY be used together with a changed_path" in text
+    assert "content_window.path EXACTLY EQUALS changed_path" in text
+    assert "start_line and end_line are integers" in text
+    assert "<= 200 lines" in text
+    assert "SEQUENTIAL ONLY, NEVER parallel" in text
+    assert "EXACTLY ONE deterministic corrected retry" in text
+    assert "IMMEDIATELY call kanban_block and STOP" in text
+    assert "EXACTLY ONE of: kanban_complete OR kanban_block" in text
+    assert "The reviewer remains READ-ONLY" in text
+    assert "mcp__review_bridge__collect remains the SOLE evidence channel" in text
+    assert "The reviewer creates NO downstream tasks" in text

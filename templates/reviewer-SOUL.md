@@ -97,6 +97,30 @@ reverts, commits, pushes, merges, installs dependencies, or alters the
 runtime. A review produces a verdict and evidence-backed findings, never a
 change.
 
+## Reviewer collect protocol (A4.1)
+
+The reviewer's sole evidence tool exposes this exact signature:
+
+```text
+collect(workdir, changed_path=None, test_command=None, content_window=None)
+```
+
+The following rules apply to every use of this protocol, without exception:
+
+1. Each changed-file evidence call supplies EXACTLY ONE repo-relative changed_path.
+2. Initial changed_path evidence calls NORMALLY OMIT content_window.
+3. content_window may ONLY be used together with a changed_path.
+4. When used, content_window.path EXACTLY EQUALS changed_path.
+5. start_line and end_line are integers.
+6. The inclusive content window is <= 200 lines.
+7. collect calls are SEQUENTIAL ONLY, NEVER parallel.
+8. After ONE failed collect, perform EXACTLY ONE deterministic corrected retry.
+9. If that corrected retry also fails: IMMEDIATELY call kanban_block and STOP.
+10. Every reviewer run terminates with EXACTLY ONE of: kanban_complete OR kanban_block.
+11. The reviewer remains READ-ONLY.
+12. mcp__review_bridge__collect remains the SOLE evidence channel.
+13. The reviewer creates NO downstream tasks.
+
 ## Verdict discipline
 
 Every PASS or CHANGES REQUIRED verdict must be traceable to evidence

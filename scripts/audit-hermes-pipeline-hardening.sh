@@ -41,11 +41,13 @@ Environment:
                         the real documented live paths
                         (/usr/local/lib/pipeline-bridge-mcp/server.py,
                         /usr/local/lib/review-bridge-mcp/server.py,
+                        /usr/local/lib/claude-bridge-mcp/server.py,
                         $HOME/.hermes/...). Intended for hermetic test
                         fixtures. When set, the layout under the override
                         root mirrors:
                           usr/local/lib/pipeline-bridge-mcp/server.py
                           usr/local/lib/review-bridge-mcp/server.py
+                          usr/local/lib/claude-bridge-mcp/server.py
                           home/.hermes/config.yaml
                           home/.hermes/SOUL.md
                           home/.hermes/profiles/reviewer/config.yaml
@@ -138,6 +140,7 @@ runtime_path() {
     case "$kind" in
       pipeline_bridge_server) echo "$root/usr/local/lib/pipeline-bridge-mcp/server.py" ;;
       review_bridge_server)   echo "$root/usr/local/lib/review-bridge-mcp/server.py" ;;
+      claude_bridge_server)   echo "$root/usr/local/lib/claude-bridge-mcp/server.py" ;;
       hermes_config)          echo "$root/home/.hermes/config.yaml" ;;
       hermes_soul)            echo "$root/home/.hermes/SOUL.md" ;;
       reviewer_config)        echo "$root/home/.hermes/profiles/reviewer/config.yaml" ;;
@@ -147,6 +150,7 @@ runtime_path() {
     case "$kind" in
       pipeline_bridge_server) echo "/usr/local/lib/pipeline-bridge-mcp/server.py" ;;
       review_bridge_server)   echo "/usr/local/lib/review-bridge-mcp/server.py" ;;
+      claude_bridge_server)   echo "/usr/local/lib/claude-bridge-mcp/server.py" ;;
       hermes_config)          echo "$HOME/.hermes/config.yaml" ;;
       hermes_soul)            echo "$HOME/.hermes/SOUL.md" ;;
       reviewer_config)        echo "$HOME/.hermes/profiles/reviewer/config.yaml" ;;
@@ -167,6 +171,227 @@ require_runtime_file_compliant() {
     check_ok "$label ($file) is compliant"
   else
     check_fail "$label ($file) is missing required hardening marker(s)"
+  fi
+}
+
+# --- A4.1: claude-bridge static contract audit (AST probe only; never
+# imports/execs the bridge source) --------------------------------------
+#
+# Verifies, via ast.parse only, that a claude-bridge server.py:
+#   - declares REQUIRED_CLAUDE_FLAGS as exactly the expected flag list
+#     (claude_flags_mismatch)
+#   - defines a _tool_run function requiring task_id with no default
+#     (claude_task_id_missing / claude_task_id_optional) that explicitly
+#     forwards a local variable (any plain Name, e.g. a stripped/validated
+#     copy) to a task_id= keyword call (claude_task_id_forwarding_missing)
+claude_static_contract_audit() {
+  local label="$1"
+  local file="$2"
+  local findings
+  findings="$(AUDIT_CLAUDE_BRIDGE_PATH="$file" python3 - <<'PY'
+import ast
+import os
+import sys
+
+PATH = os.environ["AUDIT_CLAUDE_BRIDGE_PATH"]
+
+REQUIRED_FLAGS = [
+    "--print",
+    "--output-format",
+    "json",
+    "--no-session-persistence",
+    "--permission-mode",
+    "acceptEdits",
+]
+
+findings = []
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        source = f.read()
+    tree = ast.parse(source, filename=PATH)
+except (OSError, SyntaxError) as e:
+    print("claude_probe_error:cannot_parse_source:%s" % (e,))
+    sys.exit(1)
+
+
+def assignment_pairs(node):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            yield target, node.value
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        yield node.target, node.value
+
+
+flag_assignments = []
+for node in ast.walk(tree):
+    for target, value in assignment_pairs(node):
+        if isinstance(target, ast.Name) and target.id == "REQUIRED_CLAUDE_FLAGS":
+            flag_assignments.append(value)
+
+if len(flag_assignments) != 1:
+    findings.append(
+        "claude_flags_mismatch:expected_exactly_one_REQUIRED_CLAUDE_FLAGS_assignment_found_%d;missing=%s;unexpected=none"
+        % (len(flag_assignments), ",".join(REQUIRED_FLAGS))
+    )
+else:
+    value = flag_assignments[0]
+    actual = None
+    if isinstance(value, ast.List) and all(
+        isinstance(elt, ast.Constant) and isinstance(elt.value, str) for elt in value.elts
+    ):
+        actual = [elt.value for elt in value.elts]
+    if actual != REQUIRED_FLAGS:
+        actual_list = actual if actual is not None else []
+        missing = [flag for flag in REQUIRED_FLAGS if flag not in actual_list]
+        unexpected = [flag for flag in actual_list if flag not in REQUIRED_FLAGS]
+        findings.append(
+            "claude_flags_mismatch:missing=%s;unexpected=%s"
+            % (",".join(missing) or "none", ",".join(unexpected) or "none")
+        )
+
+tool_run_def = None
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef) and node.name == "_tool_run":
+        tool_run_def = node
+        break
+
+if tool_run_def is None:
+    findings.append("claude_probe_error:no_tool_run")
+else:
+    args = tool_run_def.args
+    positional = list(args.posonlyargs) + list(args.args)
+    kwonly = list(args.kwonlyargs)
+
+    task_id_arg = None
+    task_id_in_positional = False
+    task_id_index = None
+    for i, a in enumerate(positional):
+        if a.arg == "task_id":
+            task_id_arg = a
+            task_id_in_positional = True
+            task_id_index = i
+            break
+    if task_id_arg is None:
+        for i, a in enumerate(kwonly):
+            if a.arg == "task_id":
+                task_id_arg = a
+                task_id_index = i
+                break
+
+    if task_id_arg is None:
+        findings.append("claude_task_id_missing")
+    else:
+        has_default = False
+        if task_id_in_positional:
+            first_default_index = len(positional) - len(args.defaults)
+            if not (task_id_index < first_default_index):
+                has_default = True
+        else:
+            if args.kw_defaults[task_id_index] is not None:
+                has_default = True
+
+        if has_default:
+            findings.append("claude_task_id_optional")
+
+        forwarding_found = False
+        for node in ast.walk(tool_run_def):
+            if isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if (
+                        kw.arg == "task_id"
+                        and isinstance(kw.value, ast.Name)
+                    ):
+                        forwarding_found = True
+        if not forwarding_found:
+            findings.append("claude_task_id_forwarding_missing")
+
+for finding in findings:
+    print(finding)
+
+sys.exit(1 if findings else 0)
+PY
+)"
+  if [[ -z "$findings" ]]; then
+    check_ok "$label ($file) satisfies claude static contract (REQUIRED_CLAUDE_FLAGS / _tool_run task_id)"
+  else
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && check_fail "$label ($file): $line"
+    done <<<"$findings"
+  fi
+}
+
+# --- A4.1: reviewer collect-protocol invariant audit --------------------
+#
+# Whitespace-normalized containment check of each required protocol
+# invariant's anchor phrase (taken verbatim from the current verified
+# reviewer-SOUL.md "Reviewer collect protocol (A4.1)" section) against the
+# given SOUL text. Missing invariants are reported as stable, greppable
+# reviewer_soul_missing_invariant:<id> findings.
+reviewer_soul_invariant_audit() {
+  local label="$1"
+  local file="$2"
+  if [[ ! -s "$file" ]]; then
+    check_fail "$label ($file) missing or empty; cannot verify reviewer collect protocol invariants"
+    return
+  fi
+  local findings
+  findings="$(AUDIT_REVIEWER_SOUL_PATH="$file" python3 - <<'PY'
+import os
+import re
+import sys
+
+PATH = os.environ["AUDIT_REVIEWER_SOUL_PATH"]
+
+INVARIANTS = [
+    ("collect_exact_signature", "collect(workdir, changed_path=None, test_command=None, content_window=None)"),
+    ("changed_path_repo_relative", "supplies EXACTLY ONE repo-relative changed_path"),
+    ("content_window_requires_changed_path", "content_window may ONLY be used together with a changed_path"),
+    ("content_window_path_equals_changed_path", "content_window.path EXACTLY EQUALS changed_path"),
+    ("integer_start_end_lines", "start_line and end_line are integers"),
+    ("max_window_200_lines", "inclusive content window is <= 200 lines"),
+    ("sequential_collects", "collect calls are SEQUENTIAL ONLY, NEVER parallel"),
+    ("single_corrected_retry", "perform EXACTLY ONE deterministic corrected retry"),
+    ("second_failure_block_stop", "IMMEDIATELY call kanban_block and STOP"),
+    ("terminal_complete_or_block", "terminates with EXACTLY ONE of: kanban_complete OR kanban_block"),
+    ("reviewer_read_only", "The reviewer remains READ-ONLY"),
+    ("collect_sole_evidence_channel", "mcp__review_bridge__collect remains the SOLE evidence channel"),
+    ("no_downstream_tasks", "The reviewer creates NO downstream tasks"),
+]
+
+
+def normalize(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        source = f.read()
+except OSError as e:
+    print("reviewer_soul_probe_error:cannot_read_file:%s" % (e,))
+    sys.exit(1)
+
+haystack = normalize(source)
+
+findings = []
+for invariant_id, anchor in INVARIANTS:
+    if normalize(anchor) not in haystack:
+        findings.append("reviewer_soul_missing_invariant:%s" % (invariant_id,))
+
+for finding in findings:
+    print(finding)
+
+sys.exit(1 if findings else 0)
+PY
+)"
+  if [[ -z "$findings" ]]; then
+    check_ok "$label ($file) satisfies all reviewer collect protocol invariants (A4.1)"
+  else
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && check_fail "$label ($file): $line"
+    done <<<"$findings"
   fi
 }
 
@@ -243,6 +468,10 @@ run_repo_only() {
       check_fail "reviewer template missing: $s"
     fi
   done
+
+  echo
+  echo "4a) reviewer template protocol invariants (templates/reviewer-SOUL.md) — A4.1 reviewer collect protocol:"
+  reviewer_soul_invariant_audit "reviewer SOUL (repo template)" "$REVIEWER_FILE"
 
   echo
   echo "5) pipeline template (templates/pipeline_bridge_server.py):"
@@ -411,6 +640,10 @@ run_repo_only() {
   fi
 
   echo
+  echo "6c) claude bridge static contract audit (templates/claude_bridge_server.py) — A4.1 AST probe:"
+  claude_static_contract_audit "claude bridge template" "$CLAUDE_FILE"
+
+  echo
   echo "7) docs (docs/hermes-pipeline.md):"
   DOCS_STRINGS=(
     'reviewer'
@@ -534,6 +767,10 @@ run_runtime() {
   fi
 
   echo
+  echo "12a) reviewer SOUL protocol invariants (installed runtime) — A4.1 reviewer collect protocol:"
+  reviewer_soul_invariant_audit "reviewer SOUL (installed runtime)" "$reviewer_soul"
+
+  echo
   echo "13) reviewer must NOT expose Memory:"
   if [[ -n "$override_root" ]]; then
     echo "SKIPPED: 'reviewer tools --summary' is a live host CLI probe (not a file under AUDIT_RUNTIME_ROOT); not applicable to a fixture root."
@@ -652,6 +889,16 @@ PY
     check_fail "cannot read/parse installed review_bridge server.py or ALLOWED_TEST_COMMANDS not found at $review_server"
   else
     check_fail "installed review_bridge does not authorize the Hermes pipeline hardening audit test command"
+  fi
+
+  echo
+  echo "17a) claude bridge static contract audit (installed runtime) — A4.1 AST probe (fail-closed):"
+  local claude_server
+  claude_server="$(runtime_path claude_bridge_server)"
+  if [[ ! -s "$claude_server" ]]; then
+    check_fail "installed claude_bridge ($claude_server): runtime_claude_bridge_missing"
+  else
+    claude_static_contract_audit "installed claude_bridge" "$claude_server"
   fi
 
   echo

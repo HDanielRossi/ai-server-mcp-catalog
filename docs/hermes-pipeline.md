@@ -955,3 +955,72 @@ archive-review --workdir <abs repo path> --review_task_id <task id>
 ### Reviewer isolation preserved
 
 The reviewer remains read-only and does not receive the `review_archive_bridge` tool. The controller is the only component that invokes the `review-archive-bridge` helper; archival happens strictly after the reviewer has already completed its task.
+
+## A4.1 — Claude/Reviewer Runtime Hardening (repository-only artifacts)
+
+- SCOPE: repository-only implementation. This task hardens the MCP-facing contract of `templates/claude_bridge_server.py`, documents the reviewer's `collect` evidence protocol in `templates/reviewer-SOUL.md`, and extends the invariant audit's static checks. No runtime deployment, commit, push, install, or restart occurs as part of this repository implementation.
+
+### MCP/pipeline contract (`mcp__claude_bridge__run`)
+
+- `workdir`, `prompt`, and `task_id` are all REQUIRED on the MCP `run` tool.
+- `task_id` has no default: it must be a non-empty string; the tool strips it and rejects a missing, non-string, empty, or whitespace-only value before any side effect.
+- The stripped `task_id` is the budget-ledger identity used for the call.
+
+### Direct-Python compatibility
+
+- The underlying Python function keeps its direct-Python signature: `run(workdir, prompt, task_id=None, ...)`.
+- `task_id=None` is only reachable by calling `run()` directly from Python — it is DIRECT-PYTHON ONLY.
+- The anonymous `legacy:<hash>` budget identity that `task_id=None` produces CANNOT be reached through `mcp__claude_bridge__run`, because the MCP tool requires and forwards an explicit `task_id`.
+
+### Exact acceptEdits argv requirement
+
+- `REQUIRED_CLAUDE_FLAGS == ["--print", "--output-format", "json", "--no-session-persistence", "--permission-mode", "acceptEdits"]` — this exact 6-element sequence, in this exact order.
+- `prompt` is always the final argv element.
+- The optional `--max-budget-usd <value>` pair, when the caller passes an explicit `max_budget_usd`, is inserted after the required flags and before `prompt` — never before the required flags and never after `prompt`.
+
+### Reviewer collect protocol
+
+See `templates/reviewer-SOUL.md` for the full, verbatim-installable text. The protocol governs the reviewer's sole evidence tool:
+
+```text
+collect(workdir, changed_path=None, test_command=None, content_window=None)
+```
+
+Rules:
+
+1. Each changed-file evidence call supplies EXACTLY ONE repo-relative changed_path.
+2. Initial changed_path evidence calls NORMALLY OMIT content_window.
+3. content_window may ONLY be used together with a changed_path.
+4. When used, content_window.path EXACTLY EQUALS changed_path.
+5. start_line and end_line are integers.
+6. The inclusive content window is <= 200 lines.
+7. collect calls are SEQUENTIAL ONLY, NEVER parallel.
+8. After ONE failed collect, perform EXACTLY ONE deterministic corrected retry.
+9. If that corrected retry also fails: IMMEDIATELY call kanban_block and STOP.
+10. Every reviewer run terminates with EXACTLY ONE of: kanban_complete OR kanban_block.
+11. The reviewer remains READ-ONLY.
+12. mcp__review_bridge__collect remains the SOLE evidence channel.
+13. The reviewer creates NO downstream tasks.
+
+### Audit changes (`scripts/audit-hermes-pipeline-hardening.sh`)
+
+- The audit gains a read-only static AST probe that inspects BOTH the repository template (`templates/claude_bridge_server.py`) and the installed runtime (`/usr/local/lib/claude-bridge-mcp/server.py`).
+- The probe requires the exact 6-flag `REQUIRED_CLAUDE_FLAGS` sequence documented above.
+- The probe requires a `_tool_run` that requires `task_id` with no default and forwards `task_id=task_id` into `run()`.
+- The probe adds substantive reviewer-SOUL protocol checks — covering the 13 collect-protocol rules above — against both the repository `templates/reviewer-SOUL.md` and the installed runtime reviewer SOUL.
+
+### Verification
+
+The following five commands verify this task:
+
+```
+/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q tests/test_claude_bridge_template.py
+/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q tests/test_review_bridge_template.py
+/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q tests/test_audit_hermes_pipeline_hardening.py
+/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q
+./scripts/audit-hermes-pipeline-hardening.sh --repo-only
+```
+
+### Operator
+
+A4.1 has NOT been deployed or runtime-live-validated by this implementation task. All changes described above are repository-only; live installation of any updated template, SOUL, or audit script remains a separate, human-authorized operation performed later by the operator, after review PASS.

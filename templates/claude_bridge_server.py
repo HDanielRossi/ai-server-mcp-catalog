@@ -23,16 +23,26 @@ process restarts), so they are kept narrow and explicit:
 Call budget accounting is keyed by ``task_id`` and is fail-closed: a
 malformed ledger raises ``LedgerCorruptionError`` rather than being reset
 or repaired, and a reserved call is always consumed even if the underlying
-subprocess call fails. ``task_id`` is optional: when omitted, calls are
-accounted against a per-(workdir, prompt) anonymous ledger bucket, keyed by
-a deterministic hash (never the raw prompt text) and bounded by both the
-usual call-budget threshold and a rolling TTL window (see
-``ANONYMOUS_BUDGET_TTL_SECONDS``), so unrelated legacy callers no longer
-share or starve each other's budget.
+subprocess call fails.
 
-The canonical public contract is ``run(workdir, prompt)``: ``workdir`` and
-``prompt`` are the first two positional parameters, and every other
-parameter (including ``task_id``) is optional and keyword-capable.
+Two distinct contracts share this module:
+
+- MCP contract (the ``run`` MCP tool, backed by ``_tool_run``): ``task_id``
+  is REQUIRED. The generated tool schema lists ``workdir``, ``prompt``, and
+  ``task_id`` as required, and a missing, non-string, empty, or
+  whitespace-only ``task_id`` is rejected before any side effect (before
+  state-dir resolution, ledger I/O, or the Claude subprocess). The
+  stripped ``task_id`` is used as the budget identity, and no anonymous or
+  ``legacy:<hash>`` identity is reachable through this path.
+- Direct-Python contract (calling ``run(workdir, prompt)`` directly, not
+  through MCP): ``workdir`` and ``prompt`` are the first two positional
+  parameters, and ``task_id`` remains optional and keyword-capable. When
+  omitted, calls are accounted against a per-(workdir, prompt) anonymous
+  ledger bucket, keyed by a deterministic hash (never the raw prompt text)
+  and bounded by both the usual call-budget threshold and a rolling TTL
+  window (see ``ANONYMOUS_BUDGET_TTL_SECONDS``), so unrelated legacy
+  callers don't share or starve each other's budget. This anonymous
+  compatibility path is direct-Python only; it is not reachable via MCP.
 """
 
 import contextlib
@@ -58,7 +68,14 @@ CALL_TAGS = {
     3: ["exceptional", "budget-warning"],
 }
 
-REQUIRED_CLAUDE_FLAGS = ["--print", "--output-format", "json", "--no-session-persistence"]
+REQUIRED_CLAUDE_FLAGS = [
+    "--print",
+    "--output-format",
+    "json",
+    "--no-session-persistence",
+    "--permission-mode",
+    "acceptEdits",
+]
 
 REQUIRED_TELEMETRY_KEYS = (
     "duration_ms",
@@ -315,9 +332,11 @@ def run(
 ):
     """Run one budgeted Claude CLI call and return a result dict.
 
-    Canonical contract: ``run(workdir, prompt)``. ``workdir`` and ``prompt``
-    are the first two positional parameters; every parameter after them,
-    including ``task_id``, is optional and keyword-capable.
+    Direct-Python contract: ``run(workdir, prompt)``. ``workdir`` and
+    ``prompt`` are the first two positional parameters; every parameter
+    after them, including ``task_id``, is optional and keyword-capable.
+    (The MCP ``run`` tool wraps this function but requires ``task_id``; see
+    ``_tool_run``.)
 
     ``task_id`` keys the on-disk call-budget ledger. When omitted (None),
     calls are accounted against a deterministic per-(workdir, prompt)
@@ -456,21 +475,32 @@ mcp_server = MCPServer("claude-bridge")
 def _tool_run(
     workdir,
     prompt,
-    task_id=None,
+    task_id,
     changed_paths=None,
     test_command=None,
     max_budget_usd=None,
 ):
     """Run one budgeted Claude CLI call and return a result dict.
 
-    Canonical contract: call with just ``{"workdir": ..., "prompt": ...}``.
-    ``task_id`` is optional; when omitted, calls are accounted against a
-    single fixed anonymous ledger bucket so budget bounds still apply.
+    MCP contract: ``task_id`` is REQUIRED (no default), so the generated
+    tool schema lists ``workdir``, ``prompt``, and ``task_id`` as required.
+    It is validated before any side effect: it must be a string, and is
+    rejected if empty or whitespace-only after stripping surrounding
+    whitespace. The stripped value is forwarded to ``run()`` explicitly as
+    the budget identity, so no anonymous/``legacy:<hash>`` ledger bucket is
+    reachable through this path. (``run()`` itself keeps ``task_id``
+    optional for direct-Python callers; see its docstring.)
     """
+    if not isinstance(task_id, str):
+        raise BridgeError(f"task_id must be a string, got: {type(task_id).__name__}")
+    stripped_task_id = task_id.strip()
+    if not stripped_task_id:
+        raise BridgeError("task_id must be non-empty (and not whitespace-only)")
+
     return run(
         workdir,
         prompt,
-        task_id=task_id,
+        task_id=stripped_task_id,
         changed_paths=changed_paths,
         test_command=test_command,
         max_budget_usd=max_budget_usd,

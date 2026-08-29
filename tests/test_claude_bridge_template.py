@@ -451,8 +451,45 @@ def test_argv_structure_and_prompt_safety(state_dir):
     assert argv.count("--output-format") == 1
     assert argv.count("json") == 1
     assert argv.count("--no-session-persistence") == 1
+    assert argv.count("--permission-mode") == 1
+    assert argv.count("acceptEdits") == 1
     assert argv[-1] == prompt
     assert argv == r["argv"]
+
+
+# 12b. required-claude-flags
+def test_required_claude_flags_pinned_exactly():
+    assert claude_bridge_server.REQUIRED_CLAUDE_FLAGS == [
+        "--print",
+        "--output-format",
+        "json",
+        "--no-session-persistence",
+        "--permission-mode",
+        "acceptEdits",
+    ]
+
+
+def test_permission_mode_flag_appears_exactly_once_with_expected_value(state_dir):
+    fake = FakeSubprocess()
+    r = claude_bridge_server.run(WORKDIR, "p", "task-permission-mode", state_dir=state_dir, _subprocess_run=fake)
+    argv = r["argv"]
+    assert argv.count("--permission-mode") == 1
+    idx = argv.index("--permission-mode")
+    assert argv[idx + 1] == "acceptEdits"
+
+
+def test_argv_max_budget_usd_appears_after_required_flags_and_before_prompt(state_dir):
+    fake = FakeSubprocess()
+    prompt = "the final prompt"
+    r = claude_bridge_server.run(
+        WORKDIR, prompt, "task-argv-order", max_budget_usd=2.5, state_dir=state_dir, _subprocess_run=fake
+    )
+    argv = r["argv"]
+    required_flags_end = len(claude_bridge_server.REQUIRED_CLAUDE_FLAGS) + 1  # +1 for the executable
+    idx = argv.index("--max-budget-usd")
+    assert idx >= required_flags_end
+    assert argv[-1] == prompt
+    assert idx < len(argv) - 1
 
 
 # 13. optional-budget
@@ -576,6 +613,102 @@ def test_mcp_tool_run_rejects_workdir_outside_projects_root(monkeypatch, state_d
         claude_bridge_server._tool_run("/tmp/elsewhere", "p", "task-tool-reject")
 
 
+# --- MCP boundary: task_id is required, validated before any side effect ---
+
+
+def _assert_no_side_effects(monkeypatch):
+    """Patch the two cheapest side-effect entry points to blow up if reached, so
+    rejection tests can prove validation happens strictly before state-dir
+    resolution, ledger I/O, or the Claude subprocess.
+    """
+
+    def boom_state_dir():
+        raise AssertionError("must not resolve state dir before task_id validation")
+
+    def boom_subprocess(argv, **kwargs):
+        raise AssertionError("must not shell out before task_id validation")
+
+    monkeypatch.setattr(claude_bridge_server, "_default_state_dir", boom_state_dir)
+    monkeypatch.setattr(claude_bridge_server.subprocess, "run", boom_subprocess)
+
+
+def test_mcp_tool_run_missing_task_id_rejected_before_side_effect(monkeypatch):
+    _assert_no_side_effects(monkeypatch)
+    with pytest.raises(TypeError):
+        claude_bridge_server._tool_run(WORKDIR, "p")
+
+
+def test_mcp_tool_run_empty_task_id_rejected_before_side_effect(monkeypatch):
+    _assert_no_side_effects(monkeypatch)
+    with pytest.raises(BridgeError):
+        claude_bridge_server._tool_run(WORKDIR, "p", "")
+
+
+def test_mcp_tool_run_whitespace_only_task_id_rejected_before_side_effect(monkeypatch):
+    _assert_no_side_effects(monkeypatch)
+    with pytest.raises(BridgeError):
+        claude_bridge_server._tool_run(WORKDIR, "p", "   \t\n  ")
+
+
+def test_mcp_tool_run_non_string_task_id_rejected_before_side_effect(monkeypatch):
+    _assert_no_side_effects(monkeypatch)
+    with pytest.raises(BridgeError):
+        claude_bridge_server._tool_run(WORKDIR, "p", 12345)
+
+
+def test_mcp_tool_run_non_string_task_id_none_rejected_before_side_effect(monkeypatch):
+    """None is the old MCP default; it must now be rejected the same as any other
+    non-string task_id rather than silently falling back to anonymous accounting.
+    """
+    _assert_no_side_effects(monkeypatch)
+    with pytest.raises(BridgeError):
+        claude_bridge_server._tool_run(WORKDIR, "p", None)
+
+
+def test_mcp_tool_run_strips_task_id_and_uses_it_as_ledger_key_not_legacy(monkeypatch, state_dir):
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(stdout=json.dumps(make_ok_telemetry()), returncode=0)
+
+    monkeypatch.setattr(claude_bridge_server.subprocess, "run", fake_run)
+    monkeypatch.setattr(claude_bridge_server, "_default_state_dir", lambda: state_dir)
+
+    result = claude_bridge_server._tool_run(WORKDIR, "p", "  task-mcp-stripped  ")
+    assert result["outcome"] == "ok"
+    assert result["task_id"] == "task-mcp-stripped"
+
+    ledger_path = os.path.join(state_dir, claude_bridge_server.LEDGER_FILENAME)
+    with open(ledger_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert "task-mcp-stripped" in data["tasks"]
+    assert not any(k.startswith(claude_bridge_server.ANONYMOUS_KEY_PREFIX) for k in data["tasks"])
+
+
+def test_mcp_tool_run_budget_shared_across_prompts_for_same_task_id(monkeypatch, state_dir):
+    """A constant MCP task_id shares ONE call budget across different prompts: calls
+    1-2 are normal, call 3 is exceptional/budget-warning, call 4 is rejected before the
+    subprocess runs. Varying the prompt must never reset or split the budget.
+    """
+    fake = FakeSubprocess()
+    monkeypatch.setattr(claude_bridge_server.subprocess, "run", fake)
+    monkeypatch.setattr(claude_bridge_server, "_default_state_dir", lambda: state_dir)
+
+    r1 = claude_bridge_server._tool_run(WORKDIR, "prompt one", "task-mcp-shared-budget")
+    r2 = claude_bridge_server._tool_run(WORKDIR, "prompt two", "task-mcp-shared-budget")
+    r3 = claude_bridge_server._tool_run(WORKDIR, "prompt three", "task-mcp-shared-budget")
+
+    assert r1["call_number"] == 1
+    assert r2["call_number"] == 2
+    assert r3["call_number"] == 3
+    assert r1["tags"] == ["normal"]
+    assert r2["tags"] == ["normal"]
+    assert sorted(r3["tags"]) == sorted(["exceptional", "budget-warning"])
+    assert fake.call_count == 3
+
+    with pytest.raises(BudgetExhaustedError):
+        claude_bridge_server._tool_run(WORKDIR, "prompt four", "task-mcp-shared-budget")
+    assert fake.call_count == 3
+
+
 # --- workdir: non-absolute / non-directory / traversal ----------------------
 
 
@@ -608,9 +741,12 @@ def test_workdir_traversal_escape_rejected(state_dir):
 # --- canonical positional contract: run(workdir, prompt) -------------------
 
 
-def test_canonical_two_positional_call_succeeds(monkeypatch, state_dir):
-    """The canonical public contract is run(workdir, prompt): task_id is optional and
-    keyword-capable, not a required third positional. This pins that exact two-arg call.
+def test_direct_python_two_positional_call_succeeds_anonymous_compat_contrasts_with_mcp(monkeypatch, state_dir):
+    """Direct-Python contract: run(workdir, prompt) with task_id omitted is still a
+    valid two-arg call, falling back to the legacy anonymous ledger bucket. This is
+    direct-Python-only compatibility: the same omission through the MCP _tool_run
+    wrapper is rejected outright, since task_id is required at the MCP boundary with no
+    anonymous/legacy fallback.
     """
     fake = FakeSubprocess()
     monkeypatch.setattr(claude_bridge_server, "_default_state_dir", lambda: state_dir)
@@ -620,6 +756,10 @@ def test_canonical_two_positional_call_succeeds(monkeypatch, state_dir):
     assert r["outcome"] == "ok"
     assert r["argv"][-1] == "a positional prompt"
     assert fake.call_count == 1
+    assert r["task_id"].startswith(claude_bridge_server.ANONYMOUS_KEY_PREFIX)
+
+    with pytest.raises(TypeError):
+        claude_bridge_server._tool_run(WORKDIR, "a positional prompt")
 
 
 def test_second_positional_is_prompt_not_task_id(state_dir):
@@ -813,26 +953,31 @@ def test_explicit_task_id_budget_not_subject_to_ttl(monkeypatch, state_dir):
     assert fake.call_count == 3
 
 
-def test_mcp_tool_schema_requires_only_workdir_and_prompt():
+def test_mcp_tool_schema_requires_workdir_prompt_and_task_id():
     tools = asyncio.run(claude_bridge_server.mcp_server.list_tools())
     (run_tool,) = [t for t in tools if t.name == "run"]
-    assert run_tool.input_schema["required"] == ["workdir", "prompt"]
-    assert set(run_tool.input_schema["properties"]) >= {"workdir", "prompt"}
-    if "task_id" in run_tool.input_schema["properties"]:
-        assert "task_id" not in run_tool.input_schema["required"]
+    assert run_tool.input_schema["required"] == ["workdir", "prompt", "task_id"]
+    assert set(run_tool.input_schema["properties"]) >= {"workdir", "prompt", "task_id"}
 
 
-def test_mcp_tool_run_accepts_two_field_workdir_prompt_payload(monkeypatch, state_dir):
-    def fake_run(argv, **kwargs):
-        return SimpleNamespace(stdout=json.dumps(make_ok_telemetry()), returncode=0)
+def test_mcp_tool_run_call_tool_two_field_payload_rejected(monkeypatch, state_dir):
+    """A two-field {workdir, prompt} MCP payload (no task_id) used to be accepted via a
+    fixed anonymous ledger bucket; task_id is now required at the MCP boundary, so the
+    same payload must be rejected without ever shelling out.
+    """
 
-    monkeypatch.setattr(claude_bridge_server.subprocess, "run", fake_run)
+    def boom_subprocess(argv, **kwargs):
+        raise AssertionError("must not shell out when task_id is omitted via MCP call_tool")
+
+    monkeypatch.setattr(claude_bridge_server.subprocess, "run", boom_subprocess)
     monkeypatch.setattr(claude_bridge_server, "_default_state_dir", lambda: state_dir)
 
-    result = asyncio.run(
-        claude_bridge_server.mcp_server.call_tool("run", {"workdir": WORKDIR, "prompt": "prompt via mcp two-field"})
-    )
-    assert result is not None
+    with pytest.raises(Exception):
+        asyncio.run(
+            claude_bridge_server.mcp_server.call_tool(
+                "run", {"workdir": WORKDIR, "prompt": "prompt via mcp two-field"}
+            )
+        )
 
 
 # --- subprocess transport: timeout / OS failure / bounded timeout ----------

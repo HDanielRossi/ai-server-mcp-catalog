@@ -21,6 +21,8 @@ import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_PATH = os.path.join(REPO_ROOT, "scripts", "audit-hermes-pipeline-hardening.sh")
+CLAUDE_BRIDGE_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "claude_bridge_server.py")
+REVIEWER_SOUL_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "reviewer-SOUL.md")
 
 REPO_ONLY_FILES = [
     os.path.join("templates", "review_bridge_server.py"),
@@ -76,9 +78,10 @@ def _build_runtime_fixture(tmp_path, compliant=True):
     root = tmp_path / "runtime_root"
     pipeline_dir = root / "usr" / "local" / "lib" / "pipeline-bridge-mcp"
     review_dir = root / "usr" / "local" / "lib" / "review-bridge-mcp"
+    claude_dir = root / "usr" / "local" / "lib" / "claude-bridge-mcp"
     hermes_dir = root / "home" / ".hermes"
     reviewer_dir = hermes_dir / "profiles" / "reviewer"
-    for d in (pipeline_dir, review_dir, reviewer_dir):
+    for d in (pipeline_dir, review_dir, claude_dir, reviewer_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     if not compliant:
@@ -93,6 +96,10 @@ def _build_runtime_fixture(tmp_path, compliant=True):
         'ALLOWED_TEST_COMMANDS = ["__skip__", "./scripts/audit-hermes-pipeline-hardening.sh"]\n',
         encoding="utf-8",
     )
+    # Verbatim copy (not hand-written) so the A4.1 claude static contract
+    # audit (REQUIRED_CLAUDE_FLAGS / _tool_run task_id) sees the real,
+    # currently-compliant repo template rather than a stale hand-written stub.
+    shutil.copy(CLAUDE_BRIDGE_TEMPLATE_PATH, claude_dir / "server.py")
     (hermes_dir / "config.yaml").write_text(
         "review_archive_bridge:\n  enabled: true\n",
         encoding="utf-8",
@@ -105,11 +112,41 @@ def _build_runtime_fixture(tmp_path, compliant=True):
         "review_bridge:\n  enabled: true\n",
         encoding="utf-8",
     )
-    (reviewer_dir / "SOUL.md").write_text(
-        "Mandatory Evidence Before Verdict.\nmcp__review_bridge__collect\n",
-        encoding="utf-8",
-    )
+    # Verbatim copy (not hand-written) so the A4.1 reviewer collect protocol
+    # invariant audit sees the real, currently-compliant repo SOUL text.
+    shutil.copy(REVIEWER_SOUL_TEMPLATE_PATH, reviewer_dir / "SOUL.md")
     return root
+
+
+def _mutate_file(path, old, new):
+    """Exact string-replacement mutation, asserting the target text was
+    actually present before replacing it (so a stale assumption about the
+    template's current contents fails loudly instead of silently no-op'ing)."""
+    text = path.read_text(encoding="utf-8")
+    assert old in text, f"mutation assumption stale: {old!r} not found in {path}"
+    mutated = text.replace(old, new, 1)
+    assert mutated != text
+    path.write_text(mutated, encoding="utf-8")
+
+
+# Mutations shared between repository-fixture negative tests (which mutate a
+# copy of templates/claude_bridge_server.py or templates/reviewer-SOUL.md
+# under a repo fixture) and runtime-fixture negative tests (which mutate the
+# same content under an AUDIT_RUNTIME_ROOT fixture).
+MUT_PERMISSION_MODE_FLAGS_OLD = '    "--permission-mode",\n    "acceptEdits",\n'
+MUT_PERMISSION_MODE_FLAGS_NEW = ""
+
+MUT_ACCEPT_EDITS_OLD = '"acceptEdits",\n'
+MUT_ACCEPT_EDITS_NEW = '"bypassPermissions",\n'
+
+MUT_TASK_ID_REQUIRED_PARAM_OLD = "    task_id,\n"
+MUT_TASK_ID_OPTIONAL_PARAM_NEW = "    task_id=None,\n"
+
+MUT_TASK_ID_FORWARDING_OLD = "        task_id=stripped_task_id,\n"
+MUT_TASK_ID_FORWARDING_NEW = '        task_id="static",\n'
+
+MUT_SEQUENTIAL_COLLECTS_OLD = "7. collect calls are SEQUENTIAL ONLY, NEVER parallel.\n"
+MUT_SEQUENTIAL_COLLECTS_NEW = ""
 
 
 def _run(args, cwd, env_overrides=None, timeout=60):
@@ -159,6 +196,9 @@ def test_runtime_passes_on_compliant_fixture(tmp_path):
     result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
     assert result.returncode == 0
     assert "PASS" in result.stdout
+    # The compliant fixture now includes a real claude-bridge-mcp/server.py
+    # copy (A4.1); this must not regress to the fail-closed missing-bridge path.
+    assert "runtime_claude_bridge_missing" not in result.stdout
 
 
 # 4) --all accepted (exit 0 when both suites pass under fixtures).
@@ -168,6 +208,7 @@ def test_all_passes_when_both_suites_pass(tmp_path):
     result = _run(["--all"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
     assert result.returncode == 0
     assert "PASS" in result.stdout
+    assert "runtime_claude_bridge_missing" not in result.stdout
 
 
 # 5) unknown flag rejected with usage text, exit 2.
@@ -433,3 +474,145 @@ def test_help_flag_prints_usage_and_exits_zero(tmp_path, flag):
     result = _run([flag], cwd=str(fixture))
     assert result.returncode == 0
     assert "Usage" in result.stdout
+
+
+# 13) A4.1 claude-bridge static contract + reviewer collect-protocol
+# invariant audit: compliant-fixture positives and single-mutation negatives.
+
+# 13a) compliant fixture (real templates/claude_bridge_server.py and
+# templates/reviewer-SOUL.md copied verbatim under AUDIT_RUNTIME_ROOT) passes
+# in all three modes.
+def test_compliant_claude_bridge_and_reviewer_soul_repo_only_passes(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 0
+    assert "PASS" in result.stdout
+
+
+def test_compliant_claude_bridge_and_reviewer_soul_runtime_passes(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 0
+    assert "PASS" in result.stdout
+    assert "runtime_claude_bridge_missing" not in result.stdout
+
+
+def test_compliant_claude_bridge_and_reviewer_soul_all_passes(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    result = _run(["--all"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 0
+    assert "PASS" in result.stdout
+
+
+# 13b) repository-fixture negatives: one mutation each on a copy of the
+# current repo's templates/claude_bridge_server.py or
+# templates/reviewer-SOUL.md, --repo-only must fail with the specific finding.
+def test_repo_negative_missing_permission_mode(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    claude_file = fixture / "templates" / "claude_bridge_server.py"
+    _mutate_file(claude_file, MUT_PERMISSION_MODE_FLAGS_OLD, MUT_PERMISSION_MODE_FLAGS_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "claude_flags_mismatch" in result.stdout
+
+
+def test_repo_negative_wrong_permission_mode(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    claude_file = fixture / "templates" / "claude_bridge_server.py"
+    _mutate_file(claude_file, MUT_ACCEPT_EDITS_OLD, MUT_ACCEPT_EDITS_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "claude_flags_mismatch" in result.stdout
+
+
+def test_repo_negative_task_id_optional(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    claude_file = fixture / "templates" / "claude_bridge_server.py"
+    _mutate_file(claude_file, MUT_TASK_ID_REQUIRED_PARAM_OLD, MUT_TASK_ID_OPTIONAL_PARAM_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "claude_task_id_optional" in result.stdout
+
+
+def test_repo_negative_task_id_forwarding_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    claude_file = fixture / "templates" / "claude_bridge_server.py"
+    _mutate_file(claude_file, MUT_TASK_ID_FORWARDING_OLD, MUT_TASK_ID_FORWARDING_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "claude_task_id_forwarding_missing" in result.stdout
+
+
+def test_repo_negative_reviewer_soul_missing_sequential_invariant(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    soul_file = fixture / "templates" / "reviewer-SOUL.md"
+    _mutate_file(soul_file, MUT_SEQUENTIAL_COLLECTS_OLD, MUT_SEQUENTIAL_COLLECTS_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "reviewer_soul_missing_invariant:sequential_collects" in result.stdout
+
+
+# 13c) runtime-fixture negatives: each gets its own AUDIT_RUNTIME_ROOT built
+# from the compliant fixture (real bridge + real SOUL), with exactly one
+# mutation under test; --runtime must fail with the specific finding.
+def test_runtime_negative_bridge_absent(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    claude_server = runtime_root / "usr" / "local" / "lib" / "claude-bridge-mcp" / "server.py"
+    assert claude_server.exists()
+    claude_server.unlink()
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "runtime_claude_bridge_missing" in result.stdout
+
+
+def test_runtime_negative_missing_permission_mode(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    claude_server = runtime_root / "usr" / "local" / "lib" / "claude-bridge-mcp" / "server.py"
+    _mutate_file(claude_server, MUT_PERMISSION_MODE_FLAGS_OLD, MUT_PERMISSION_MODE_FLAGS_NEW)
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "claude_flags_mismatch" in result.stdout
+
+
+def test_runtime_negative_wrong_permission_mode(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    claude_server = runtime_root / "usr" / "local" / "lib" / "claude-bridge-mcp" / "server.py"
+    _mutate_file(claude_server, MUT_ACCEPT_EDITS_OLD, MUT_ACCEPT_EDITS_NEW)
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "claude_flags_mismatch" in result.stdout
+
+
+def test_runtime_negative_task_id_optional(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    claude_server = runtime_root / "usr" / "local" / "lib" / "claude-bridge-mcp" / "server.py"
+    _mutate_file(claude_server, MUT_TASK_ID_REQUIRED_PARAM_OLD, MUT_TASK_ID_OPTIONAL_PARAM_NEW)
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "claude_task_id_optional" in result.stdout
+
+
+def test_runtime_negative_task_id_forwarding_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    claude_server = runtime_root / "usr" / "local" / "lib" / "claude-bridge-mcp" / "server.py"
+    _mutate_file(claude_server, MUT_TASK_ID_FORWARDING_OLD, MUT_TASK_ID_FORWARDING_NEW)
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "claude_task_id_forwarding_missing" in result.stdout
+
+
+def test_runtime_negative_reviewer_soul_missing_sequential_invariant(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    reviewer_soul = runtime_root / "home" / ".hermes" / "profiles" / "reviewer" / "SOUL.md"
+    _mutate_file(reviewer_soul, MUT_SEQUENTIAL_COLLECTS_OLD, MUT_SEQUENTIAL_COLLECTS_NEW)
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "reviewer_soul_missing_invariant:sequential_collects" in result.stdout
