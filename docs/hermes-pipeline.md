@@ -913,3 +913,45 @@ Both commands below must pass, in addition to the existing verification commands
 /home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q tests/test_planner_bridge_template.py tests/test_planner_bridge_wrapper.py
 bash scripts/audit-hermes-pipeline-hardening.sh
 ```
+
+## A4 — Deterministic review archival (repository-only artifacts)
+
+- SCOPE: repository-only implementation. This task adds the `archive-review` subcommand to `scripts/hermes-pipeline-controller.py`. No runtime deployment, commit, push, install, or restart occurs as part of this repository implementation.
+- WHY: a completed review must be archived deterministically, from real controller-verified state, instead of trusting a caller-supplied summary of what happened.
+
+### Command
+
+```text
+archive-review --workdir <abs repo path> --review_task_id <task id>
+```
+
+`wait` remains side-effect-free and does not auto-archive on any outcome; archiving is always a separate, explicit `archive-review` call.
+
+### Authoritative prerequisites
+
+- The controller reads real state via `hermes kanban show <id> --json`; it never archives from a caller-supplied summary.
+- `task.completed_at` must be a positive int — a bool is not accepted, and the value is never synthesized or defaulted when missing or malformed.
+- The controller selects the run with the maximum integer `run.id` (`select_latest_run`) and never falls back to an older run. That latest run must be `profile="reviewer"`, `status="done"`, and `outcome="completed"`.
+
+### Authoritative verdict
+
+- `classify_verdict` prefers `run.metadata.verdict` (exactly `"PASS"` or `"CHANGES REQUIRED"`) over the narrative `run.summary`.
+- A valid metadata verdict is authoritative even if the narrative summary happens to mention both markers — the metadata value is never second-guessed by summary text.
+- The fail-closed summary fallback is used only when the metadata verdict is absent, `None`, or exactly `"unknown"`. It classifies the summary as `PASS` or `CHANGES REQUIRED` when exactly one marker is present, blocks as ambiguous when both markers are present, and blocks as unknown when neither marker is present.
+- Both `PASS` and `CHANGES REQUIRED` are archiveable outcomes.
+
+### Helper idempotency
+
+- `/usr/local/bin/review-archive-bridge` owns artifact idempotency and is the only component the controller invokes; the controller calls it at most once per `archive-review` execution.
+- The controller writes nothing under `.ai/reviews/` itself and generates no timestamps — the installed helper is solely responsible for artifact naming and idempotent writes.
+
+### Output and exit contract
+
+- Success: exit `0` plus exactly one compact JSON line on stdout (`phase`, `outcome: "archive-succeeded"`, `review_task_id`, `workdir`, `verdict`, `completed_at`).
+- Validation or state rejection (bad workdir, invalid `review_task_id`, wrong workspace/assignee/status, malformed `completed_at`, stale or wrong-profile/status/outcome latest run, blocked verdict): exit `2` with a blocked JSON payload.
+- Usage error, transport error, malformed `hermes kanban show --json` output, or helper failure (non-zero exit, launch failure, timeout): exit `3`.
+- `archive-review` never exits `4` — exit `4` is reserved for `wait`-timeout only.
+
+### Reviewer isolation preserved
+
+The reviewer remains read-only and does not receive the `review_archive_bridge` tool. The controller is the only component that invokes the `review-archive-bridge` helper; archival happens strictly after the reviewer has already completed its task.

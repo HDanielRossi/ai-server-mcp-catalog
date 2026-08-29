@@ -47,6 +47,8 @@ EXIT_TIMEOUT = 4
 WAIT_TERMINAL_STATUSES = frozenset({"done", "archived", "blocked"})
 SLEEP = time.sleep
 MONOTONIC = time.monotonic
+ARCHIVE_HELPER_PATH = "/usr/local/bin/review-archive-bridge"
+ARCHIVE_HELPER_TIMEOUT = 120
 
 
 class CliUsageError(Exception):
@@ -75,6 +77,14 @@ class ValidationBlock(Exception):
     def __init__(self, phase, reason):
         super().__init__(reason)
         self.phase = phase
+        self.reason = reason
+
+
+class VerdictBlock(Exception):
+    """A verdict-classification failure; callers map this to a phase-scoped block."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
         self.reason = reason
 
 
@@ -126,6 +136,13 @@ def build_parser():
     wait_p.add_argument("--interval", default=1.0, type=_type_positive_finite_float)
     wait_p.add_argument("--max-retries", default=2, type=_type_nonnegative_int)
 
+    archive_review_p = subparsers.add_parser(
+        "archive-review", prog="archive-review",
+        description="deterministically archive a completed reviewer task",
+    )
+    archive_review_p.add_argument("--workdir", required=True)
+    archive_review_p.add_argument("--review_task_id", required=True)
+
     return parser
 
 
@@ -162,6 +179,58 @@ def valid_task_id(tid):
     if tid.isalnum() and len(tid) >= 3:
         return True
     return False
+
+
+def classify_verdict(run):
+    """Authoritative verdict classification shared by create-correction and archive-review.
+
+    Prefers run.metadata.verdict (exactly "PASS" or "CHANGES REQUIRED") over the narrative
+    run.summary. Falls back to summary only when the metadata verdict is absent, None, or
+    exactly "unknown"; any other metadata verdict value blocks outright without ever
+    consulting summary (an authoritative metadata verdict must not be second-guessed by
+    narrative marker mentions).
+    """
+    metadata = run.get("metadata")
+    if isinstance(metadata, dict):
+        verdict = metadata.get("verdict")
+        if verdict == "PASS":
+            return "PASS", "metadata"
+        if verdict == "CHANGES REQUIRED":
+            return "CHANGES REQUIRED", "metadata"
+        if not (verdict is None or verdict == "unknown"):
+            raise VerdictBlock("invalid metadata verdict: %r" % (verdict,))
+
+    summary = run.get("summary")
+    if not isinstance(summary, str):
+        raise VerdictBlock("summary must be a string, got %r" % (summary,))
+    has_pass = "PASS" in summary
+    has_cr = "CHANGES REQUIRED" in summary
+    if has_cr and not has_pass:
+        return "CHANGES REQUIRED", "summary"
+    if has_pass and not has_cr:
+        return "PASS", "summary"
+    raise VerdictBlock("ambiguous or unknown summary verdict: %r" % (summary,))
+
+
+def select_latest_run(phase, runs):
+    """Select the run with the maximum integer id; never fall back on an invalid latest run."""
+    if not isinstance(runs, list) or not runs:
+        raise ValidationBlock(phase, "runs must be a non-empty array")
+    ids = []
+    for r in runs:
+        if not isinstance(r, dict):
+            raise ValidationBlock(phase, "malformed run entry: %r" % (r,))
+        rid = r.get("id")
+        if isinstance(rid, bool) or not isinstance(rid, int):
+            raise ValidationBlock(phase, "malformed or missing run id: %r" % (rid,))
+        ids.append(rid)
+    if len(ids) != len(set(ids)):
+        raise ValidationBlock(phase, "duplicate run ids in runs array")
+    max_id = max(ids)
+    for r in runs:
+        if r["id"] == max_id:
+            return r
+    raise ValidationBlock(phase, "could not select latest run")
 
 
 def extract_real_id(payload):
@@ -638,19 +707,16 @@ def create_correction(args):
     except TypeError:
         raise ValidationBlock(phase, "ambiguous verdict, cannot create correction")
 
-    summary = selected.get("summary")
-    if not isinstance(summary, str):
-        raise ValidationBlock(phase, "ambiguous verdict, cannot create correction")
-
-    upper = summary.upper()
-    has_cr = "CHANGES REQUIRED" in upper
-    has_pass = "PASS" in upper
-    if has_cr and not has_pass:
-        pass
-    elif has_pass and not has_cr:
+    try:
+        verdict, _source = classify_verdict(selected)
+    except VerdictBlock as exc:
+        raise ValidationBlock(
+            phase, "ambiguous verdict, cannot create correction: %s" % exc.reason
+        )
+    if verdict == "PASS":
         raise ValidationBlock(phase, "review verdict was PASS, no correction authorized")
-    else:
-        raise ValidationBlock(phase, "ambiguous verdict, cannot create correction")
+
+    summary = selected.get("summary")
 
     key = stable_key(str(resolved), feature, "correction:" + review_id)
     body_parts = [
@@ -683,6 +749,119 @@ def create_correction(args):
     return EXIT_OK
 
 
+def archive_review(args):
+    phase = "archive-review"
+
+    try:
+        resolved = validate_workdir(args.workdir)
+    except WorkdirValidationError as exc:
+        raise ValidationBlock(phase, str(exc))
+
+    review_id = args.review_task_id
+    if not valid_task_id(review_id):
+        raise ValidationBlock(phase, "review_task_id is invalid: %r" % (review_id,))
+
+    show_completed = run_hermes_command(["hermes", "kanban", "show", review_id, "--json"])
+    show = parse_json_stdout(show_completed, "hermes kanban show " + review_id)
+    show = validate_show_top_level(show)
+
+    task = show.get("task")
+    if not isinstance(task, dict):
+        raise ValidationBlock(phase, "show.task must be a JSON object")
+    if task.get("id") != review_id:
+        raise ValidationBlock(
+            phase, "task.id is %r, expected %r" % (task.get("id"), review_id)
+        )
+
+    if task.get("workspace_kind") != "dir":
+        raise ValidationBlock(
+            phase,
+            "task.workspace_kind is %r, expected 'dir'" % (task.get("workspace_kind"),),
+        )
+    workspace_path = task.get("workspace_path")
+    if (
+        not isinstance(workspace_path, str)
+        or not workspace_path
+        or not Path(workspace_path).is_absolute()
+    ):
+        raise ValidationBlock(
+            phase, "task.workspace_path is missing or malformed: %r" % (workspace_path,)
+        )
+    if Path(workspace_path).resolve() != resolved:
+        raise ValidationBlock(
+            phase,
+            "task workspace %r does not match requested workdir %r"
+            % (workspace_path, str(resolved)),
+        )
+
+    if task.get("assignee") != "reviewer":
+        raise ValidationBlock(
+            phase, "task.assignee is %r, expected 'reviewer'" % (task.get("assignee"),)
+        )
+    if task.get("status") != "done":
+        raise ValidationBlock(
+            phase, "task.status is %r, expected 'done'" % (task.get("status"),)
+        )
+
+    completed_at = task.get("completed_at")
+    if isinstance(completed_at, bool) or not isinstance(completed_at, int) or completed_at <= 0:
+        raise ValidationBlock(
+            phase, "task.completed_at must be a positive int, got %r" % (completed_at,)
+        )
+
+    latest_run = select_latest_run(phase, show.get("runs"))
+
+    if latest_run.get("profile") != "reviewer":
+        raise ValidationBlock(
+            phase,
+            "latest run profile is %r, expected 'reviewer'" % (latest_run.get("profile"),),
+        )
+    if latest_run.get("status") != "done":
+        raise ValidationBlock(
+            phase, "latest run status is %r, expected 'done'" % (latest_run.get("status"),)
+        )
+    if latest_run.get("outcome") != "completed":
+        raise ValidationBlock(
+            phase,
+            "latest run outcome is %r, expected 'completed'" % (latest_run.get("outcome"),),
+        )
+
+    try:
+        verdict, _source = classify_verdict(latest_run)
+    except VerdictBlock as exc:
+        raise ValidationBlock(phase, "verdict blocked, cannot archive review: %s" % exc.reason)
+
+    helper_argv = [ARCHIVE_HELPER_PATH, str(resolved), review_id]
+    try:
+        helper_completed = subprocess.run(
+            helper_argv, shell=False, capture_output=True, text=True, check=False,
+            timeout=ARCHIVE_HELPER_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TransportError("review-archive-bridge timed out: %s" % exc)
+    except OSError as exc:
+        raise TransportError("review-archive-bridge failed to launch: %s" % exc)
+
+    if helper_completed.returncode != 0:
+        detail = (
+            (helper_completed.stderr or "").strip() + " " + (helper_completed.stdout or "").strip()
+        ).strip()
+        raise TransportError(
+            "review-archive-bridge exited %s: %s" % (helper_completed.returncode, detail)
+        )
+
+    payload = {
+        "phase": phase,
+        "outcome": "archive-succeeded",
+        "review_task_id": review_id,
+        "workdir": str(resolved),
+        "verdict": verdict,
+        "completed_at": completed_at,
+    }
+    print(json.dumps(payload, separators=(",", ":")))
+    return EXIT_OK
+
+
 def main(argv=None):
     try:
         args = build_parser().parse_args(argv)
@@ -700,6 +879,8 @@ def main(argv=None):
             return create_review(args)
         elif args.command == "create-correction":
             return create_correction(args)
+        elif args.command == "archive-review":
+            return archive_review(args)
         else:
             raise CliUsageError("unknown command: %r" % (args.command,))
     except ValidationBlock as exc:

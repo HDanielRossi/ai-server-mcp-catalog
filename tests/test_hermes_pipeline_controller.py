@@ -1197,3 +1197,705 @@ def test_wait_defaults_resolve_to_interval_1_and_retries_2():
         with mock.patch.object(hpc, "MONOTONIC") as mono, mock.patch.object(hpc, "SLEEP") as sle:
             rc = hpc.wait_for_task(TASK_ID, 4.2, 1.0, 2) if False else 0
     # (the real behavior is exercised by the other wait tests)
+
+
+# === A4: archive-review tests (pipeline-controller-a4-review-archive) ===
+
+ARCHIVE_HELPER = hpc.ARCHIVE_HELPER_PATH
+
+
+def make_archive_task(**overrides):
+    base = make_task(id=REVIEW_ID, assignee="reviewer")
+    base.update(overrides)
+    return base
+
+
+def make_archive_run(**overrides):
+    base = make_run(id=1, profile="reviewer", status="done", outcome="completed",
+                     summary="PASS", metadata=None)
+    base.update(overrides)
+    return base
+
+
+def make_archive_show(**overrides):
+    s = make_show(task=make_archive_task(), runs=[make_archive_run()])
+    s.update(overrides)
+    return s
+
+
+def stub_archive_aware(show_obj=None, show_exit=0, show_stdout=None,
+                        helper_returncode=0, helper_stdout="", helper_stderr="",
+                        helper_raise=None):
+    calls = []
+    kwargs_list = []
+
+    def run(args, **kwargs):
+        args = list(args)
+        calls.append(args)
+        kwargs_list.append(kwargs)
+        if args[:3] == ["hermes", "kanban", "show"]:
+            out = show_stdout if show_stdout is not None else json.dumps(show_obj)
+            return subprocess.CompletedProcess(args, show_exit, stdout=out, stderr="")
+        if args[:1] == [ARCHIVE_HELPER]:
+            if helper_raise is not None:
+                raise helper_raise
+            return subprocess.CompletedProcess(
+                args, helper_returncode, stdout=helper_stdout, stderr=helper_stderr)
+        raise AssertionError("unexpected subprocess call: %r" % (args,))
+
+    patcher = mock.patch.object(hpc.subprocess, "run", side_effect=run)
+    return patcher, calls, kwargs_list
+
+
+def archive_show_calls(calls):
+    return [c for c in calls if c[:3] == ["hermes", "kanban", "show"]]
+
+
+def archive_helper_calls(calls):
+    return [c for c in calls if c[:1] == [ARCHIVE_HELPER]]
+
+
+def parse_archive_blocked(capsys):
+    captured = capsys.readouterr()
+    lines = [l for l in captured.out.splitlines() if l.strip()]
+    assert len(lines) == 1
+    obj = json.loads(lines[0])
+    assert list(obj.keys()) == ["phase", "blocked", "reason", "task_id"]
+    assert obj["phase"] == "archive-review"
+    assert obj["blocked"] is True
+    assert obj["task_id"] is None
+    return captured, obj
+
+
+def parse_archive_success(capsys):
+    captured = capsys.readouterr()
+    lines = [l for l in captured.out.splitlines() if l.strip()]
+    assert len(lines) == 1
+    obj = json.loads(lines[0])
+    assert list(obj.keys()) == [
+        "phase", "outcome", "review_task_id", "workdir", "verdict", "completed_at",
+    ]
+    assert obj["phase"] == "archive-review"
+    assert obj["outcome"] == "archive-succeeded"
+    return captured, obj
+
+
+def run_archive_review(workdir=VALID_WD, review_task_id=REVIEW_ID):
+    return hpc.main(["archive-review", "--workdir", workdir, "--review_task_id", review_task_id])
+
+
+# --- A: CLI / input validation ---
+
+def test_archive_review_valid_args_accepted(capsys):
+    show_obj = make_archive_show()
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    assert len(archive_show_calls(calls)) == 1
+    assert len(archive_helper_calls(calls)) == 1
+
+
+@pytest.mark.parametrize("argv", [
+    ["archive-review"],
+    ["archive-review", "--workdir", VALID_WD],
+    ["archive-review", "--review_task_id", REVIEW_ID],
+    ["archive-review", "--workdir", VALID_WD, "--review_task_id", REVIEW_ID, "extra"],
+])
+def test_archive_review_cli_usage_errors_exit_3(capsys, argv):
+    with mock.patch.object(hpc.subprocess, "run") as m:
+        rc = hpc.main(argv)
+    assert rc == hpc.EXIT_TRANSPORT
+    m.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "usage error" in captured.err
+
+
+@pytest.mark.parametrize("bad_id", ["", "   ", "!!!", "ab", "t1"])
+def test_archive_review_malformed_review_task_id_rejected(capsys, bad_id):
+    with mock.patch.object(hpc.subprocess, "run") as m:
+        rc = run_archive_review(review_task_id=bad_id)
+    assert rc == hpc.EXIT_VALIDATION
+    m.assert_not_called()
+    captured, obj = parse_archive_blocked(capsys)
+    assert "review_task_id" in obj["reason"]
+
+
+@pytest.mark.parametrize("bad_wd", [
+    "/tmp/foo",
+    "relative/path",
+    "/opt/ai/projects/definitely_not_here_xyz",
+])
+def test_archive_review_bad_workdir_rejected(capsys, bad_wd):
+    with mock.patch.object(hpc.subprocess, "run") as m:
+        rc = run_archive_review(workdir=bad_wd)
+    assert rc == hpc.EXIT_VALIDATION
+    m.assert_not_called()
+    captured, obj = parse_archive_blocked(capsys)
+    assert obj["reason"].startswith("workdir")
+
+
+# --- B: authoritative show ---
+
+def test_archive_review_show_argv_exact(capsys):
+    show_obj = make_archive_show()
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    shows = archive_show_calls(calls)
+    assert len(shows) == 1
+    assert shows[0] == ["hermes", "kanban", "show", REVIEW_ID, "--json"]
+
+
+def test_archive_review_show_before_helper_ordering(capsys):
+    show_obj = make_archive_show()
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    show_idx = calls.index(["hermes", "kanban", "show", REVIEW_ID, "--json"])
+    helper_idx = calls.index([ARCHIVE_HELPER, VALID_WD, REVIEW_ID])
+    assert show_idx < helper_idx
+
+
+def test_archive_review_show_nonzero_exit_transport(capsys):
+    patcher, calls, _ = stub_archive_aware(show_exit=1, show_stdout="boom")
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_TRANSPORT
+    assert len(archive_helper_calls(calls)) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "transport error" in captured.err
+
+
+def test_archive_review_show_non_json_transport(capsys):
+    patcher, calls, _ = stub_archive_aware(show_stdout="not json")
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_TRANSPORT
+    assert len(archive_helper_calls(calls)) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "transport error" in captured.err
+
+
+def test_archive_review_show_payload_not_dict_transport(capsys):
+    patcher, calls, _ = stub_archive_aware(show_obj=[1, 2, 3])
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_TRANSPORT
+    assert len(archive_helper_calls(calls)) == 0
+
+
+def test_archive_review_wrong_task_id_blocked(capsys):
+    show_obj = make_archive_show(task=make_archive_task(id="t_other"))
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "t_other" in obj["reason"]
+
+
+# --- C: workspace ---
+
+def test_archive_review_workspace_kind_not_dir_blocked(capsys):
+    show_obj = make_archive_show(task=make_archive_task(workspace_kind="git"))
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "workspace_kind" in obj["reason"]
+
+
+@pytest.mark.parametrize("bad_path", [None, 123, "", "relative/path"])
+def test_archive_review_malformed_workspace_path_blocked(capsys, bad_path):
+    show_obj = make_archive_show(task=make_archive_task(workspace_path=bad_path))
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "workspace_path" in obj["reason"]
+
+
+def test_archive_review_missing_workspace_path_key_blocked(capsys):
+    task = make_archive_task()
+    del task["workspace_path"]
+    show_obj = make_archive_show(task=task)
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "workspace_path" in obj["reason"]
+
+
+def test_archive_review_workspace_path_mismatch_blocked(capsys):
+    show_obj = make_archive_show(
+        task=make_archive_task(workspace_path="/opt/ai/projects/other-repo")
+    )
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "does not match" in obj["reason"]
+
+
+# --- D: task state ---
+
+@pytest.mark.parametrize("bad_assignee", ["coder-claude", "", None, "Reviewer"])
+def test_archive_review_wrong_assignee_blocked(capsys, bad_assignee):
+    show_obj = make_archive_show(task=make_archive_task(assignee=bad_assignee))
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "assignee" in obj["reason"]
+
+
+@pytest.mark.parametrize("bad_status", ["running", "blocked", "ready", "archived"])
+def test_archive_review_wrong_status_blocked(capsys, bad_status):
+    show_obj = make_archive_show(task=make_archive_task(status=bad_status))
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "status" in obj["reason"]
+
+
+# --- E: completed_at ---
+
+def test_archive_review_completed_at_missing_key_blocked(capsys):
+    task = make_archive_task()
+    del task["completed_at"]
+    show_obj = make_archive_show(task=task)
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "completed_at" in obj["reason"]
+
+
+@pytest.mark.parametrize("bad_val", [None, 0, -1, "3", 3.0, True, False])
+def test_archive_review_completed_at_invalid_blocked(capsys, bad_val):
+    show_obj = make_archive_show(task=make_archive_task(completed_at=bad_val))
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "completed_at" in obj["reason"]
+
+
+def test_archive_review_completed_at_positive_int_accepted(capsys):
+    show_obj = make_archive_show(task=make_archive_task(completed_at=99))
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    captured, obj = parse_archive_success(capsys)
+    assert obj["completed_at"] == 99
+
+
+# --- F: latest run selection ---
+
+def test_archive_review_latest_run_selected_by_max_id_not_position(capsys):
+    runs = [
+        make_archive_run(id=9, summary="PASS"),
+        make_archive_run(id=2, summary="CHANGES REQUIRED"),
+        make_archive_run(id=5, summary="CHANGES REQUIRED"),
+    ]
+    show_obj = make_archive_show(runs=runs)
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    captured, obj = parse_archive_success(capsys)
+    assert obj["verdict"] == "PASS"
+
+
+def test_archive_review_empty_runs_blocked(capsys):
+    show_obj = make_archive_show(runs=[])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "runs" in obj["reason"]
+
+
+def test_archive_review_runs_not_list_blocked(capsys):
+    show_obj = make_archive_show(runs={"not": "a list"})
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+
+
+@pytest.mark.parametrize("bad_run", [
+    {"profile": "reviewer", "status": "done", "outcome": "completed", "summary": "PASS"},
+    dict(make_archive_run(), id="1"),
+    dict(make_archive_run(), id=None),
+    dict(make_archive_run(), id=True),
+])
+def test_archive_review_malformed_run_id_blocked(capsys, bad_run):
+    show_obj = make_archive_show(runs=[bad_run])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+
+
+def test_archive_review_duplicate_run_ids_blocked(capsys):
+    runs = [make_archive_run(id=1, summary="PASS"), make_archive_run(id=1, summary="CHANGES REQUIRED")]
+    show_obj = make_archive_show(runs=runs)
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "duplicate" in obj["reason"]
+
+
+def test_archive_review_latest_run_invalid_not_fallback(capsys):
+    runs = [
+        make_archive_run(id=1, outcome="completed", summary="PASS"),
+        make_archive_run(id=2, outcome="in_progress", summary="PASS"),
+    ]
+    show_obj = make_archive_show(runs=runs)
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "outcome" in obj["reason"]
+
+
+# --- G: latest run state ---
+
+def test_archive_review_latest_run_wrong_profile_blocked(capsys):
+    show_obj = make_archive_show(runs=[make_archive_run(profile="coder-claude")])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "profile" in obj["reason"]
+
+
+def test_archive_review_latest_run_wrong_status_blocked(capsys):
+    show_obj = make_archive_show(runs=[make_archive_run(status="blocked")])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "run status" in obj["reason"]
+
+
+def test_archive_review_latest_run_wrong_outcome_blocked(capsys):
+    show_obj = make_archive_show(runs=[make_archive_run(outcome="blocked")])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "outcome" in obj["reason"]
+
+
+# --- H: verdict logic ---
+
+def test_archive_review_verdict_metadata_pass_summary_both_markers_success(capsys):
+    run = make_archive_run(metadata={"verdict": "PASS"}, summary="PASS but CHANGES REQUIRED noted")
+    show_obj = make_archive_show(runs=[run])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    assert len(archive_helper_calls(calls)) == 1
+    captured, obj = parse_archive_success(capsys)
+    assert obj["verdict"] == "PASS"
+
+
+def test_archive_review_verdict_metadata_changes_required_summary_both_markers_success(capsys):
+    run = make_archive_run(metadata={"verdict": "CHANGES REQUIRED"}, summary="PASS but CHANGES REQUIRED noted")
+    show_obj = make_archive_show(runs=[run])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    assert len(archive_helper_calls(calls)) == 1
+    captured, obj = parse_archive_success(capsys)
+    assert obj["verdict"] == "CHANGES REQUIRED"
+
+
+@pytest.mark.parametrize("bad_verdict", ["other", 123, ["PASS"], {}])
+def test_archive_review_verdict_metadata_invalid_blocked(capsys, bad_verdict):
+    run = make_archive_run(metadata={"verdict": bad_verdict}, summary="PASS")
+    show_obj = make_archive_show(runs=[run])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "verdict" in obj["reason"]
+
+
+@pytest.mark.parametrize("metadata", [None, {}, {"verdict": None}, {"verdict": "unknown"}])
+def test_archive_review_verdict_metadata_fallback_to_summary(capsys, metadata):
+    run = make_archive_run(metadata=metadata, summary="PASS")
+    show_obj = make_archive_show(runs=[run])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    captured, obj = parse_archive_success(capsys)
+    assert obj["verdict"] == "PASS"
+
+
+def test_archive_review_verdict_summary_pass_only_success(capsys):
+    show_obj = make_archive_show(runs=[make_archive_run(metadata=None, summary="PASS")])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    captured, obj = parse_archive_success(capsys)
+    assert obj["verdict"] == "PASS"
+
+
+def test_archive_review_verdict_summary_changes_required_only_success(capsys):
+    show_obj = make_archive_show(runs=[make_archive_run(metadata=None, summary="CHANGES REQUIRED")])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    captured, obj = parse_archive_success(capsys)
+    assert obj["verdict"] == "CHANGES REQUIRED"
+
+
+def test_archive_review_verdict_summary_both_markers_blocked(capsys):
+    show_obj = make_archive_show(
+        runs=[make_archive_run(metadata=None, summary="PASS and CHANGES REQUIRED")]
+    )
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "verdict" in obj["reason"]
+
+
+def test_archive_review_verdict_summary_neither_marker_blocked(capsys):
+    show_obj = make_archive_show(runs=[make_archive_run(metadata=None, summary="looks fine")])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+    captured, obj = parse_archive_blocked(capsys)
+    assert "verdict" in obj["reason"]
+
+
+@pytest.mark.parametrize("bad_summary", [None, 123])
+def test_archive_review_verdict_summary_not_str_blocked(capsys, bad_summary):
+    show_obj = make_archive_show(runs=[make_archive_run(metadata=None, summary=bad_summary)])
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    assert len(archive_helper_calls(calls)) == 0
+
+
+# --- I: helper contract ---
+
+def test_archive_review_helper_argv_exact(capsys):
+    show_obj = make_archive_show()
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    helpers = archive_helper_calls(calls)
+    assert len(helpers) == 1
+    assert helpers[0] == [ARCHIVE_HELPER, VALID_WD, REVIEW_ID]
+
+
+def test_archive_review_helper_kwargs_shell_false_timeout_120(capsys):
+    show_obj = make_archive_show()
+    patcher, calls, kwargs_list = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    helper_idx = [i for i, c in enumerate(calls) if c[:1] == [ARCHIVE_HELPER]][0]
+    kwargs = kwargs_list[helper_idx]
+    assert kwargs.get("shell") is False
+    assert kwargs.get("timeout") == hpc.ARCHIVE_HELPER_TIMEOUT == 120
+
+
+def test_archive_review_success_output_shape(capsys):
+    show_obj = make_archive_show(task=make_archive_task(completed_at=42))
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    captured, obj = parse_archive_success(capsys)
+    assert obj == {
+        "phase": "archive-review",
+        "outcome": "archive-succeeded",
+        "review_task_id": REVIEW_ID,
+        "workdir": VALID_WD,
+        "verdict": "PASS",
+        "completed_at": 42,
+    }
+
+
+def test_archive_review_idempotent_two_calls_both_succeed(capsys):
+    show_obj = make_archive_show()
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc1 = run_archive_review()
+        capsys.readouterr()
+        rc2 = run_archive_review()
+    assert rc1 == hpc.EXIT_OK
+    assert rc2 == hpc.EXIT_OK
+    assert len(archive_helper_calls(calls)) == 2
+
+
+def test_archive_review_helper_nonzero_exit_transport(capsys):
+    show_obj = make_archive_show()
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj, helper_returncode=1, helper_stderr="boom")
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_TRANSPORT
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "transport error" in captured.err
+
+
+def test_archive_review_helper_oserror_transport(capsys):
+    show_obj = make_archive_show()
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj, helper_raise=OSError("no exec"))
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_TRANSPORT
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "transport error" in captured.err
+
+
+def test_archive_review_helper_timeout_transport(capsys):
+    show_obj = make_archive_show()
+    patcher, calls, _ = stub_archive_aware(
+        show_obj=show_obj,
+        helper_raise=subprocess.TimeoutExpired(cmd=[ARCHIVE_HELPER], timeout=120))
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_TRANSPORT
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "transport error" in captured.err
+    assert "timed out" in captured.err
+
+
+def test_archive_review_helper_stdout_junk_not_leaked(capsys):
+    show_obj = make_archive_show()
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj, helper_stdout="some junk output\nmore junk")
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    captured, obj = parse_archive_success(capsys)
+    assert "junk" not in captured.out
+
+
+def test_archive_review_never_calls_kanban_create(capsys):
+    show_obj = make_archive_show()
+    patcher, calls, _ = stub_archive_aware(show_obj=show_obj)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    assert not any("create" in c for c in calls)
+
+
+# --- J: create-correction regression (shared classify_verdict helper) ---
+
+def test_create_correction_metadata_changes_required_allowed(capsys):
+    show_obj = _done_show(runs=[
+        make_run(id=1, metadata={"verdict": "CHANGES REQUIRED"}, summary="unrelated narrative")
+    ])
+    patcher, calls = stub_create_aware(show_obj=show_obj, create_obj={"id": "t_corr"})
+    with patcher:
+        rc = hpc.main([
+            "create-correction", "--workdir", VALID_WD, "--feature", "widgets",
+            "--implementation_task_id", IMPL_ID, "--review_task_id", REVIEW_ID,
+        ])
+    assert rc == hpc.EXIT_OK
+    assert len(create_calls(calls)) == 1
+
+
+def test_create_correction_metadata_pass_overrides_summary_marker_blocks(capsys):
+    show_obj = _done_show(runs=[
+        make_run(id=1, metadata={"verdict": "PASS"}, summary="CHANGES REQUIRED mentioned only in narrative")
+    ])
+    patcher, calls = stub_create_aware(show_obj=show_obj, create_obj={"id": "t_corr"})
+    with patcher:
+        rc = hpc.main([
+            "create-correction", "--workdir", VALID_WD, "--feature", "widgets",
+            "--implementation_task_id", IMPL_ID, "--review_task_id", REVIEW_ID,
+        ])
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_single_json_line(capsys, ["phase", "blocked", "reason", "task_id"])
+    assert "PASS" in obj["reason"]
+    assert len(create_calls(calls)) == 0
+
+
+# --- K: wait regression (no archive-review helper calls, no .ai/reviews writes) ---
+
+def test_wait_never_calls_archive_helper(capsys, monkeypatch):
+    monkeypatch.setattr(hpc, "MONOTONIC", lambda: 0.0)
+    with mock.patch.object(hpc, "SLEEP"), stub_wait_read("done") as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1"])
+    assert rc == hpc.EXIT_OK
+    for call in m.call_args_list:
+        argv = list(call.args[0])
+        assert argv[:1] != [ARCHIVE_HELPER]
+        assert not any("review-archive-bridge" in str(a) for a in argv)
+
+
+def test_wait_timeout_never_calls_archive_helper(capsys, monkeypatch):
+    seq = [0.0, 0.0, 1.0, 1.0]
+    monkeypatch.setattr(hpc, "SLEEP", lambda s: None)
+    monkeypatch.setattr(hpc, "MONOTONIC", fake_monotonic(seq))
+    with stub_wait_read("running") as m:
+        rc = hpc.main(["wait", TASK_ID, "--timeout", "1"])
+    assert rc == hpc.EXIT_TIMEOUT
+    for call in m.call_args_list:
+        argv = list(call.args[0])
+        assert argv[:1] != [ARCHIVE_HELPER]
+        assert not any("review-archive-bridge" in str(a) for a in argv)
