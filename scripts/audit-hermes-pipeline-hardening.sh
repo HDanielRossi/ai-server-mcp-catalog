@@ -1390,6 +1390,203 @@ PY
   fi
 }
 
+# --- A6: pipeline_controller_server MCP adapter hardening (AST probe only;
+# never imports/execs the MCP adapter source, never starts the MCP server)
+pipeline_controller_mcp_audit() {
+  local label="$1"
+  local file="$2"
+  local findings
+  findings="$(AUDIT_PIPELINE_CONTROLLER_MCP_PATH="$file" python3 - <<'PY'
+import ast
+import os
+import sys
+
+PATH = os.environ["AUDIT_PIPELINE_CONTROLLER_MCP_PATH"]
+
+findings = []
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        source = f.read()
+    tree = ast.parse(source, filename=PATH)
+except (OSError, SyntaxError) as e:
+    print("pipeline_controller_mcp_probe_error:cannot_parse_source:%s" % (e,))
+    sys.exit(1)
+
+
+def assignment_pairs(node):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            yield target, node.value
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        yield node.target, node.value
+
+
+def has_assigned_constant(name, value):
+    for node in ast.walk(tree):
+        for target, val in assignment_pairs(node):
+            if (
+                isinstance(target, ast.Name)
+                and target.id == name
+                and isinstance(val, ast.Constant)
+                and val.value == value
+            ):
+                return True
+    return False
+
+
+FUNCTIONS = {}
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef):
+        FUNCTIONS[node.name] = node
+
+
+def find_function(name):
+    return FUNCTIONS.get(name)
+
+
+def string_constants(node):
+    return [n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+
+
+# 1) MCPServer("pipeline-controller")
+server_ok = False
+for node in ast.walk(tree):
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "MCPServer"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "pipeline-controller"
+    ):
+        server_ok = True
+if not server_ok:
+    findings.append("pipeline_controller_mcp_server_name_missing")
+
+# 2) exactly the intended seven-tool surface
+EXPECTED_TOOLS = {
+    "check_task", "create_implementation", "create_review", "create_correction",
+    "wait_task", "archive_review", "ready_to_commit",
+}
+registered_tools = set()
+for node in FUNCTIONS.values():
+    for dec in node.decorator_list:
+        if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr == "tool":
+            for kw in dec.keywords:
+                if kw.arg == "name" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                    registered_tools.add(kw.value.value)
+if registered_tools != EXPECTED_TOOLS:
+    missing = EXPECTED_TOOLS - registered_tools
+    unexpected = registered_tools - EXPECTED_TOOLS
+    findings.append(
+        "pipeline_controller_mcp_tool_surface_mismatch:missing=%s;unexpected=%s"
+        % (",".join(sorted(missing)) or "none", ",".join(sorted(unexpected)) or "none")
+    )
+
+# 3) fixed controller path constant
+if not has_assigned_constant("CONTROLLER_PATH", "/usr/local/bin/hermes-pipeline-controller"):
+    findings.append("pipeline_controller_mcp_controller_path_missing")
+
+# 4) shell=False + bounded subprocess (module-wide); at least one real
+# subprocess execution point must exist (the controller invocation).
+subprocess_run_calls = 0
+for node in ast.walk(tree):
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+    ):
+        subprocess_run_calls += 1
+        shell_kw = next((kw for kw in node.keywords if kw.arg == "shell"), None)
+        timeout_kw = next((kw for kw in node.keywords if kw.arg == "timeout"), None)
+        if shell_kw is None or not (isinstance(shell_kw.value, ast.Constant) and shell_kw.value.value is False):
+            findings.append("pipeline_controller_mcp_unbounded_or_shell_true_subprocess:line=%d" % node.lineno)
+        if timeout_kw is None:
+            findings.append("pipeline_controller_mcp_unbounded_or_shell_true_subprocess:line=%d" % node.lineno)
+if subprocess_run_calls == 0:
+    findings.append("pipeline_controller_mcp_no_subprocess_execution_present")
+
+# 5) no arbitrary-command/argv tool: no tool-decorated function may accept a
+# parameter literally named argv/command/cmd/shell_command/executable/args.
+FORBIDDEN_PARAM_NAMES = {"argv", "command", "cmd", "shell_command", "executable", "args"}
+for node in FUNCTIONS.values():
+    is_tool = any(
+        isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr == "tool"
+        for dec in node.decorator_list
+    )
+    if not is_tool:
+        continue
+    param_names = {a.arg for a in node.args.args} | {a.arg for a in node.args.kwonlyargs}
+    if param_names & FORBIDDEN_PARAM_NAMES:
+        findings.append("pipeline_controller_mcp_arbitrary_command_tool_present:%s" % node.name)
+
+# 6) no commit/push/staging subprocess: this adapter must never spawn git or
+# reference a raw "git" argv token; the controller subprocess is its only
+# execution path.
+if any(s == "git" for s in string_constants(tree)):
+    findings.append("pipeline_controller_mcp_commit_push_staging_subprocess_present")
+
+# 7) no controller-policy reimplementation: none of these controller-owned
+# policy symbols may be redefined/duplicated in the adapter.
+FORBIDDEN_POLICY_NAMES = {
+    "TASK_STATUSES", "RUN_STATUSES", "EVENT_KINDS", "WAIT_TERMINAL_STATUSES",
+    "classify_verdict", "select_latest_run", "validate_workdir", "capture_repository_state",
+    "REPOSITORY_STATE_SCHEMA", "REVIEW_ARCHIVE_SCHEMA_V2", "ALLOWED_ROOT",
+}
+defined_names = set(FUNCTIONS.keys())
+for node in ast.walk(tree):
+    for target, _val in assignment_pairs(node):
+        if isinstance(target, ast.Name):
+            defined_names.add(target.id)
+present_policy_names = defined_names & FORBIDDEN_POLICY_NAMES
+if present_policy_names:
+    findings.append(
+        "pipeline_controller_mcp_policy_reimplementation_present:%s" % ",".join(sorted(present_policy_names))
+    )
+
+# 8) no ready_to_commit -> archive_review chaining
+ready_fn = find_function("_tool_ready_to_commit")
+if ready_fn is None:
+    findings.append("pipeline_controller_mcp_ready_to_commit_tool_missing")
+else:
+    ready_strings = string_constants(ready_fn)
+    ready_called = {
+        n.func.id for n in ast.walk(ready_fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    if "archive-review" in ready_strings or "_tool_archive_review" in ready_called:
+        findings.append("pipeline_controller_mcp_ready_to_commit_chains_archive_review")
+
+# 9) no archive_review -> ready_to_commit chaining
+archive_fn = find_function("_tool_archive_review")
+if archive_fn is None:
+    findings.append("pipeline_controller_mcp_archive_review_tool_missing")
+else:
+    archive_strings = string_constants(archive_fn)
+    archive_called = {
+        n.func.id for n in ast.walk(archive_fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    if "ready-to-commit" in archive_strings or "_tool_ready_to_commit" in archive_called:
+        findings.append("pipeline_controller_mcp_archive_review_chains_ready_to_commit")
+
+for finding in findings:
+    print(finding)
+
+sys.exit(1 if findings else 0)
+PY
+)"
+  if [[ -z "$findings" ]]; then
+    check_ok "$label ($file) satisfies pipeline-controller MCP adapter hardening invariants (A6)"
+  else
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && check_fail "$label ($file): $line"
+    done <<<"$findings"
+  fi
+}
+
 run_repo_only() {
   ACTIVE_FAILURES_ARR="REPO_FAILURES"
 
@@ -1412,6 +1609,8 @@ run_repo_only() {
   require_file_nonempty "tests/test_review_archive_bridge_template.py"
   require_file_nonempty "scripts/hermes-pipeline-controller.py"
   require_file_nonempty "tests/test_hermes_pipeline_controller.py"
+  require_file_nonempty "templates/pipeline_controller_server.py"
+  require_file_nonempty "tests/test_pipeline_controller_template.py"
   require_file_nonempty ".gitignore"
 
   echo
@@ -1763,6 +1962,11 @@ run_repo_only() {
   else
     check_fail "controller tests missing coverage for an unrelated untracked path elsewhere under .ai/ (outside .ai/reviews/) still blocking READY_TO_COMMIT"
   fi
+
+  echo
+  echo "13) pipeline-controller MCP adapter hardening (A6 thin MCP facade):"
+  PIPELINE_CONTROLLER_MCP_FILE="$REPO_DIR/templates/pipeline_controller_server.py"
+  pipeline_controller_mcp_audit "pipeline-controller MCP adapter template" "$PIPELINE_CONTROLLER_MCP_FILE"
 }
 
 run_runtime() {

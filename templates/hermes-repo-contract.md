@@ -128,3 +128,12 @@ A successful READY_TO_COMMIT result must preserve:
 The human operator gives explicit commit authorization only after READY_TO_COMMIT succeeds.
 
 Push requires a separate explicit human authorization. Commit authorization never implies push authorization.
+
+## A6 `pipeline_controller` MCP adapter
+
+When the pipeline is driven through the `pipeline-controller` MCP server (`templates/pipeline_controller_server.py`), the same READY_TO_COMMIT and archival rules above apply unchanged: the MCP server is a thin façade over `scripts/hermes-pipeline-controller.py` and never reimplements or second-guesses controller policy.
+
+- The MCP server exposes exactly seven tools: `check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`. There is no arbitrary command/argv/executable/shell tool, and no `git add`/`git commit`/`git push` or other staging tool.
+- `archive_review` and `ready_to_commit` remain separate, explicit operations — the adapter never chains one into the other.
+- `ready_to_commit` remains strictly read-only technical attestation through the MCP adapter exactly as through the CLI: it never stages, commits, pushes, or infers human approval.
+- Runtime exposure of the MCP adapter (installing and wiring it into a live profile) is a separate, human-authorized step outside of this repository contract.

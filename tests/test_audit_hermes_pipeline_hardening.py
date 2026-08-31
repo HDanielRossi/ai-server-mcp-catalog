@@ -41,6 +41,8 @@ REPO_ONLY_FILES = [
     os.path.join("tests", "test_review_archive_bridge_template.py"),
     os.path.join("scripts", "hermes-pipeline-controller.py"),
     os.path.join("tests", "test_hermes_pipeline_controller.py"),
+    os.path.join("templates", "pipeline_controller_server.py"),
+    os.path.join("tests", "test_pipeline_controller_template.py"),
     ".gitignore",
 ]
 
@@ -1409,3 +1411,144 @@ def test_repo_negative_a51_controller_fixture_regresses_to_broad_dot_ai(tmp_path
     assert (
         "controller test fixture (make_rtc_repo) must not regress to the broad .ai/ ignore rule" in result.stdout
     )
+
+
+# 15) A6: pipeline_controller_server MCP adapter hardening.
+
+
+def _pipeline_controller_mcp_file(fixture):
+    return fixture / "templates" / "pipeline_controller_server.py"
+
+
+MUT_A6_SERVER_NAME_OLD = 'mcp_server = MCPServer("pipeline-controller")'
+MUT_A6_SERVER_NAME_NEW = 'mcp_server = MCPServer("pipeline-controller-x")'
+
+MUT_A6_TOOL_SURFACE_OLD = '@mcp_server.tool(name="check_task")'
+MUT_A6_TOOL_SURFACE_NEW = '@mcp_server.tool(name="check_task_x")'
+
+MUT_A6_CONTROLLER_PATH_ANCHOR = 'CONTROLLER_PATH = "/usr/local/bin/hermes-pipeline-controller"\n'
+
+MUT_A6_CONTROLLER_PATH_OLD = 'CONTROLLER_PATH = "/usr/local/bin/hermes-pipeline-controller"'
+MUT_A6_CONTROLLER_PATH_NEW = 'CONTROLLER_PATH = "/usr/local/bin/hermes-pipeline-controller-x"'
+
+MUT_A6_SHELL_FALSE_OLD = "            shell=False,\n"
+MUT_A6_SHELL_FALSE_NEW = "            shell=True,\n"
+
+MUT_A6_TIMEOUT_OLD = "            timeout=timeout,\n"
+MUT_A6_TIMEOUT_NEW = ""
+
+MUT_A6_ARBITRARY_TOOL_OLD = "def _tool_check_task(task_id: str):"
+MUT_A6_ARBITRARY_TOOL_NEW = "def _tool_check_task(task_id: str, argv=None):"
+
+MUT_A6_GIT_TOKEN_NEW = MUT_A6_CONTROLLER_PATH_ANCHOR + '_UNUSED_GIT_TOKEN = "git"\n'
+
+MUT_A6_POLICY_REIMPL_NEW = MUT_A6_CONTROLLER_PATH_ANCHOR + 'ALLOWED_ROOT = "/opt/ai/projects"\n'
+
+MUT_A6_READY_CHAINS_ARCHIVE_OLD = (
+    '    return _invoke_controller("ready-to-commit", argv_tail, DEFAULT_READY_TO_COMMIT_TIMEOUT_SECONDS)\n'
+)
+MUT_A6_READY_CHAINS_ARCHIVE_NEW = (
+    '    _invoke_controller("archive-review", argv_tail, DEFAULT_ARCHIVE_REVIEW_TIMEOUT_SECONDS)\n'
+    '    return _invoke_controller("ready-to-commit", argv_tail, DEFAULT_READY_TO_COMMIT_TIMEOUT_SECONDS)\n'
+)
+
+MUT_A6_ARCHIVE_CHAINS_READY_OLD = (
+    '    return _invoke_controller("archive-review", argv_tail, DEFAULT_ARCHIVE_REVIEW_TIMEOUT_SECONDS)\n'
+)
+MUT_A6_ARCHIVE_CHAINS_READY_NEW = (
+    '    _invoke_controller("ready-to-commit", argv_tail, DEFAULT_READY_TO_COMMIT_TIMEOUT_SECONDS)\n'
+    '    return _invoke_controller("archive-review", argv_tail, DEFAULT_ARCHIVE_REVIEW_TIMEOUT_SECONDS)\n'
+)
+
+
+def test_repo_only_a6_section_passes_on_compliant_fixture(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 0
+    assert "PASS" in result.stdout
+    assert "pipeline-controller MCP adapter template" in result.stdout
+    assert "satisfies pipeline-controller MCP adapter hardening invariants (A6)" in result.stdout
+
+
+def test_repo_negative_a6_server_name_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_mcp_file(fixture), MUT_A6_SERVER_NAME_OLD, MUT_A6_SERVER_NAME_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "pipeline_controller_mcp_server_name_missing" in result.stdout
+
+
+def test_repo_negative_a6_tool_surface_mismatch(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_mcp_file(fixture), MUT_A6_TOOL_SURFACE_OLD, MUT_A6_TOOL_SURFACE_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "pipeline_controller_mcp_tool_surface_mismatch" in result.stdout
+
+
+def test_repo_negative_a6_controller_path_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_mcp_file(fixture), MUT_A6_CONTROLLER_PATH_OLD, MUT_A6_CONTROLLER_PATH_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "pipeline_controller_mcp_controller_path_missing" in result.stdout
+
+
+def test_repo_negative_a6_shell_true_subprocess(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_mcp_file(fixture), MUT_A6_SHELL_FALSE_OLD, MUT_A6_SHELL_FALSE_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "pipeline_controller_mcp_unbounded_or_shell_true_subprocess" in result.stdout
+
+
+def test_repo_negative_a6_unbounded_subprocess(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_mcp_file(fixture), MUT_A6_TIMEOUT_OLD, MUT_A6_TIMEOUT_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "pipeline_controller_mcp_unbounded_or_shell_true_subprocess" in result.stdout
+
+
+def test_repo_negative_a6_arbitrary_command_tool_present(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_mcp_file(fixture), MUT_A6_ARBITRARY_TOOL_OLD, MUT_A6_ARBITRARY_TOOL_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "pipeline_controller_mcp_arbitrary_command_tool_present" in result.stdout
+
+
+def test_repo_negative_a6_commit_push_staging_subprocess_present(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_mcp_file(fixture), MUT_A6_CONTROLLER_PATH_ANCHOR, MUT_A6_GIT_TOKEN_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "pipeline_controller_mcp_commit_push_staging_subprocess_present" in result.stdout
+
+
+def test_repo_negative_a6_policy_reimplementation_present(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_mcp_file(fixture), MUT_A6_CONTROLLER_PATH_ANCHOR, MUT_A6_POLICY_REIMPL_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "pipeline_controller_mcp_policy_reimplementation_present" in result.stdout
+
+
+def test_repo_negative_a6_ready_to_commit_chains_archive_review(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(
+        _pipeline_controller_mcp_file(fixture), MUT_A6_READY_CHAINS_ARCHIVE_OLD, MUT_A6_READY_CHAINS_ARCHIVE_NEW
+    )
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "pipeline_controller_mcp_ready_to_commit_chains_archive_review" in result.stdout
+
+
+def test_repo_negative_a6_archive_review_chains_ready_to_commit(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(
+        _pipeline_controller_mcp_file(fixture), MUT_A6_ARCHIVE_CHAINS_READY_OLD, MUT_A6_ARCHIVE_CHAINS_READY_NEW
+    )
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "pipeline_controller_mcp_archive_review_chains_ready_to_commit" in result.stdout

@@ -196,3 +196,11 @@ Why this matters: `review_archive_bridge` writes the final `hermes.review-archiv
 The archive artifact itself remains control-plane evidence, not reviewed source-state, and its validity is still independently enforced by `hermes.review-archive/v2` — Git-ignoring `.ai/reviews/` never substitutes for that validation, and it is not human approval.
 
 The human operator commits only after implementation completion, final review PASS, matching v2 archival, successful `ready-to-commit`, passing tests, reviewed Git diff, expected scope, and explicit commit authorization.
+
+## A6 `pipeline_controller` MCP adapter
+
+`templates/pipeline_controller_server.py` is a thin MCP façade over `scripts/hermes-pipeline-controller.py`: it exposes the controller's seven operations (`check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`) as typed MCP tools, one controller subprocess invocation per call, with no arbitrary command/argv tool and no commit/push/staging capability of any kind.
+
+The controller remains the sole policy authority — workdir policy, Kanban validation, verdict classification, correction policy, repository-state/v1, archive validation, and READY_TO_COMMIT policy are all implemented exclusively in the controller, never in the adapter. `archive_review` and `ready_to_commit` remain separate, explicit operations; the adapter never chains one into the other, and READY_TO_COMMIT remains a technical, read-only attestation — it never infers or grants human commit/push approval.
+
+A6 is repository-only: this task performs no live deployment, installation, or configuration change. Exposing the MCP adapter at a live path and wiring it into a profile's tool configuration is a separate, human-authorized rollout performed later by the operator, after review PASS. See "A6" in `docs/hermes-pipeline.md` for the full contract.

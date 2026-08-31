@@ -1123,3 +1123,74 @@ A5 remains repository-only until a separate human-authorized runtime rollout. RE
 - `templates/hermes-repo-contract.md` documents the `/.ai/reviews/` precondition as part of the A5 READY_TO_COMMIT requirements for every onboarded repository.
 - `scripts/audit-hermes-pipeline-hardening.sh` (`--repo-only`) statically verifies that this repository's own tracked `.gitignore` contains the exact rooted `/.ai/reviews/` rule (and not a broad `.ai/` or `/.ai/` rule), that the controller test fixture (`make_rtc_repo` in `tests/test_hermes_pipeline_controller.py`) uses the same narrow rule, and that the test suite covers an unrelated untracked path elsewhere under `.ai/` still blocking READY_TO_COMMIT.
 - `tests/test_hermes_pipeline_controller.py` includes hermetic regression coverage proving: repository state captured before an archive write is identical to state captured after a valid archive is written beneath the ignored `.ai/reviews/`; READY_TO_COMMIT succeeds with the archive physically present under `.ai/reviews/`; an unrelated untracked path outside `.ai/reviews/` still blocks READY_TO_COMMIT; and an unrelated untracked path elsewhere under `.ai/` (outside `.ai/reviews/`) is NOT hidden by the narrow rule and still blocks READY_TO_COMMIT.
+
+## A6 — `pipeline_controller` MCP adapter (repository-only artifacts)
+
+- SCOPE: repository-only implementation. `templates/pipeline_controller_server.py` is a thin MCP façade over the existing `scripts/hermes-pipeline-controller.py` CLI. `scripts/hermes-pipeline-controller.py` itself is NOT modified by A6. No live deployment, install, restart, commit, or push occurs as part of this repository implementation; runtime exposure/configuration of the MCP server happens only in a later, separately human-authorized step.
+- WHY: an MCP-native caller needs a typed, bounded way to drive the controller's seven authorized operations without ever gaining a general-purpose shell/argv escape hatch.
+
+### The controller remains the sole policy authority
+
+`pipeline_controller_server.py` never reimplements, duplicates, or second-guesses any controller policy. All of the following remain exclusively in `scripts/hermes-pipeline-controller.py`:
+
+- workdir policy and containment;
+- Kanban structural validation;
+- verdict classification (`classify_verdict`);
+- implementation/review authority and correction policy;
+- `hermes.repository-state/v1` capture and stability checks;
+- `hermes.review-archive/v2` validation;
+- READY_TO_COMMIT policy;
+- `wait` timeout/retry semantics.
+
+The adapter's job is limited to: build the exact controller argv for a requested operation, invoke the controller as a bounded subprocess, and report its exit code and stdout back unchanged.
+
+### Seven MCP tools
+
+The MCP server is named `pipeline-controller` and exposes exactly these seven tools, each mapping onto one controller CLI subcommand:
+
+| MCP tool | Controller subcommand | Role |
+| --- | --- | --- |
+| `check_task` | `check` | Read-only structural validation of one Kanban task. |
+| `create_implementation` | `create-implementation` | Create an implementation task. |
+| `create_review` | `create-review` | Create a review task. |
+| `create_correction` | `create-correction` | Create a correction task. |
+| `wait_task` | `wait` | Poll one Kanban task until terminal or timeout. |
+| `archive_review` | `archive-review` | Deterministically archive a completed reviewer task. |
+| `ready_to_commit` | `ready-to-commit` | Read-only technical attestation that a workdir is ready to commit. |
+
+No other tool exists: there is no arbitrary command, argv, executable, or shell-command tool, and no `git add`/`git commit`/`git push`/reset/restore/checkout tool. The adapter has exactly one subprocess execution point, and it is always `[CONTROLLER_PATH, <subcommand>, ...]` with `shell=False`.
+
+### Execution boundary
+
+- `CONTROLLER_PATH = "/usr/local/bin/hermes-pipeline-controller"` is a fixed, trusted location intended for later runtime installation. It is never probed, statted, or otherwise inspected at import time, so repository tests import the template without any runtime deployment.
+- Every controller invocation uses `subprocess.run` with an argv list only, `shell=False`, `capture_output=True`, `text=True`, and a bounded timeout — never shell interpolation.
+- `wait_task`'s outer MCP subprocess timeout is the validated requested `timeout` plus a small, fixed transport grace period (`WAIT_TRANSPORT_GRACE_SECONDS`). This never races or replaces the controller's own exit-4 wait-timeout semantics: the controller's `--timeout` flag always receives the exact requested value, unmodified by the grace period.
+- Adapter-only numeric inputs are strictly validated before any subprocess runs: `timeout` and `interval` must be finite, positive numbers (NaN/inf/zero/negative rejected), `max_retries` must be a non-negative integer, and `timeout` additionally has a conservative adapter maximum (`MAX_WAIT_TIMEOUT_SECONDS = 3600`). The adapter never duplicates the controller's own validation of task IDs, workdirs, feature strings, or review authority — those are passed through unchanged for the controller to validate.
+
+### Output contract
+
+Every tool returns the same envelope shape:
+
+```json
+{
+  "schema": "hermes.pipeline-controller-mcp/v1",
+  "command": "<controller-subcommand>",
+  "exit_code": 0,
+  "payload": {"...": "..."},
+  "stderr": ""
+}
+```
+
+- The controller's exact exit code is always preserved (0/2/3/4), never reinterpreted.
+- When stdout contains the expected single JSON object, it is returned unchanged as `payload` — `reason_code`, `verdict`, `outcome`, `phase`, fingerprints, and task IDs are never rewritten.
+- Malformed, multiple, or non-object controller stdout fails closed (a deterministic adapter error), rather than being silently accepted.
+- Captured stdout/stderr are bounded.
+- Launch failures (`OSError`) and subprocess timeouts (`subprocess.TimeoutExpired`) are deterministic MCP adapter errors — they never masquerade as a controller exit code.
+
+### No commit/push/staging capability; READY_TO_COMMIT stays read-only
+
+The adapter exposes no commit, push, or staging capability of any kind. `archive_review` and `ready_to_commit` remain separate, explicit operations: `ready_to_commit` never chains into `archive_review`, and `archive_review` never chains into `ready_to_commit` — each invokes exactly one controller subcommand. READY_TO_COMMIT is a technical, read-only attestation; the adapter never infers, grants, or records human approval from it. Human commit/push approval remains a separate action outside this adapter, exactly as in the base A5 contract.
+
+### Deployment boundary
+
+A6 is repository-only: no live deployment, installation, or configuration change occurs as part of this task. Exposing `pipeline_controller_server.py` as a running MCP server (installing it at a live path, wiring it into a profile's tool config, etc.) is a separate, human-authorized rollout performed later by the operator, after review PASS.
