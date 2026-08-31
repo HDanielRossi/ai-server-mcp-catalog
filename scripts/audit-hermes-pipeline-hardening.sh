@@ -121,6 +121,18 @@ grep_absent() {
   ! grep -qF -- "$needle" "$file" 2>/dev/null
 }
 
+grep_line_exact() {
+  local file="$1"
+  local line="$2"
+  grep -qxF -- "$line" "$file" 2>/dev/null
+}
+
+grep_line_exact_absent() {
+  local file="$1"
+  local line="$2"
+  ! grep -qxF -- "$line" "$file" 2>/dev/null
+}
+
 require_file_nonempty() {
   local file="$1"
   if [[ -s "$REPO_DIR/$file" ]]; then
@@ -395,6 +407,989 @@ PY
   fi
 }
 
+# --- A5 B3: review_bridge repository-state/v1 hardening (AST probe only;
+# never imports/execs the review_bridge source) -------------------------
+#
+# Verifies, via ast.parse only, that templates/review_bridge_server.py
+# implements the deterministic hermes.repository-state/v1 envelope contract:
+# schema literal, canonical workdir, HEAD capture, changed_paths union,
+# staged/unstaged patch digests, untracked evidence, aggregate digest,
+# double-capture stability check, conflict/submodule/special-entry
+# rejection, and bounded shell=False git execution.
+review_bridge_repository_state_audit() {
+  local label="$1"
+  local file="$2"
+  local findings
+  findings="$(AUDIT_REVIEW_BRIDGE_PATH="$file" python3 - <<'PY'
+import ast
+import os
+import sys
+
+PATH = os.environ["AUDIT_REVIEW_BRIDGE_PATH"]
+
+findings = []
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        source = f.read()
+    tree = ast.parse(source, filename=PATH)
+except (OSError, SyntaxError) as e:
+    print("review_bridge_repo_state_probe_error:cannot_parse_source:%s" % (e,))
+    sys.exit(1)
+
+
+def assignment_pairs(node):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            yield target, node.value
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        yield node.target, node.value
+
+
+def subscript_key(node):
+    s = node.slice
+    if hasattr(ast, "Index") and isinstance(s, ast.Index):
+        s = s.value
+    return s
+
+
+def find_function(name):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def has_name(node, name):
+    return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
+
+
+def has_raise(node):
+    return any(isinstance(n, ast.Raise) for n in ast.walk(node))
+
+
+def list_literals(node):
+    for n in ast.walk(node):
+        if isinstance(n, ast.List):
+            elts = []
+            ok = True
+            for elt in n.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    elts.append(elt.value)
+                else:
+                    ok = False
+                    break
+            if ok:
+                yield elts
+
+
+# 1) schema literal
+schema_ok = False
+for node in ast.walk(tree):
+    for target, value in assignment_pairs(node):
+        if (
+            isinstance(target, ast.Name)
+            and target.id == "REPOSITORY_STATE_SCHEMA"
+            and isinstance(value, ast.Constant)
+            and value.value == "hermes.repository-state/v1"
+        ):
+            schema_ok = True
+if not schema_ok:
+    findings.append("review_bridge_repo_state_schema_missing")
+
+# 2) canonical workdir via os.path.realpath inside collect_repository_state
+collect_fn = find_function("collect_repository_state")
+canonical_ok = False
+if collect_fn is not None:
+    for node in ast.walk(collect_fn):
+        for target, value in assignment_pairs(node):
+            if (
+                isinstance(target, ast.Name)
+                and target.id == "canonical_workdir"
+                and isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "realpath"
+            ):
+                canonical_ok = True
+if collect_fn is None or not canonical_ok:
+    findings.append("review_bridge_repo_state_canonical_workdir_missing")
+
+# 3) HEAD capture
+head_ok = any(elts == ["git", "rev-parse", "HEAD"] for elts in list_literals(tree))
+if not head_ok:
+    findings.append("review_bridge_repo_state_head_missing")
+
+# 4) changed_paths union of staged/unstaged/untracked
+changed_paths_ok = False
+for node in ast.walk(tree):
+    for target, value in assignment_pairs(node):
+        if (
+            isinstance(target, ast.Name)
+            and target.id == "changed_paths"
+            and isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "sorted"
+        ):
+            set_calls = sum(
+                1
+                for n in ast.walk(value)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "set"
+            )
+            bitor_ok = any(isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr) for n in ast.walk(value))
+            if set_calls >= 3 and bitor_ok:
+                changed_paths_ok = True
+if not changed_paths_ok:
+    findings.append("review_bridge_repo_state_changed_paths_missing")
+
+# 5) envelope dict required keys
+envelope_keys = set()
+for node in ast.walk(tree):
+    for target, value in assignment_pairs(node):
+        if isinstance(target, ast.Name) and target.id == "envelope" and isinstance(value, ast.Dict):
+            for key in value.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    envelope_keys.add(key.value)
+for required_key in (
+    "schema", "workdir", "head", "changed_paths",
+    "staged_patch_sha256", "unstaged_patch_sha256", "untracked",
+):
+    if required_key not in envelope_keys:
+        findings.append("review_bridge_repo_state_envelope_key_missing:%s" % required_key)
+
+# 6) aggregate_sha256: envelope["aggregate_sha256"] = <call>
+aggregate_ok = False
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign) and len(node.targets) == 1:
+        target = node.targets[0]
+        if (
+            isinstance(target, ast.Subscript)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "envelope"
+        ):
+            key_node = subscript_key(target)
+            if (
+                isinstance(key_node, ast.Constant)
+                and key_node.value == "aggregate_sha256"
+                and isinstance(node.value, ast.Call)
+            ):
+                aggregate_ok = True
+if not aggregate_ok:
+    findings.append("review_bridge_repo_state_aggregate_sha256_missing")
+
+# 7) double capture + stability check inside collect_repository_state
+if collect_fn is None:
+    findings.append("review_bridge_repo_state_double_capture_missing")
+    findings.append("review_bridge_repo_state_stability_check_missing")
+else:
+    capture_calls = sum(
+        1
+        for n in ast.walk(collect_fn)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_capture_repository_state_once"
+    )
+    if capture_calls < 2:
+        findings.append("review_bridge_repo_state_double_capture_missing")
+
+    stability_ok = False
+    for node in ast.walk(collect_fn):
+        if isinstance(node, ast.If):
+            test = node.test
+            if (
+                isinstance(test, ast.Compare)
+                and isinstance(test.left, ast.Name)
+                and test.left.id == "first"
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.NotEq)
+                and len(test.comparators) == 1
+                and isinstance(test.comparators[0], ast.Name)
+                and test.comparators[0].id == "second"
+                and has_raise(node)
+            ):
+                stability_ok = True
+    if not stability_ok:
+        findings.append("review_bridge_repo_state_stability_check_missing")
+
+# 8) conflict + submodule rejection
+conflict_fn = find_function("_reject_conflicts_and_submodules")
+if conflict_fn is None:
+    findings.append("review_bridge_repo_state_conflict_rejection_missing")
+    findings.append("review_bridge_repo_state_submodule_rejection_missing")
+else:
+    if not (has_name(conflict_fn, "CONFLICT_STATUS_CODES") and has_raise(conflict_fn)):
+        findings.append("review_bridge_repo_state_conflict_rejection_missing")
+    submodule_ok = any(isinstance(n, ast.Constant) and n.value == "160000" for n in ast.walk(tree))
+    if not submodule_ok:
+        findings.append("review_bridge_repo_state_submodule_rejection_missing")
+
+# 9) unsupported special-entry rejection
+special_fn = find_function("_reject_untracked_special_entries")
+if special_fn is None:
+    findings.append("review_bridge_repo_state_special_entry_rejection_missing")
+else:
+    attrs = {n.attr for n in ast.walk(special_fn) if isinstance(n, ast.Attribute)}
+    required_attrs = {"S_ISREG", "S_ISDIR", "S_ISLNK"}
+    if not required_attrs.issubset(attrs) or not has_raise(special_fn):
+        findings.append("review_bridge_repo_state_special_entry_rejection_missing")
+
+# 10) bounded shell=False subprocess execution (module-wide)
+for node in ast.walk(tree):
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+    ):
+        shell_kw = next((kw for kw in node.keywords if kw.arg == "shell"), None)
+        timeout_kw = next((kw for kw in node.keywords if kw.arg == "timeout"), None)
+        if shell_kw is None or not (isinstance(shell_kw.value, ast.Constant) and shell_kw.value.value is False):
+            findings.append("review_bridge_repo_state_unbounded_or_shell_true_subprocess:line=%d" % node.lineno)
+        if timeout_kw is None:
+            findings.append("review_bridge_repo_state_unbounded_or_shell_true_subprocess:line=%d" % node.lineno)
+
+for finding in findings:
+    print(finding)
+
+sys.exit(1 if findings else 0)
+PY
+)"
+  if [[ -z "$findings" ]]; then
+    check_ok "$label ($file) satisfies repository-state/v1 hardening invariants (A5)"
+  else
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && check_fail "$label ($file): $line"
+    done <<<"$findings"
+  fi
+}
+
+# --- A5 B3: reviewer-SOUL.md repository-state fingerprint requirement ---
+#
+# Whitespace-normalized containment check of each required A5 invariant's
+# anchor phrase (taken verbatim from the current verified reviewer-SOUL.md
+# "Repository-state fingerprint requirement (A4.2)" section) against the
+# given SOUL text. This is the requirement that the final authoritative
+# collect/review records the exact repository-state envelope/digest that
+# READY_TO_COMMIT later cross-checks.
+reviewer_soul_a5_repository_state_invariant_audit() {
+  local label="$1"
+  local file="$2"
+  if [[ ! -s "$file" ]]; then
+    check_fail "$label ($file) missing or empty; cannot verify A5 repository-state fingerprint invariants"
+    return
+  fi
+  local findings
+  findings="$(AUDIT_REVIEWER_SOUL_A5_PATH="$file" python3 - <<'PY'
+import os
+import re
+import sys
+
+PATH = os.environ["AUDIT_REVIEWER_SOUL_A5_PATH"]
+
+INVARIANTS = [
+    ("final_collect_required", "one final, successful collect(workdir) call"),
+    ("final_collect_after_every_other", "made after every other collect in the session"),
+    ("fingerprint_purpose", "fingerprint the exact repository state the verdict is being issued against"),
+    (
+        "copy_repository_state_and_digest_verbatim",
+        "must copy the repository_state object and the repository_state_sha256 string returned by "
+        "that final call verbatim into the completion metadata",
+    ),
+    ("copy_byte_for_byte", "byte-for-byte, with no summarization, truncation, retyping, or reformatting"),
+    ("block_on_missing_or_unstable", "the reviewer must BLOCK the task instead of completing it"),
+    ("unstable_capture_blocks", "repository state was unstable across consecutive captures"),
+    ("scope_paths_no_substitute", "scope_paths never substitutes for a fingerprint"),
+]
+
+
+def normalize(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        source = f.read()
+except OSError as e:
+    print("reviewer_soul_a5_probe_error:cannot_read_file:%s" % (e,))
+    sys.exit(1)
+
+haystack = normalize(source)
+
+findings = []
+for invariant_id, anchor in INVARIANTS:
+    if normalize(anchor) not in haystack:
+        findings.append("reviewer_soul_a5_missing_invariant:%s" % (invariant_id,))
+
+for finding in findings:
+    print(finding)
+
+sys.exit(1 if findings else 0)
+PY
+)"
+  if [[ -z "$findings" ]]; then
+    check_ok "$label ($file) satisfies A5 repository-state fingerprint invariants"
+  else
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && check_fail "$label ($file): $line"
+    done <<<"$findings"
+  fi
+}
+
+# --- A5 B3: review_archive_bridge hermes.review-archive/v2 hardening
+# (AST probe only; never imports/execs the archive helper source) -------
+review_archive_bridge_v2_audit() {
+  local label="$1"
+  local file="$2"
+  local findings
+  findings="$(AUDIT_REVIEW_ARCHIVE_PATH="$file" python3 - <<'PY'
+import ast
+import os
+import sys
+
+PATH = os.environ["AUDIT_REVIEW_ARCHIVE_PATH"]
+
+findings = []
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        source = f.read()
+    tree = ast.parse(source, filename=PATH)
+except (OSError, SyntaxError) as e:
+    print("review_archive_v2_probe_error:cannot_parse_source:%s" % (e,))
+    sys.exit(1)
+
+
+def assignment_pairs(node):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            yield target, node.value
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        yield node.target, node.value
+
+
+def subscript_key(node):
+    s = node.slice
+    if hasattr(ast, "Index") and isinstance(s, ast.Index):
+        s = s.value
+    return s
+
+
+def find_function(name):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def has_name(node, name):
+    return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
+
+
+def has_raise(node):
+    return any(isinstance(n, ast.Raise) for n in ast.walk(node))
+
+
+def string_constants(node):
+    return [n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+
+
+def has_assigned_constant(name, value):
+    for node in ast.walk(tree):
+        for target, val in assignment_pairs(node):
+            if isinstance(target, ast.Name) and target.id == name and isinstance(val, ast.Constant) and val.value == value:
+                return True
+    return False
+
+
+all_strings = string_constants(tree)
+
+# 1) schema literals
+if not has_assigned_constant("REVIEW_ARCHIVE_SCHEMA_V2", "hermes.review-archive/v2"):
+    findings.append("review_archive_v2_schema_missing")
+if not has_assigned_constant("REPOSITORY_STATE_SCHEMA", "hermes.repository-state/v1"):
+    findings.append("review_archive_v2_repo_state_schema_missing")
+
+# 2) authoritative table use
+if not any("FROM tasks" in s for s in all_strings):
+    findings.append("review_archive_v2_tasks_table_missing")
+if not any("FROM task_runs" in s for s in all_strings):
+    findings.append("review_archive_v2_task_runs_table_missing")
+if not any("FROM task_events" in s for s in all_strings):
+    findings.append("review_archive_v2_task_events_table_missing")
+
+# 3) no guessed tables
+if any("FROM runs" in s for s in all_strings):
+    findings.append("review_archive_v2_guessed_runs_table_present")
+if any("task_parents" in s for s in all_strings):
+    findings.append("review_archive_v2_guessed_task_parents_table_present")
+
+# 4) exact review/implementation identity
+validate_run_fn = find_function("validate_run")
+if validate_run_fn is None or not (
+    any("implementation_task_id" in s for s in string_constants(validate_run_fn))
+    and has_name(validate_run_fn, "parent")
+    and has_raise(validate_run_fn)
+):
+    findings.append("review_archive_v2_implementation_identity_check_missing")
+
+# 5) repository_state and aggregate digest validation
+validate_state_fn = find_function("validate_repository_state")
+if validate_state_fn is None or not (
+    any("aggregate_sha256" in s for s in string_constants(validate_state_fn))
+    and has_name(validate_state_fn, "sha256_canonical_excluding")
+    and has_name(validate_state_fn, "REPOSITORY_STATE_SCHEMA")
+    and has_raise(validate_state_fn)
+):
+    findings.append("review_archive_v2_repository_state_validation_missing")
+
+# 6) archive_envelope_sha256
+build_envelope_fn = find_function("build_v2_envelope")
+archive_sha_ok = False
+if build_envelope_fn is not None:
+    for node in ast.walk(build_envelope_fn):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name) and target.value.id == "envelope":
+                key_node = subscript_key(target)
+                if isinstance(key_node, ast.Constant) and key_node.value == "archive_envelope_sha256":
+                    archive_sha_ok = True
+if not archive_sha_ok:
+    findings.append("review_archive_v2_archive_envelope_sha256_missing")
+
+# 7) direct .ai/reviews artifact handling
+ensure_dir_fn = find_function("ensure_reviews_dir")
+if ensure_dir_fn is None or not (
+    ".ai" in string_constants(ensure_dir_fn) and "reviews" in string_constants(ensure_dir_fn)
+):
+    findings.append("review_archive_v2_ai_reviews_path_missing")
+
+write_artifact_fn = find_function("write_artifact")
+escape_check_ok = False
+for fn in (ensure_dir_fn, write_artifact_fn):
+    if fn is None:
+        continue
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.NotEq):
+            attrs = [n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)]
+            if "parent" in attrs:
+                escape_check_ok = True
+if not escape_check_ok:
+    findings.append("review_archive_v2_reviews_dir_escape_check_missing")
+
+# 8) symlink / nonregular fail-closed behavior
+is_symlink_calls = sum(1 for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "is_symlink")
+regular_checks = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in ("S_ISREG", "S_ISDIR")}
+if is_symlink_calls < 2 or not {"S_ISREG", "S_ISDIR"}.issubset(regular_checks):
+    findings.append("review_archive_v2_symlink_or_nonregular_check_missing")
+
+# 9) read-only Kanban DB access
+readonly_fn = find_function("open_kanban_db_readonly")
+if readonly_fn is None or not any("mode=ro" in s for s in string_constants(readonly_fn)):
+    findings.append("review_archive_v2_readonly_kanban_missing")
+
+# 10) shell=False bounded subprocesses
+for node in ast.walk(tree):
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+    ):
+        shell_kw = next((kw for kw in node.keywords if kw.arg == "shell"), None)
+        timeout_kw = next((kw for kw in node.keywords if kw.arg == "timeout"), None)
+        if shell_kw is None or not (isinstance(shell_kw.value, ast.Constant) and shell_kw.value.value is False):
+            findings.append("review_archive_v2_shell_false_subprocess_missing:line=%d" % node.lineno)
+        if timeout_kw is None:
+            findings.append("review_archive_v2_shell_false_subprocess_missing:line=%d" % node.lineno)
+
+# 11) no commit/push/staging mutations: this module's only git execution
+# path is run_git(workdir, args) -> subprocess.run(["git", *args], ...), so
+# the subcommand to inspect is args[0] at each run_git(...) call site (the
+# literal ["git", ...] itself is never fully static because of the *args
+# splat, so scanning call-site argument lists is the robust check here).
+FORBIDDEN_GIT_SUBCOMMANDS = {
+    "add", "commit", "push", "merge", "reset", "restore", "checkout", "clean", "rebase", "update-index",
+}
+for node in ast.walk(tree):
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "run_git":
+        if len(node.args) >= 2 and isinstance(node.args[1], ast.List) and node.args[1].elts:
+            first = node.args[1].elts[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                sub = first.value
+                if sub in FORBIDDEN_GIT_SUBCOMMANDS:
+                    findings.append("review_archive_v2_git_mutation_command_present:%s" % sub)
+                if sub == "hash-object" and any(
+                    isinstance(e, ast.Constant) and e.value == "-w" for e in node.args[1].elts
+                ):
+                    findings.append("review_archive_v2_git_mutation_command_present:hash-object-w")
+
+for finding in findings:
+    print(finding)
+
+sys.exit(1 if findings else 0)
+PY
+)"
+  if [[ -z "$findings" ]]; then
+    check_ok "$label ($file) satisfies hermes.review-archive/v2 hardening invariants (A5)"
+  else
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && check_fail "$label ($file): $line"
+    done <<<"$findings"
+  fi
+}
+
+# --- A5 B3: hermes-pipeline-controller.py ready-to-commit hardening
+# (AST probe only; never imports/execs the controller source) -----------
+pipeline_controller_ready_to_commit_audit() {
+  local label="$1"
+  local file="$2"
+  local findings
+  findings="$(AUDIT_PIPELINE_CONTROLLER_PATH="$file" python3 - <<'PY'
+import ast
+import os
+import sys
+
+PATH = os.environ["AUDIT_PIPELINE_CONTROLLER_PATH"]
+
+findings = []
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        source = f.read()
+    tree = ast.parse(source, filename=PATH)
+except (OSError, SyntaxError) as e:
+    print("ready_to_commit_probe_error:cannot_parse_source:%s" % (e,))
+    sys.exit(1)
+
+
+def assignment_pairs(node):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            yield target, node.value
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        yield node.target, node.value
+
+
+def subscript_key(node):
+    s = node.slice
+    if hasattr(ast, "Index") and isinstance(s, ast.Index):
+        s = s.value
+    return s
+
+
+FUNCTIONS = {}
+for _node in ast.walk(tree):
+    if isinstance(_node, ast.FunctionDef):
+        FUNCTIONS[_node.name] = _node
+
+
+def find_function(name):
+    return FUNCTIONS.get(name)
+
+
+def has_name(node, name):
+    return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
+
+
+def has_raise(node):
+    return any(isinstance(n, ast.Raise) for n in ast.walk(node))
+
+
+def list_literals(node):
+    for n in ast.walk(node):
+        if isinstance(n, ast.List):
+            elts = []
+            ok = True
+            for elt in n.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    elts.append(elt.value)
+                else:
+                    ok = False
+                    break
+            if ok:
+                yield elts
+
+
+def called_function_names(node):
+    names = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+            names.add(n.func.id)
+    return names
+
+
+def has_assigned_constant(name, value):
+    for node in ast.walk(tree):
+        for target, val in assignment_pairs(node):
+            if isinstance(target, ast.Name) and target.id == name and isinstance(val, ast.Constant) and val.value == value:
+                return True
+    return False
+
+
+def dict_has_key_value(node, key, value):
+    for n in ast.walk(node):
+        if isinstance(n, ast.Dict):
+            for k, v in zip(n.keys, n.values):
+                if isinstance(k, ast.Constant) and k.value == key and isinstance(v, ast.Constant) and v.value == value:
+                    return True
+    return False
+
+
+ready_fn = find_function("ready_to_commit")
+
+# 1) ready-to-commit parser exists
+parser_ok = any(
+    isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and node.func.attr == "add_parser"
+    and node.args
+    and isinstance(node.args[0], ast.Constant)
+    and node.args[0].value == "ready-to-commit"
+    for node in ast.walk(tree)
+)
+if not parser_ok:
+    findings.append("ready_to_commit_parser_missing")
+
+# 2) exactly required flags for the ready-to-commit subcommand
+build_parser_fn = find_function("build_parser")
+ready_var_name = None
+if build_parser_fn is not None:
+    for node in ast.walk(build_parser_fn):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            value = node.value
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "add_parser"
+                and value.args
+                and isinstance(value.args[0], ast.Constant)
+                and value.args[0].value == "ready-to-commit"
+            ):
+                ready_var_name = node.targets[0].id
+
+flags_ok = False
+if build_parser_fn is not None and ready_var_name is not None:
+    flag_specs = {}
+    for node in ast.walk(build_parser_fn):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == ready_var_name
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ):
+            flag_name = node.args[0].value
+            required_kw = next((kw for kw in node.keywords if kw.arg == "required"), None)
+            required_true = bool(
+                required_kw is not None
+                and isinstance(required_kw.value, ast.Constant)
+                and required_kw.value.value is True
+            )
+            flag_specs[flag_name] = required_true
+    expected = {"--workdir", "--implementation_task_id", "--review_task_id"}
+    if set(flag_specs.keys()) == expected and all(flag_specs.values()):
+        flags_ok = True
+if not flags_ok:
+    findings.append("ready_to_commit_flags_mismatch")
+
+# 3) success/reject contract markers
+if ready_fn is None or not dict_has_key_value(ready_fn, "outcome", "ready"):
+    findings.append("ready_to_commit_success_marker_missing")
+
+reject_fn = find_function("_emit_ready_to_commit_reject")
+if reject_fn is None or not dict_has_key_value(reject_fn, "outcome", "not-ready"):
+    findings.append("ready_to_commit_reject_marker_missing")
+
+for fn, label_ in ((ready_fn, "ready"), (reject_fn, "reject")):
+    if fn is None:
+        findings.append("ready_to_commit_human_approval_required_missing:%s" % label_)
+        findings.append("ready_to_commit_commit_performed_missing:%s" % label_)
+        findings.append("ready_to_commit_push_performed_missing:%s" % label_)
+        continue
+    if not dict_has_key_value(fn, "human_approval_required", True):
+        findings.append("ready_to_commit_human_approval_required_missing:%s" % label_)
+    if not dict_has_key_value(fn, "commit_performed", False):
+        findings.append("ready_to_commit_commit_performed_missing:%s" % label_)
+    if not dict_has_key_value(fn, "push_performed", False):
+        findings.append("ready_to_commit_push_performed_missing:%s" % label_)
+
+# 4) repository-state/v1 and archive-v2 schema references
+if not has_assigned_constant("REPOSITORY_STATE_SCHEMA", "hermes.repository-state/v1"):
+    findings.append("ready_to_commit_repo_state_schema_missing")
+if not has_assigned_constant("REVIEW_ARCHIVE_SCHEMA_V2", "hermes.review-archive/v2"):
+    findings.append("ready_to_commit_archive_v2_schema_missing")
+
+# 5) double repository capture / stability check
+capture_fn = find_function("capture_repository_state")
+if capture_fn is None:
+    findings.append("ready_to_commit_double_capture_missing")
+    findings.append("ready_to_commit_stability_check_missing")
+else:
+    capture_calls = sum(
+        1
+        for n in ast.walk(capture_fn)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_capture_repository_state_once"
+    )
+    if capture_calls < 2:
+        findings.append("ready_to_commit_double_capture_missing")
+    stability_ok = False
+    for node in ast.walk(capture_fn):
+        if isinstance(node, ast.If):
+            test = node.test
+            if (
+                isinstance(test, ast.Compare)
+                and isinstance(test.left, ast.Name)
+                and test.left.id == "first"
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.NotEq)
+                and len(test.comparators) == 1
+                and isinstance(test.comparators[0], ast.Name)
+                and test.comparators[0].id == "second"
+                and has_raise(node)
+            ):
+                stability_ok = True
+    if not stability_ok:
+        findings.append("ready_to_commit_stability_check_missing")
+
+# 6) review/Kanban/archive/current fingerprint equality, directly inside ready_to_commit
+fingerprint_compare_count = 0
+if ready_fn is not None:
+    for node in ast.walk(ready_fn):
+        if (
+            isinstance(node, ast.Compare)
+            and isinstance(node.left, ast.Name)
+            and node.left.id == "current_state"
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.NotEq)
+        ):
+            fingerprint_compare_count += 1
+if fingerprint_compare_count < 2:
+    findings.append("ready_to_commit_fingerprint_equality_missing")
+
+# 7) git diff --check gate
+diff_check_ok = any(elts == ["git", "diff", "--check"] for elts in list_literals(tree))
+if not diff_check_ok:
+    findings.append("ready_to_commit_git_diff_check_missing")
+
+# 8) reachable-set BFS from ready_to_commit: bounded shell=False subprocess
+#    execution, forbidden git mutation subcommands, forbidden archive-helper
+#    / kanban-create invocations, all scoped to ready-to-commit's own logic.
+reachable = set()
+frontier = ["ready_to_commit"]
+while frontier:
+    name = frontier.pop()
+    if name in reachable:
+        continue
+    reachable.add(name)
+    fn = find_function(name)
+    if fn is None:
+        continue
+    for callee in called_function_names(fn):
+        if callee in FUNCTIONS and callee not in reachable:
+            frontier.append(callee)
+
+FORBIDDEN_CALLEES = {"archive_review", "create_implementation", "create_review", "create_correction"}
+for name in sorted(reachable & FORBIDDEN_CALLEES):
+    findings.append("ready_to_commit_forbidden_mutation_call:%s" % name)
+
+FORBIDDEN_GIT_SUBCOMMANDS = {
+    "add", "commit", "push", "merge", "reset", "restore", "checkout", "clean", "rebase", "update-index",
+}
+archive_helper_ok = True
+kanban_create_ok = True
+git_mutation_findings = set()
+shell_timeout_findings = []
+
+for name in reachable:
+    fn = find_function(name)
+    if fn is None:
+        continue
+    if has_name(fn, "ARCHIVE_HELPER_PATH"):
+        archive_helper_ok = False
+    for elts in list_literals(fn):
+        if len(elts) >= 3 and elts[0] == "hermes" and elts[1] == "kanban" and elts[2] == "create":
+            kanban_create_ok = False
+        if len(elts) >= 2 and elts[0] == "git":
+            sub = elts[1]
+            if sub in FORBIDDEN_GIT_SUBCOMMANDS:
+                git_mutation_findings.add(sub)
+            if sub == "hash-object" and "-w" in elts:
+                git_mutation_findings.add("hash-object-w")
+    for node in ast.walk(fn):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "run"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "subprocess"
+        ):
+            shell_kw = next((kw for kw in node.keywords if kw.arg == "shell"), None)
+            timeout_kw = next((kw for kw in node.keywords if kw.arg == "timeout"), None)
+            if shell_kw is None or not (isinstance(shell_kw.value, ast.Constant) and shell_kw.value.value is False):
+                shell_timeout_findings.append("shell:%s:line=%d" % (name, node.lineno))
+            if timeout_kw is None:
+                shell_timeout_findings.append("timeout:%s:line=%d" % (name, node.lineno))
+
+if not archive_helper_ok:
+    findings.append("ready_to_commit_archive_helper_invocation_present")
+if not kanban_create_ok:
+    findings.append("ready_to_commit_kanban_create_invocation_present")
+for sub in sorted(git_mutation_findings):
+    findings.append("ready_to_commit_git_mutation_command_present:%s" % sub)
+for item in shell_timeout_findings:
+    findings.append("ready_to_commit_unbounded_or_shell_true_subprocess:%s" % item)
+
+# 9) exit-code contract: EXIT_VALIDATION=2 for reject, EXIT_TRANSPORT=3 for
+#    usage/transport failures, and no ready-to-commit exit-4 (timeout) path.
+EXIT_CONST = {}
+for node in ast.walk(tree):
+    for target, val in assignment_pairs(node):
+        if isinstance(target, ast.Name) and target.id in ("EXIT_OK", "EXIT_VALIDATION", "EXIT_TRANSPORT", "EXIT_TIMEOUT"):
+            if isinstance(val, ast.Constant) and isinstance(val.value, int):
+                EXIT_CONST[target.id] = val.value
+
+if EXIT_CONST.get("EXIT_VALIDATION") != 2:
+    findings.append("ready_to_commit_reject_exit_code_wrong")
+if EXIT_CONST.get("EXIT_TRANSPORT") != 3:
+    findings.append("ready_to_commit_usage_transport_exit_code_wrong")
+
+main_fn = find_function("main")
+
+# A5 B3 host fix: strict all-handler exit mapping
+def _handler_exception_names(type_node):
+    if isinstance(type_node, ast.Name):
+        return {type_node.id}
+
+    if isinstance(type_node, ast.Tuple):
+        return {
+            elt.id
+            for elt in type_node.elts
+            if isinstance(elt, ast.Name)
+        }
+
+    return set()
+
+
+def _handler_return_names(handler):
+    result = set()
+
+    for stmt in handler.body:
+        for node in ast.walk(stmt):
+            if (
+                isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Name)
+            ):
+                result.add(node.value.id)
+
+    return result
+
+
+_expected_handler_exits = {
+    "ReadyToCommitReject": "EXIT_VALIDATION",
+    "TransportError": "EXIT_TRANSPORT",
+    "OSError": "EXIT_TRANSPORT",
+    "CliUsageError": "EXIT_TRANSPORT",
+}
+
+_observed_handler_exits = {
+    name: []
+    for name in _expected_handler_exits
+}
+
+if main_fn is not None:
+    for node in ast.walk(main_fn):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+
+        if node.type is None:
+            continue
+
+        return_names = _handler_return_names(node)
+
+        for exc_name in _handler_exception_names(node.type):
+            if exc_name in _observed_handler_exits:
+                _observed_handler_exits[exc_name].append(
+                    return_names
+                )
+
+
+def _all_handlers_exact(exc_name, expected_exit):
+    handlers = _observed_handler_exits.get(exc_name, [])
+
+    return bool(handlers) and all(
+        values == {expected_exit}
+        for values in handlers
+    )
+
+
+if not _all_handlers_exact(
+    "ReadyToCommitReject",
+    "EXIT_VALIDATION",
+):
+    findings.append(
+        "ready_to_commit_reject_exit_code_wrong"
+    )
+
+if not all(
+    _all_handlers_exact(exc_name, "EXIT_TRANSPORT")
+    for exc_name in (
+        "TransportError",
+        "OSError",
+        "CliUsageError",
+    )
+):
+    findings.append(
+        "ready_to_commit_usage_transport_exit_code_wrong"
+    )
+
+reject_mapped = set()
+transport_mapped = set()
+if main_fn is not None:
+    for node in ast.walk(main_fn):
+        if isinstance(node, ast.ExceptHandler) and node.type is not None:
+            type_names = set()
+            if isinstance(node.type, ast.Name):
+                type_names = {node.type.id}
+            elif isinstance(node.type, ast.Tuple):
+                type_names = {e.id for e in node.type.elts if isinstance(e, ast.Name)}
+            returns = [n for n in ast.walk(node) if isinstance(n, ast.Return)]
+            if any(isinstance(r.value, ast.Name) and r.value.id == "EXIT_VALIDATION" for r in returns):
+                reject_mapped |= type_names
+            if any(isinstance(r.value, ast.Name) and r.value.id == "EXIT_TRANSPORT" for r in returns):
+                transport_mapped |= type_names
+
+if "ReadyToCommitReject" not in reject_mapped:
+    findings.append("ready_to_commit_reject_exit_code_wrong")
+if not {"TransportError", "CliUsageError", "OSError"}.issubset(transport_mapped):
+    findings.append("ready_to_commit_usage_transport_exit_code_wrong")
+
+if ready_fn is not None:
+    if has_name(ready_fn, "EXIT_TIMEOUT"):
+        findings.append("ready_to_commit_exit4_path_present")
+    for node in ast.walk(ready_fn):
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant) and node.value.value == 4:
+            findings.append("ready_to_commit_exit4_path_present")
+
+for finding in findings:
+    print(finding)
+
+sys.exit(1 if findings else 0)
+PY
+)"
+  if [[ -z "$findings" ]]; then
+    check_ok "$label ($file) satisfies ready-to-commit hardening invariants (A5)"
+  else
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && check_fail "$label ($file): $line"
+    done <<<"$findings"
+  fi
+}
+
 run_repo_only() {
   ACTIVE_FAILURES_ARR="REPO_FAILURES"
 
@@ -413,6 +1408,11 @@ run_repo_only() {
   require_file_nonempty "tests/test_claude_bridge_template.py"
   require_file_nonempty "tests/test_planner_bridge_template.py"
   require_file_nonempty "tests/test_planner_bridge_wrapper.py"
+  require_file_nonempty "templates/review_archive_bridge.py"
+  require_file_nonempty "tests/test_review_archive_bridge_template.py"
+  require_file_nonempty "scripts/hermes-pipeline-controller.py"
+  require_file_nonempty "tests/test_hermes_pipeline_controller.py"
+  require_file_nonempty ".gitignore"
 
   echo
   echo "2) docs A3.5 marker:"
@@ -709,6 +1709,60 @@ run_repo_only() {
       check_fail "docs missing: $s"
     fi
   done
+
+  echo
+  echo "8) review bridge repository-state/v1 hardening (A5 B3 repo-state audit):"
+  review_bridge_repository_state_audit "review bridge template" "$REVIEW_FILE"
+
+  echo
+  echo "9) reviewer SOUL A5 repository-state fingerprint requirement:"
+  reviewer_soul_a5_repository_state_invariant_audit "reviewer SOUL (repo template)" "$REVIEWER_FILE"
+
+  echo
+  echo "10) review archive bridge hermes.review-archive/v2 hardening (A5 B3):"
+  ARCHIVE_BRIDGE_FILE="$REPO_DIR/templates/review_archive_bridge.py"
+  review_archive_bridge_v2_audit "review archive bridge template" "$ARCHIVE_BRIDGE_FILE"
+
+  echo
+  echo "11) ready-to-commit controller hardening (A5 B3):"
+  PIPELINE_CONTROLLER_FILE="$REPO_DIR/scripts/hermes-pipeline-controller.py"
+  pipeline_controller_ready_to_commit_audit "pipeline controller" "$PIPELINE_CONTROLLER_FILE"
+
+  echo
+  echo "12) A5.1 /.ai/reviews/ narrow ignore-scope integration invariant:"
+  GITIGNORE_FILE="$REPO_DIR/.gitignore"
+  if [[ -s "$GITIGNORE_FILE" ]] && grep_line_exact "$GITIGNORE_FILE" "/.ai/reviews/"; then
+    check_ok ".gitignore contains the exact rooted rule: /.ai/reviews/"
+  else
+    check_fail ".gitignore missing the exact rooted rule: /.ai/reviews/"
+  fi
+
+  for broad_rule in ".ai/" "/.ai/"; do
+    if [[ -s "$GITIGNORE_FILE" ]] && grep_line_exact_absent "$GITIGNORE_FILE" "$broad_rule"; then
+      check_ok ".gitignore does not rely on the overly broad ignore rule: $broad_rule"
+    else
+      check_fail ".gitignore must not rely on the overly broad ignore rule: $broad_rule (only the rooted /.ai/reviews/ rule is permitted for this contract)"
+    fi
+  done
+
+  CONTROLLER_TEST_FILE="$REPO_DIR/tests/test_hermes_pipeline_controller.py"
+  if grep_ok "$CONTROLLER_TEST_FILE" '(repo / ".gitignore").write_text("/.ai/reviews/\n")'; then
+    check_ok "controller test fixture (make_rtc_repo) uses the narrow /.ai/reviews/ ignore rule"
+  else
+    check_fail "controller test fixture (make_rtc_repo) must use the narrow /.ai/reviews/ ignore rule, not a broad .ai/ rule"
+  fi
+
+  if grep_absent "$CONTROLLER_TEST_FILE" '(repo / ".gitignore").write_text(".ai/\n")'; then
+    check_ok "controller test fixture (make_rtc_repo) does not regress to the broad .ai/ ignore rule"
+  else
+    check_fail "controller test fixture (make_rtc_repo) must not regress to the broad .ai/ ignore rule"
+  fi
+
+  if grep_ok "$CONTROLLER_TEST_FILE" "test_a51_unrelated_untracked_path_under_ai_outside_reviews_blocks_ready_to_commit"; then
+    check_ok "controller tests cover an unrelated untracked path elsewhere under .ai/ still blocking READY_TO_COMMIT"
+  else
+    check_fail "controller tests missing coverage for an unrelated untracked path elsewhere under .ai/ (outside .ai/reviews/) still blocking READY_TO_COMMIT"
+  fi
 }
 
 run_runtime() {

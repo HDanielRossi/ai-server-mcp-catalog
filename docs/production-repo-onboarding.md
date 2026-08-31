@@ -159,3 +159,40 @@ The preflight checks:
 - Current branch is shown.
 - Test command passes.
 - Hermes hardening audit passes.
+
+## A5 production commit gate
+
+Before the final review, verify the repository's tracked `.gitignore` contains the exact rooted rule `/.ai/reviews/` (see "A5.1 `/.ai/reviews/` Git-ignore precondition" below). Without it, a valid review archive artifact becomes a spurious repository-state change and `ready-to-commit` rejects an otherwise-correct pipeline run.
+
+For A5, the earlier production flow is extended after the final reviewer PASS:
+
+1. The final reviewer run records the authoritative `hermes.repository-state/v1` fingerprint.
+2. Persist that final review as matching `hermes.review-archive/v2` evidence.
+3. Run `ready-to-commit` with the exact implementation task ID and final review task ID.
+4. Continue only when it returns `outcome="ready"`.
+5. The human operator then gives separate explicit commit authorization.
+6. Push requires a second, separate explicit human authorization.
+
+`ready-to-commit` is read-only technical attestation. It does not stage files, commit, push, create tasks, mutate the repository, or constitute human approval. Commit authorization never implies push authorization.
+
+Treat any of these as a hard stop:
+
+- final review metadata lacks `hermes.repository-state/v1`;
+- the `hermes.review-archive/v2` artifact does not exactly match final reviewer/Kanban state;
+- `ready-to-commit` does not return `outcome="ready"`;
+- repository state changes after review/archive and before commit;
+- any worker or controller attempts to infer approval, stage, commit, or push automatically.
+
+## A5.1 `/.ai/reviews/` Git-ignore precondition
+
+Before the final review, confirm the target repository's tracked `.gitignore` contains the exact rooted rule:
+
+    /.ai/reviews/
+
+Only that exact directory is ignored. Do not broadly ignore `.ai/` (or `/.ai/`) — any other content under `.ai/` remains a normal, visible, untracked path and must still show up in `hermes.repository-state/v1` and still block READY_TO_COMMIT if it changes unexpectedly.
+
+Why this matters: `review_archive_bridge` writes the final `hermes.review-archive/v2` artifact under `.ai/reviews/` after the reviewer has already completed its task. If that directory is not Git-ignored (or is ignored too broadly, hiding unrelated `.ai/` content), the archive write either becomes an untracked repository-state delta that `ready-to-commit` correctly rejects with `repository_state_mismatch_kanban`, or an unrelated change elsewhere under `.ai/` gets silently hidden from repository-state instead of blocking READY_TO_COMMIT.
+
+The archive artifact itself remains control-plane evidence, not reviewed source-state, and its validity is still independently enforced by `hermes.review-archive/v2` — Git-ignoring `.ai/reviews/` never substitutes for that validation, and it is not human approval.
+
+The human operator commits only after implementation completion, final review PASS, matching v2 archival, successful `ready-to-commit`, passing tests, reviewed Git diff, expected scope, and explicit commit authorization.

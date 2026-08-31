@@ -131,3 +131,31 @@ verdict, quoting the exact failure text received — never substitute stale
 evidence, guesses, or memory to force a PASS or CHANGES REQUIRED. If you
 cannot gather sufficient evidence within the rules above, BLOCK rather than
 speculate.
+
+## Repository-state fingerprint requirement (A4.2)
+
+After all other evidence and tests for the review have been gathered, the
+reviewer must make one final, successful collect(workdir) call, made after
+every other collect in the session, whose purpose is to fingerprint the
+exact repository state the verdict is being issued against.
+
+The reviewer must copy the repository_state object and the
+repository_state_sha256 string returned by that final call verbatim into
+the completion metadata — byte-for-byte, with no summarization,
+truncation, retyping, or reformatting.
+
+If the final collect(workdir) call fails, or its result is missing
+repository_state or repository_state_sha256, or either field is malformed
+(not the exact object/string collect returned), or the underlying capture
+raises because repository state was unstable across consecutive captures,
+the reviewer must BLOCK the task instead of completing it. A missing,
+malformed, or unstable repository-state fingerprint is an operational
+failure like any other under Hard rule #1 and #2 above and is never worked
+around.
+
+scope_paths never substitutes for a fingerprint: a list of the paths that
+were in scope for the review only names what was looked at, it does not
+prove what state the repository was actually in when the verdict was
+issued. The repository_state fingerprint from the final collect call is
+the only acceptable evidence of that state, and no scope_paths list, task
+metadata, or narrative summary may stand in for it.

@@ -161,6 +161,8 @@ mcp__review_archive_bridge__persist_review_artifact
 
 The bridge writes only inside `.ai/reviews/`. It does not execute the review, modify code, commit, or push.
 
+`.ai/reviews/` is control-plane evidence storage, not reviewed source-state. See "A5.1 — `/.ai/reviews/` narrow ignore-scope integration precondition" below for the Git-ignore contract that keeps archive artifacts from becoming spurious repository-state changes.
+
 For example, persisting review task `t_1bf0c4e1` generated:
 
 ```text
@@ -1024,3 +1026,100 @@ The following five commands verify this task:
 ### Operator
 
 A4.1 has NOT been deployed or runtime-live-validated by this implementation task. All changes described above are repository-only; live installation of any updated template, SOUL, or audit script remains a separate, human-authorized operation performed later by the operator, after review PASS.
+
+## A5 — READY_TO_COMMIT technical attestation (repository-only artifacts)
+
+A5 binds the final completed review to the exact repository state that was reviewed before the human operator is asked to authorize a commit.
+
+The authoritative sequence is:
+
+```text
+implementation completed
+→ final reviewer PASS
+→ final hermes.repository-state/v1 captured
+→ hermes.review-archive/v2 persisted
+→ ready-to-commit returns ready
+→ explicit human commit approval
+→ commit
+→ separate explicit human push approval
+→ push
+```
+
+### Repository-state fingerprint
+
+The final successful reviewer collect records a deterministic `hermes.repository-state/v1` envelope containing:
+
+- canonical `workdir`
+- `head`
+- `changed_paths`
+- `staged_patch_sha256`
+- `unstaged_patch_sha256`
+- exact `untracked` evidence
+- `aggregate_sha256`
+
+Repository state is captured twice and must be stable. Conflicts, changed submodules, unsupported untracked special entries, or unstable captures fail closed.
+
+### Review archive v2
+
+The final review is persisted as `hermes.review-archive/v2`.
+
+The archive binds the exact implementation task, review task, latest authoritative reviewer run, verdict, repository-state envelope, aggregate repository-state digest, and archive-envelope SHA-256.
+
+Historical A4 archives remain readable evidence but are not sufficient for A5 READY_TO_COMMIT unless they satisfy the v2 contract.
+
+### READY_TO_COMMIT command
+
+```text
+ready-to-commit --workdir <absolute repo path> --implementation_task_id <implementation task id> --review_task_id <review task id>
+```
+
+The controller independently verifies the implementation task, final reviewer task, exact parent relation, latest authoritative runs, PASS verdict, `mutation_performed=false`, review archive v2, `git diff --check`, and exact equality between reviewed, archived, and current repository state.
+
+A successful result means:
+
+```text
+reviewed state == archived state == current state
+```
+
+It does NOT mean that commit or push has been authorized.
+
+`ready-to-commit` is strictly read-only. It must not stage, commit, push, merge, reset, restore, checkout, clean, rebase, create Kanban tasks, invoke the archive helper, or write repository files.
+
+Success exits `0` with `outcome="ready"`, `verdict="PASS"`, `review_archived=true`, `human_approval_required=true`, `commit_performed=false`, and `push_performed=false`.
+
+Repository/state rejection exits `2`. Usage or transport failure exits `3`. `ready-to-commit` never exits `4`.
+
+### Human approval boundary
+
+Commit approval is a separate human action after READY_TO_COMMIT succeeds.
+
+Push approval is another separate human action after commit approval. Authorization to commit never implies authorization to push.
+
+### Audit and deployment boundary
+
+The A5 repository audit verifies repository-state/v1, reviewer fingerprint requirements, review-archive/v2, READY_TO_COMMIT read-only behavior, bounded `shell=False` subprocesses, forbidden mutation commands, and fail-closed exit behavior.
+
+A5 remains repository-only until a separate human-authorized runtime rollout. READY_TO_COMMIT itself performs no installation, deployment, commit, or push.
+
+## A5.1 — `/.ai/reviews/` narrow ignore-scope integration precondition (repository-only artifacts)
+
+- SCOPE: repository-only integration correction. No runtime deployment, commit, push, install, or restart occurs as part of this repository implementation.
+- WHY: a target repository's tracked `.gitignore` must Git-ignore `.ai/reviews/` before the final review, or the valid `hermes.review-archive/v2` artifact that `review_archive_bridge` writes there becomes an untracked repository-state change of its own, causing `ready-to-commit` to reject with `repository_state_mismatch_kanban` even on an otherwise-correct pipeline run.
+
+### The precondition
+
+- `/.ai/reviews/` is a required Git-ignore integration precondition for A5: the target repository's `.gitignore` must contain the exact rooted rule `/.ai/reviews/` before the final authoritative review.
+- Only that specific directory is ignored — do not broadly ignore `.ai/` (or `/.ai/`). Everything else under `.ai/` remains a normal, visible, untracked path exactly like any other path in the repository, and still shows up in `hermes.repository-state/v1` and still blocks READY_TO_COMMIT if it changes.
+
+### What this does and does not mean
+
+- Review archive artifacts under `.ai/reviews/` are control-plane evidence, not reviewed source-state paths — they record what the reviewer already verified, they are not part of the change being reviewed.
+- Archive validity is still independently enforced by `hermes.review-archive/v2`: `ready-to-commit` reads and validates the archive envelope (implementation/review identity, repository-state equality, `archive_envelope_sha256`) regardless of whether the artifact is Git-ignored.
+- The presence of a valid archive is not human approval. `ready-to-commit` remains strictly read-only technical attestation.
+- Commit and push approvals remain separate human actions, exactly as in the base A5 contract: `human_approval_required=true`, `commit_performed=false`, `push_performed=false` on every successful result.
+
+### Where this is enforced
+
+- `templates/hermes-repo-contract.md` documents the `/.ai/reviews/` precondition as part of the A5 READY_TO_COMMIT requirements for every onboarded repository.
+- `scripts/audit-hermes-pipeline-hardening.sh` (`--repo-only`) statically verifies that this repository's own tracked `.gitignore` contains the exact rooted `/.ai/reviews/` rule (and not a broad `.ai/` or `/.ai/` rule), that the controller test fixture (`make_rtc_repo` in `tests/test_hermes_pipeline_controller.py`) uses the same narrow rule, and that the test suite covers an unrelated untracked path elsewhere under `.ai/` still blocking READY_TO_COMMIT.
+- `tests/test_hermes_pipeline_controller.py` includes hermetic regression coverage proving: repository state captured before an archive write is identical to state captured after a valid archive is written beneath the ignored `.ai/reviews/`; READY_TO_COMMIT succeeds with the archive physically present under `.ai/reviews/`; an unrelated untracked path outside `.ai/reviews/` still blocks READY_TO_COMMIT; and an unrelated untracked path elsewhere under `.ai/` (outside `.ai/reviews/`) is NOT hidden by the narrow rule and still blocks READY_TO_COMMIT.

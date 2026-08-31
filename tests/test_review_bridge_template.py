@@ -7,7 +7,9 @@ git (assertions confirm repo state is unchanged after every collect() call).
 """
 
 import asyncio
+import hashlib
 import importlib.util
+import json
 import os
 import shlex
 import subprocess
@@ -676,3 +678,182 @@ def test_reviewer_soul_documents_collect_protocol_rules():
     assert "The reviewer remains READ-ONLY" in text
     assert "mcp__review_bridge__collect remains the SOLE evidence channel" in text
     assert "The reviewer creates NO downstream tasks" in text
+
+
+# --- repository-state fingerprint (A4.2) ------------------------------------
+
+
+def test_repository_state_schema_and_aggregate_sha256_recompute(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    state = review_bridge_server.collect_repository_state(str(repo))
+
+    assert state["schema"] == "hermes.repository-state/v1"
+    assert state["schema"] == review_bridge_server.REPOSITORY_STATE_SCHEMA
+
+    envelope_without_aggregate = {k: v for k, v in state.items() if k != "aggregate_sha256"}
+    expected = hashlib.sha256(
+        json.dumps(
+            envelope_without_aggregate, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    ).hexdigest()
+    assert state["aggregate_sha256"] == expected
+
+
+def test_repository_state_is_deterministic_across_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    (repo / "a.py").write_text("print('hello')\nprint('again')\n")
+
+    first = review_bridge_server.collect_repository_state(str(repo))
+    second = review_bridge_server.collect_repository_state(str(repo))
+
+    assert first == second
+
+
+def test_repository_state_staged_vs_unstaged_digests_and_changed_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    (repo / "b.py").write_text("second file\n")
+    subprocess.run(["git", "add", "b.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "add b"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "a.py").write_text("print('hello')\nprint('staged')\n")
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    (repo / "b.py").write_text("second file\nunstaged change\n")
+
+    state = review_bridge_server.collect_repository_state(str(repo))
+
+    assert state["changed_paths"] == ["a.py", "b.py"]
+    empty_sha256 = hashlib.sha256(b"").hexdigest()
+    assert state["staged_patch_sha256"] != empty_sha256
+    assert state["unstaged_patch_sha256"] != empty_sha256
+    assert state["staged_patch_sha256"] != state["unstaged_patch_sha256"]
+
+
+def test_repository_state_untracked_file_and_symlink_digests(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    (repo / "new_file.txt").write_text("untracked contents\n")
+    (repo / "link_to_a").symlink_to("a.py")
+
+    state = review_bridge_server.collect_repository_state(str(repo))
+
+    untracked_by_path = {entry["path"]: entry for entry in state["untracked"]}
+    assert set(untracked_by_path) == {"new_file.txt", "link_to_a"}
+    assert [entry["path"] for entry in state["untracked"]] == sorted(untracked_by_path)
+
+    file_entry = untracked_by_path["new_file.txt"]
+    assert file_entry["type"] == "file"
+    assert file_entry["size"] == len(b"untracked contents\n")
+    assert file_entry["content_sha256"] == hashlib.sha256(b"untracked contents\n").hexdigest()
+
+    link_entry = untracked_by_path["link_to_a"]
+    assert link_entry["type"] == "symlink"
+    assert link_entry["content_sha256"] == hashlib.sha256(b"a.py").hexdigest()
+
+
+def test_repository_state_raises_on_untracked_special_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    os.mkfifo(repo / "special.fifo")
+
+    with pytest.raises(ReviewBridgeError):
+        review_bridge_server.collect_repository_state(str(repo))
+
+
+def test_repository_state_allows_ignored_special_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    (repo / ".gitignore").write_text("ignored.fifo\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "ignore fifo"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    os.mkfifo(repo / "ignored.fifo")
+
+    state = review_bridge_server.collect_repository_state(str(repo))
+
+    assert "ignored.fifo" not in state["changed_paths"]
+    assert all(entry["path"] != "ignored.fifo" for entry in state["untracked"])
+
+
+def test_repository_state_raises_on_unresolved_conflict(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    real_run_git_text = review_bridge_server._run_git_text
+
+    def fake_run_git_text(argv, cwd, timeout=review_bridge_server.REPO_STATE_TIMEOUT_SECONDS):
+        if argv[:2] == ["git", "status"] and "--porcelain" in argv:
+            return "UU conflicted.py\n"
+        return real_run_git_text(argv, cwd, timeout)
+
+    monkeypatch.setattr(review_bridge_server, "_run_git_text", fake_run_git_text)
+
+    with pytest.raises(ReviewBridgeError):
+        review_bridge_server.collect_repository_state(str(repo))
+
+
+def test_repository_state_raises_on_unstable_capture(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    real_capture = review_bridge_server._capture_repository_state_once
+    call_count = {"n": 0}
+
+    def flaky_capture(resolved_workdir, canonical_workdir):
+        call_count["n"] += 1
+        envelope = real_capture(resolved_workdir, canonical_workdir)
+        if call_count["n"] == 2:
+            envelope["head"] = "f" * 40
+            envelope["aggregate_sha256"] = "unstable"
+        return envelope
+
+    monkeypatch.setattr(review_bridge_server, "_capture_repository_state_once", flaky_capture)
+
+    with pytest.raises(ReviewBridgeError):
+        review_bridge_server.collect_repository_state(str(repo))
+
+
+def test_collect_existing_keys_unchanged_after_repository_state_addition(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    result = collect(str(repo))
+
+    expected_keys = {
+        "workdir", "repo_check", "git_status", "changed_path", "diff_name_only",
+        "diff", "diff_check", "content_window", "test_result", "repository_state",
+        "repository_state_sha256", "status",
+    }
+    assert set(result.keys()) == expected_keys
+    assert result["status"] == "ok"
+    assert result["repository_state"]["schema"] == review_bridge_server.REPOSITORY_STATE_SCHEMA
+    assert result["repository_state_sha256"] == result["repository_state"]["aggregate_sha256"]

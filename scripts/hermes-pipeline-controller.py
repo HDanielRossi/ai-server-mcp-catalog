@@ -12,7 +12,9 @@ import argparse
 import math
 import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -50,6 +52,20 @@ MONOTONIC = time.monotonic
 ARCHIVE_HELPER_PATH = "/usr/local/bin/review-archive-bridge"
 ARCHIVE_HELPER_TIMEOUT = 120
 
+REPOSITORY_STATE_SCHEMA = "hermes.repository-state/v1"
+REVIEW_ARCHIVE_SCHEMA_V2 = "hermes.review-archive/v2"
+REPO_STATE_TIMEOUT_SECONDS = 30
+KANBAN_READ_TIMEOUT_SECONDS = 30
+GIT_DIFF_CHECK_TIMEOUT_SECONDS = 30
+CONFLICT_STATUS_CODES = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})
+REVIEW_ARCHIVE_ENVELOPE_KEYS = frozenset({
+    "schema", "workdir", "implementation_task_id", "review_task_id",
+    "review_run_id", "review_completed_at", "verdict", "verdict_source",
+    "repository_state", "archive_envelope_sha256",
+})
+REVIEW_ARCHIVE_FILENAME_RE_TEMPLATE = r"^\d{8}_\d{6}-%s\.md$"
+REVIEW_ARCHIVE_JSON_BLOCK_RE = re.compile(r"```json\r?\n(.*?)\r?\n```", re.DOTALL)
+
 
 class CliUsageError(Exception):
     """A CLI usage problem, mapped to exit code 3."""
@@ -86,6 +102,19 @@ class VerdictBlock(Exception):
     def __init__(self, reason):
         super().__init__(reason)
         self.reason = reason
+
+
+class ReadyToCommitReject(Exception):
+    """A ready-to-commit structural/content rejection, mapped to exit code 2."""
+
+    def __init__(self, reason_code, reason):
+        super().__init__(reason)
+        self.reason_code = reason_code
+        self.reason = reason
+
+
+class RepositoryStateError(Exception):
+    """A repository-state capture content/stability failure (not a transport failure)."""
 
 
 class Exit3ArgumentParser(argparse.ArgumentParser):
@@ -142,6 +171,14 @@ def build_parser():
     )
     archive_review_p.add_argument("--workdir", required=True)
     archive_review_p.add_argument("--review_task_id", required=True)
+
+    ready_p = subparsers.add_parser(
+        "ready-to-commit", prog="ready-to-commit",
+        description="read-only attestation that a workdir is ready to commit",
+    )
+    ready_p.add_argument("--workdir", required=True)
+    ready_p.add_argument("--implementation_task_id", required=True)
+    ready_p.add_argument("--review_task_id", required=True)
 
     return parser
 
@@ -862,6 +899,720 @@ def archive_review(args):
     return EXIT_OK
 
 
+# --- ready-to-commit: read-only attestation ---------------------------------
+#
+# Everything below is strictly read-only: it never authorizes or performs a
+# commit, push, staging, filesystem write, or Kanban write. It only proves --
+# via two authorized `hermes kanban` JSON reads, a git diff --check, and a
+# deterministic repository-state fingerprint capture -- that a workdir's
+# implementation/review pair is in a state a human could safely commit.
+
+GIT_ENV_OVERRIDES = {
+    "LC_ALL": "C",
+    "LANG": "C",
+    "TZ": "UTC",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+def _deterministic_git_env():
+    env = dict(os.environ)
+    env.update(GIT_ENV_OVERRIDES)
+    return env
+
+
+def _sha256_canonical_excluding(obj, excluded_key):
+    filtered = {k: v for k, v in obj.items() if k != excluded_key}
+    encoded = json.dumps(filtered, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _hash_file_bytes(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _run_git_capture(argv, cwd, timeout=REPO_STATE_TIMEOUT_SECONDS):
+    """Run a read-only git argv command; raise TransportError on launch/timeout, RepositoryStateError on failure exit."""
+    try:
+        completed = subprocess.run(
+            argv, cwd=str(cwd), shell=False, capture_output=True,
+            timeout=timeout, check=False, env=_deterministic_git_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TransportError("git command timed out after %ss: %r" % (timeout, argv)) from exc
+    except OSError as exc:
+        raise TransportError("git command failed to launch: %r: %s" % (argv, exc)) from exc
+    if completed.returncode != 0:
+        stderr_text = completed.stderr.decode("utf-8", "replace")
+        raise RepositoryStateError("git command failed (%s): %r: %s" % (completed.returncode, argv, stderr_text))
+    return completed.stdout
+
+
+def _run_git_text(argv, cwd, timeout=REPO_STATE_TIMEOUT_SECONDS):
+    return _run_git_capture(argv, cwd, timeout).decode("utf-8", "replace")
+
+
+def _git_path_list(argv, cwd):
+    text = _run_git_text(argv, cwd)
+    return [line for line in text.split("\n") if line != ""]
+
+
+def _verify_git_repo_worktree(resolved_workdir):
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"], cwd=str(resolved_workdir),
+            shell=False, capture_output=True, text=True, timeout=REPO_STATE_TIMEOUT_SECONDS,
+            check=False, env=_deterministic_git_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TransportError("git rev-parse timed out: %s" % exc) from exc
+    except OSError as exc:
+        raise TransportError("git rev-parse failed to launch: %s" % exc) from exc
+    if completed.returncode != 0 or completed.stdout.strip() != "true":
+        raise RepositoryStateError("workdir is not a usable git repository: %s" % resolved_workdir)
+
+
+def _git_path_is_ignored(resolved_workdir, relative_path):
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", "--", relative_path],
+            cwd=str(resolved_workdir), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            check=False, timeout=REPO_STATE_TIMEOUT_SECONDS, shell=False, env=_deterministic_git_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TransportError("git check-ignore timed out for %r: %s" % (relative_path, exc)) from exc
+    except OSError as exc:
+        raise TransportError("git check-ignore failed to launch for %r: %s" % (relative_path, exc)) from exc
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    stderr = result.stderr.decode("utf-8", "replace").strip()
+    raise RepositoryStateError(
+        "git check-ignore failed for %r: exit_code=%s stderr=%r" % (relative_path, result.returncode, stderr)
+    )
+
+
+def _reject_untracked_special_entries(resolved_workdir):
+    """Fail closed on non-ignored filesystem entries Git cannot fingerprint (FIFOs, sockets, devices, ...)."""
+    repo_root = Path(resolved_workdir)
+    try:
+        walker = os.walk(repo_root, topdown=True, followlinks=False)
+        for root, dirs, files in walker:
+            dirs[:] = [name for name in dirs if name != ".git"]
+            for name in list(dirs) + list(files):
+                full_path = Path(root) / name
+                try:
+                    file_stat = full_path.lstat()
+                except OSError as exc:
+                    raise RepositoryStateError("cannot inspect repository entry %s: %s" % (full_path, exc)) from exc
+                mode = file_stat.st_mode
+                if stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
+                    continue
+                relative_path = full_path.relative_to(repo_root).as_posix()
+                if _git_path_is_ignored(resolved_workdir, relative_path):
+                    continue
+                raise RepositoryStateError(
+                    "unsupported non-ignored special filesystem entry in worktree: %s" % relative_path
+                )
+    except RepositoryStateError:
+        raise
+    except OSError as exc:
+        raise RepositoryStateError("cannot scan worktree for special filesystem entries: %s" % exc)
+
+
+def _gitlink_paths(resolved_workdir, paths):
+    if not paths:
+        return set()
+    argv = ["git", "ls-files", "-s", "--"] + list(paths)
+    text = _run_git_text(argv, resolved_workdir)
+    gitlinks = set()
+    for line in text.split("\n"):
+        if line == "":
+            continue
+        meta, _, path = line.partition("\t")
+        fields = meta.split()
+        if fields and fields[0] == "160000":
+            gitlinks.add(path)
+    return gitlinks
+
+
+def _reject_conflicts_and_submodules(resolved_workdir, staged_paths, unstaged_paths, untracked_paths):
+    status_text = _run_git_text(["git", "status", "--porcelain"], resolved_workdir)
+    for line in status_text.split("\n"):
+        if line == "":
+            continue
+        code = line[:2]
+        if code in CONFLICT_STATUS_CODES:
+            raise RepositoryStateError("unresolved merge conflict detected in git status: %s" % line)
+
+    overlap = set(staged_paths) & set(unstaged_paths)
+    if overlap:
+        raise RepositoryStateError(
+            "unresolved merge conflict detected (path both staged and unstaged): %s" % sorted(overlap)
+        )
+
+    all_changed = sorted(set(staged_paths) | set(unstaged_paths) | set(untracked_paths))
+    gitlinks = _gitlink_paths(resolved_workdir, all_changed)
+    if gitlinks:
+        raise RepositoryStateError("changed submodule (gitlink) detected: %s" % sorted(gitlinks))
+
+    submodule_status_text = _run_git_text(["git", "submodule", "status"], resolved_workdir)
+    for line in submodule_status_text.split("\n"):
+        if line == "":
+            continue
+        if line[0] in ("+", "-"):
+            raise RepositoryStateError("changed submodule detected via git submodule status: %s" % line.strip())
+
+
+def _describe_untracked_entry(resolved_workdir, relative_path):
+    full_path = resolved_workdir / relative_path
+    file_stat = full_path.lstat()
+
+    if stat.S_ISLNK(file_stat.st_mode):
+        target_bytes = os.fsencode(os.readlink(full_path))
+        return {
+            "path": relative_path,
+            "type": "symlink",
+            "mode": format(stat.S_IMODE(file_stat.st_mode), "04o"),
+            "size": len(target_bytes),
+            "content_sha256": hashlib.sha256(target_bytes).hexdigest(),
+        }
+
+    if stat.S_ISREG(file_stat.st_mode):
+        return {
+            "path": relative_path,
+            "type": "file",
+            "mode": format(stat.S_IMODE(file_stat.st_mode), "04o"),
+            "size": file_stat.st_size,
+            "content_sha256": _hash_file_bytes(full_path),
+        }
+
+    raise RepositoryStateError(
+        "untracked path is a special file (not a regular file or symlink): %s" % relative_path
+    )
+
+
+def _capture_repository_state_once(resolved_workdir, canonical_workdir):
+    """Capture one repository-state/v1 envelope. Read-only: no git object/index/file writes."""
+    head = _run_git_text(["git", "rev-parse", "HEAD"], resolved_workdir).strip()
+
+    staged_paths = _git_path_list(["git", "diff", "--name-only", "--cached"], resolved_workdir)
+    unstaged_paths = _git_path_list(["git", "diff", "--name-only"], resolved_workdir)
+    untracked_paths = _git_path_list(["git", "ls-files", "--others", "--exclude-standard"], resolved_workdir)
+
+    _reject_untracked_special_entries(resolved_workdir)
+    _reject_conflicts_and_submodules(resolved_workdir, staged_paths, unstaged_paths, untracked_paths)
+
+    changed_paths = sorted(set(staged_paths) | set(unstaged_paths) | set(untracked_paths))
+
+    staged_patch = _run_git_capture(["git", "diff", "--cached", "--binary", "--full-index"], resolved_workdir)
+    unstaged_patch = _run_git_capture(["git", "diff", "--binary", "--full-index"], resolved_workdir)
+
+    untracked_entries = [
+        _describe_untracked_entry(resolved_workdir, relative_path) for relative_path in sorted(untracked_paths)
+    ]
+
+    envelope = {
+        "schema": REPOSITORY_STATE_SCHEMA,
+        "workdir": canonical_workdir,
+        "head": head,
+        "changed_paths": changed_paths,
+        "staged_patch_sha256": _sha256_bytes(staged_patch),
+        "unstaged_patch_sha256": _sha256_bytes(unstaged_patch),
+        "untracked": untracked_entries,
+    }
+    envelope["aggregate_sha256"] = _sha256_canonical_excluding(envelope, "aggregate_sha256")
+    return envelope
+
+
+def capture_repository_state(resolved_workdir):
+    """Capture a deterministic repository-state/v1 envelope, twice, requiring exact equality."""
+    _verify_git_repo_worktree(resolved_workdir)
+    canonical_workdir = os.path.realpath(str(resolved_workdir))
+    first = _capture_repository_state_once(resolved_workdir, canonical_workdir)
+    second = _capture_repository_state_once(resolved_workdir, canonical_workdir)
+    if first != second:
+        raise RepositoryStateError("repository state changed between consecutive captures (unstable state)")
+    return first
+
+
+def _run_git_diff_check_gate(resolved_workdir):
+    try:
+        completed = subprocess.run(
+            ["git", "diff", "--check"], cwd=str(resolved_workdir), shell=False,
+            capture_output=True, text=True, timeout=GIT_DIFF_CHECK_TIMEOUT_SECONDS,
+            check=False, env=_deterministic_git_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TransportError("git diff --check timed out: %s" % exc) from exc
+    except OSError as exc:
+        raise TransportError("git diff --check failed to launch: %s" % exc) from exc
+    if completed.returncode != 0:
+        detail = ((completed.stdout or "").strip() + " " + (completed.stderr or "").strip()).strip()
+        raise ReadyToCommitReject("git_diff_check_failed", "git diff --check reported issues: %s" % detail)
+
+
+def _run_kanban_json(argv, label):
+    try:
+        completed = run_hermes_command_with_timeout(argv, KANBAN_READ_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise TransportError("%s timed out after %ss" % (label, KANBAN_READ_TIMEOUT_SECONDS)) from exc
+    except OSError as exc:
+        raise TransportError("%s failed to launch: %s" % (label, exc)) from exc
+    return parse_json_stdout(completed, label)
+
+
+def _fetch_show_and_runs(task_id):
+    show = _run_kanban_json(["hermes", "kanban", "show", task_id, "--json"], "hermes kanban show " + task_id)
+    runs = _run_kanban_json(["hermes", "kanban", "runs", task_id, "--json"], "hermes kanban runs " + task_id)
+    show = validate_show_top_level(show)
+    return show, runs
+
+
+def _require_show_runs_match(prefix, show, runs):
+    show_runs = show.get("runs")
+    if not isinstance(show_runs, list) or not isinstance(runs, list):
+        raise ReadyToCommitReject(prefix + "_runs_shape", prefix + ": show.runs and runs must both be arrays")
+    if show_runs != runs:
+        raise ReadyToCommitReject(
+            prefix + "_runs_mismatch", prefix + ": show.runs and standalone runs are not equal as parsed JSON"
+        )
+
+
+def _select_latest_run_reject(reason_code, runs):
+    try:
+        return select_latest_run("ready-to-commit", runs)
+    except ValidationBlock as exc:
+        raise ReadyToCommitReject(reason_code, exc.reason)
+
+
+def _validate_implementation_task(task, task_id, canonical_workdir):
+    if not isinstance(task, dict):
+        raise ReadyToCommitReject("implementation_task_shape", "implementation task must be a JSON object")
+    if task.get("id") != task_id:
+        raise ReadyToCommitReject(
+            "implementation_task_id_mismatch",
+            "implementation task.id is %r, expected %r" % (task.get("id"), task_id),
+        )
+    if task.get("workspace_kind") != "dir":
+        raise ReadyToCommitReject(
+            "implementation_workspace_kind_mismatch",
+            "implementation task.workspace_kind is %r, expected 'dir'" % (task.get("workspace_kind"),),
+        )
+    workspace_path = task.get("workspace_path")
+    if not isinstance(workspace_path, str) or not workspace_path or not Path(workspace_path).is_absolute():
+        raise ReadyToCommitReject(
+            "implementation_workspace_path_invalid",
+            "implementation task.workspace_path is missing or malformed: %r" % (workspace_path,),
+        )
+    if os.path.realpath(workspace_path) != canonical_workdir:
+        raise ReadyToCommitReject(
+            "implementation_workspace_mismatch",
+            "implementation task workspace %r does not match requested workdir %r"
+            % (workspace_path, canonical_workdir),
+        )
+    if task.get("assignee") != "coder-claude":
+        raise ReadyToCommitReject(
+            "implementation_assignee_mismatch",
+            "implementation task.assignee is %r, expected 'coder-claude'" % (task.get("assignee"),),
+        )
+    if task.get("status") != "done":
+        raise ReadyToCommitReject(
+            "implementation_status_mismatch",
+            "implementation task.status is %r, expected 'done'" % (task.get("status"),),
+        )
+    completed_at = task.get("completed_at")
+    if isinstance(completed_at, bool) or not isinstance(completed_at, int) or completed_at <= 0:
+        raise ReadyToCommitReject(
+            "implementation_completed_at_invalid",
+            "implementation task.completed_at must be a positive int, got %r" % (completed_at,),
+        )
+    return completed_at
+
+
+def _validate_implementation_latest_run(run):
+    if run.get("profile") != "coder-claude":
+        raise ReadyToCommitReject(
+            "implementation_run_profile_mismatch",
+            "implementation latest run profile is %r, expected 'coder-claude'" % (run.get("profile"),),
+        )
+    if run.get("outcome") != "completed":
+        raise ReadyToCommitReject(
+            "implementation_run_outcome_mismatch",
+            "implementation latest run outcome is %r, expected 'completed'" % (run.get("outcome"),),
+        )
+    if run.get("status") not in ("done", "completed"):
+        raise ReadyToCommitReject(
+            "implementation_run_status_mismatch",
+            "implementation latest run status is %r, expected 'done' or 'completed'" % (run.get("status"),),
+        )
+
+
+def _validate_review_task(task, task_id, canonical_workdir):
+    if not isinstance(task, dict):
+        raise ReadyToCommitReject("review_task_shape", "review task must be a JSON object")
+    if task.get("id") != task_id:
+        raise ReadyToCommitReject(
+            "review_task_id_mismatch", "review task.id is %r, expected %r" % (task.get("id"), task_id)
+        )
+    if task.get("workspace_kind") != "dir":
+        raise ReadyToCommitReject(
+            "review_workspace_kind_mismatch",
+            "review task.workspace_kind is %r, expected 'dir'" % (task.get("workspace_kind"),),
+        )
+    workspace_path = task.get("workspace_path")
+    if not isinstance(workspace_path, str) or not workspace_path or not Path(workspace_path).is_absolute():
+        raise ReadyToCommitReject(
+            "review_workspace_path_invalid",
+            "review task.workspace_path is missing or malformed: %r" % (workspace_path,),
+        )
+    if os.path.realpath(workspace_path) != canonical_workdir:
+        raise ReadyToCommitReject(
+            "review_workspace_mismatch",
+            "review task workspace %r does not match requested workdir %r" % (workspace_path, canonical_workdir),
+        )
+    if task.get("assignee") != "reviewer":
+        raise ReadyToCommitReject(
+            "review_assignee_mismatch", "review task.assignee is %r, expected 'reviewer'" % (task.get("assignee"),)
+        )
+    if task.get("status") != "done":
+        raise ReadyToCommitReject(
+            "review_status_mismatch", "review task.status is %r, expected 'done'" % (task.get("status"),)
+        )
+    completed_at = task.get("completed_at")
+    if isinstance(completed_at, bool) or not isinstance(completed_at, int) or completed_at <= 0:
+        raise ReadyToCommitReject(
+            "review_completed_at_invalid",
+            "review task.completed_at must be a positive int, got %r" % (completed_at,),
+        )
+    return completed_at
+
+
+def _validate_review_parents(parents, implementation_task_id):
+    if parents != [implementation_task_id]:
+        raise ReadyToCommitReject(
+            "review_parents_mismatch",
+            "review parents is %r, expected [%r]" % (parents, implementation_task_id),
+        )
+
+
+def _validate_review_latest_run(run, implementation_task_id):
+    if run.get("profile") != "reviewer":
+        raise ReadyToCommitReject(
+            "review_run_profile_mismatch",
+            "review latest run profile is %r, expected 'reviewer'" % (run.get("profile"),),
+        )
+    if run.get("status") != "done":
+        raise ReadyToCommitReject(
+            "review_run_status_mismatch", "review latest run status is %r, expected 'done'" % (run.get("status"),)
+        )
+    if run.get("outcome") != "completed":
+        raise ReadyToCommitReject(
+            "review_run_outcome_mismatch",
+            "review latest run outcome is %r, expected 'completed'" % (run.get("outcome"),),
+        )
+    metadata = run.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ReadyToCommitReject(
+            "review_metadata_shape", "review latest run metadata must be a JSON object, got %r" % (metadata,)
+        )
+    if metadata.get("implementation_task_id") != implementation_task_id:
+        raise ReadyToCommitReject(
+            "review_metadata_implementation_task_id_mismatch",
+            "review latest run metadata.implementation_task_id is %r, expected %r"
+            % (metadata.get("implementation_task_id"), implementation_task_id),
+        )
+    if metadata.get("mutation_performed") is not False:
+        raise ReadyToCommitReject(
+            "review_metadata_mutation_performed_invalid",
+            "review latest run metadata.mutation_performed is %r, expected exactly false"
+            % (metadata.get("mutation_performed"),),
+        )
+    return metadata
+
+
+def _validate_review_metadata_repository_state(metadata, canonical_workdir):
+    state = metadata.get("repository_state")
+    if not isinstance(state, dict):
+        raise ReadyToCommitReject(
+            "review_metadata_repository_state_shape",
+            "review metadata.repository_state must be a JSON object, got %r" % (state,),
+        )
+    if state.get("schema") != REPOSITORY_STATE_SCHEMA:
+        raise ReadyToCommitReject(
+            "review_metadata_repository_state_schema_mismatch",
+            "unsupported repository_state schema: %r" % (state.get("schema"),),
+        )
+    if state.get("workdir") != canonical_workdir:
+        raise ReadyToCommitReject(
+            "review_metadata_repository_state_workdir_mismatch",
+            "repository_state workdir is %r, expected %r" % (state.get("workdir"), canonical_workdir),
+        )
+    aggregate = state.get("aggregate_sha256")
+    duplicate = metadata.get("repository_state_sha256")
+    if not isinstance(aggregate, str) or not re.fullmatch(r"[0-9a-f]{64}", aggregate):
+        raise ReadyToCommitReject(
+            "review_metadata_repository_state_sha256_malformed",
+            "repository_state aggregate_sha256 is malformed: %r" % (aggregate,),
+        )
+    if duplicate != aggregate:
+        raise ReadyToCommitReject(
+            "review_metadata_repository_state_sha256_mismatch",
+            "metadata.repository_state_sha256 does not match repository_state.aggregate_sha256",
+        )
+    recomputed = _sha256_canonical_excluding(state, "aggregate_sha256")
+    if recomputed != aggregate:
+        raise ReadyToCommitReject(
+            "review_metadata_repository_state_sha256_invalid",
+            "repository_state aggregate_sha256 does not match recomputed digest",
+        )
+    return state
+
+
+def _find_review_archive_artifact(resolved_workdir, review_task_id):
+    ai_dir = resolved_workdir / ".ai"
+    reviews_dir = ai_dir / "reviews"
+
+    for directory in (ai_dir, reviews_dir):
+        try:
+            dir_stat = directory.lstat()
+        except OSError as exc:
+            raise ReadyToCommitReject(
+                "review_archive_missing", "review archive directory missing: %s (%s)" % (directory, exc)
+            )
+        if not stat.S_ISDIR(dir_stat.st_mode) or directory.is_symlink():
+            raise ReadyToCommitReject(
+                "review_archive_invalid_directory",
+                "review archive directory is not a real directory: %s" % directory,
+            )
+
+    if reviews_dir.parent != ai_dir or ai_dir.parent != resolved_workdir:
+        raise ReadyToCommitReject(
+            "review_archive_invalid_directory", "review archive directory escaped canonical workdir"
+        )
+
+    pattern = re.compile(REVIEW_ARCHIVE_FILENAME_RE_TEMPLATE % re.escape(review_task_id))
+    try:
+        entries = list(reviews_dir.iterdir())
+    except OSError as exc:
+        raise ReadyToCommitReject("review_archive_unreadable", "cannot list review archive directory: %s" % exc)
+
+    candidates = [entry for entry in entries if pattern.fullmatch(entry.name)]
+    if len(candidates) != 1:
+        raise ReadyToCommitReject(
+            "review_archive_ambiguous",
+            "expected exactly one review archive artifact for %s, found %d" % (review_task_id, len(candidates)),
+        )
+
+    artifact = candidates[0]
+    if artifact.parent != reviews_dir:
+        raise ReadyToCommitReject(
+            "review_archive_invalid_directory", "review archive artifact escaped reviews directory"
+        )
+    artifact_stat = artifact.lstat()
+    if artifact.is_symlink() or not stat.S_ISREG(artifact_stat.st_mode):
+        raise ReadyToCommitReject(
+            "review_archive_not_regular",
+            "review archive artifact is not a regular non-symlink file: %s" % artifact,
+        )
+    return artifact
+
+
+def _parse_review_archive_envelope(artifact_path, review_task_id):
+    try:
+        raw = artifact_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReadyToCommitReject("review_archive_unreadable", "cannot read review archive artifact: %s" % exc)
+
+    envelopes = []
+    for block in REVIEW_ARCHIVE_JSON_BLOCK_RE.findall(raw):
+        try:
+            parsed = json.loads(block)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict) and parsed.get("schema") == REVIEW_ARCHIVE_SCHEMA_V2:
+            envelopes.append(parsed)
+
+    if len(envelopes) != 1:
+        raise ReadyToCommitReject(
+            "review_archive_envelope_ambiguous",
+            "expected exactly one %s JSON section, found %d" % (REVIEW_ARCHIVE_SCHEMA_V2, len(envelopes)),
+        )
+    envelope = envelopes[0]
+
+    errors = []
+    validate_exact_keys(envelope, REVIEW_ARCHIVE_ENVELOPE_KEYS, "review_archive_envelope", errors)
+    if errors:
+        raise ReadyToCommitReject("review_archive_envelope_shape", "; ".join(errors))
+
+    if envelope.get("review_task_id") != review_task_id:
+        raise ReadyToCommitReject(
+            "review_archive_envelope_mismatch",
+            "review archive envelope.review_task_id is %r, expected %r"
+            % (envelope.get("review_task_id"), review_task_id),
+        )
+
+    recomputed = _sha256_canonical_excluding(envelope, "archive_envelope_sha256")
+    if recomputed != envelope.get("archive_envelope_sha256"):
+        raise ReadyToCommitReject(
+            "review_archive_envelope_sha256_mismatch",
+            "recomputed archive_envelope_sha256 does not match review archive artifact",
+        )
+
+    return envelope
+
+
+def _require_envelope_matches_kanban(
+    envelope, canonical_workdir, implementation_task_id, review_task_id,
+    review_run_id, review_completed_at, verdict, verdict_source, review_state,
+):
+    checks = (
+        ("workdir", envelope.get("workdir"), canonical_workdir),
+        ("implementation_task_id", envelope.get("implementation_task_id"), implementation_task_id),
+        ("review_task_id", envelope.get("review_task_id"), review_task_id),
+        ("review_run_id", envelope.get("review_run_id"), review_run_id),
+        ("review_completed_at", envelope.get("review_completed_at"), review_completed_at),
+        ("verdict", envelope.get("verdict"), verdict),
+        ("verdict_source", envelope.get("verdict_source"), verdict_source),
+    )
+    for field, actual, expected in checks:
+        if actual != expected:
+            raise ReadyToCommitReject(
+                "review_archive_envelope_mismatch",
+                "review archive envelope.%s is %r, expected %r" % (field, actual, expected),
+            )
+    if envelope.get("repository_state") != review_state:
+        raise ReadyToCommitReject(
+            "review_archive_repository_state_mismatch",
+            "review archive envelope.repository_state does not match authoritative review metadata repository_state",
+        )
+
+
+def _emit_ready_to_commit_reject(args, reason_code, reason):
+    payload = {
+        "phase": "ready-to-commit",
+        "outcome": "not-ready",
+        "workdir": args.workdir,
+        "implementation_task_id": args.implementation_task_id,
+        "review_task_id": args.review_task_id,
+        "reason_code": reason_code,
+        "reason": reason,
+        "human_approval_required": True,
+        "commit_performed": False,
+        "push_performed": False,
+    }
+    print(json.dumps(payload, separators=(",", ":")))
+
+
+def ready_to_commit(args):
+    """Strictly read-only technical attestation that a workdir is ready to commit.
+
+    Never authorizes or performs commit/push/staging/filesystem writes/Kanban
+    writes. Validates the implementation and review tasks via two authorized
+    `hermes kanban` JSON reads each, requires an exact PASS verdict, requires
+    the deterministically archived review artifact envelope to match the
+    authoritative Kanban review metadata exactly, and requires a fresh,
+    doubly-captured repository-state fingerprint to match both the
+    authoritative review metadata and the archived envelope exactly.
+    """
+    implementation_task_id = args.implementation_task_id
+    review_task_id = args.review_task_id
+
+    try:
+        resolved = validate_workdir(args.workdir)
+    except WorkdirValidationError as exc:
+        raise ReadyToCommitReject("invalid_workdir", str(exc))
+
+    if not valid_task_id(implementation_task_id):
+        raise ReadyToCommitReject(
+            "invalid_implementation_task_id", "implementation_task_id is invalid: %r" % (implementation_task_id,)
+        )
+    if not valid_task_id(review_task_id):
+        raise ReadyToCommitReject("invalid_review_task_id", "review_task_id is invalid: %r" % (review_task_id,))
+
+    canonical_workdir = os.path.realpath(str(resolved))
+
+    # --- implementation task ---
+    impl_show, impl_runs = _fetch_show_and_runs(implementation_task_id)
+    _require_show_runs_match("implementation", impl_show, impl_runs)
+    _validate_implementation_task(impl_show.get("task"), implementation_task_id, canonical_workdir)
+    impl_latest = _select_latest_run_reject("implementation_run_selection_invalid", impl_show.get("runs"))
+    _validate_implementation_latest_run(impl_latest)
+
+    # --- review task ---
+    review_show, review_runs = _fetch_show_and_runs(review_task_id)
+    _require_show_runs_match("review", review_show, review_runs)
+    review_completed_at = _validate_review_task(review_show.get("task"), review_task_id, canonical_workdir)
+    _validate_review_parents(review_show.get("parents"), implementation_task_id)
+    review_latest = _select_latest_run_reject("review_run_selection_invalid", review_show.get("runs"))
+    metadata = _validate_review_latest_run(review_latest, implementation_task_id)
+
+    try:
+        verdict, verdict_source = classify_verdict(review_latest)
+    except VerdictBlock as exc:
+        raise ReadyToCommitReject("verdict_blocked", exc.reason)
+    if verdict != "PASS":
+        raise ReadyToCommitReject("verdict_not_pass", "review verdict is %r, expected PASS" % (verdict,))
+
+    review_state = _validate_review_metadata_repository_state(metadata, canonical_workdir)
+
+    # --- archived review artifact ---
+    artifact_path = _find_review_archive_artifact(resolved, review_task_id)
+    envelope = _parse_review_archive_envelope(artifact_path, review_task_id)
+    review_run_id = review_latest.get("id")
+    _require_envelope_matches_kanban(
+        envelope, canonical_workdir, implementation_task_id, review_task_id,
+        review_run_id, review_completed_at, verdict, verdict_source, review_state,
+    )
+
+    # --- working tree gates ---
+    _run_git_diff_check_gate(resolved)
+
+    try:
+        current_state = capture_repository_state(resolved)
+    except RepositoryStateError as exc:
+        raise ReadyToCommitReject("repository_state_invalid", str(exc))
+
+    if current_state != review_state:
+        raise ReadyToCommitReject(
+            "repository_state_mismatch_kanban",
+            "current repository_state does not match authoritative review metadata repository_state",
+        )
+    if current_state != envelope.get("repository_state"):
+        raise ReadyToCommitReject(
+            "repository_state_mismatch_archive",
+            "current repository_state does not match the archived review artifact repository_state",
+        )
+
+    payload = {
+        "phase": "ready-to-commit",
+        "outcome": "ready",
+        "workdir": args.workdir,
+        "implementation_task_id": implementation_task_id,
+        "review_task_id": review_task_id,
+        "review_run_id": review_run_id,
+        "verdict": "PASS",
+        "verdict_source": verdict_source,
+        "review_archived": True,
+        "repository_state_sha256": current_state["aggregate_sha256"],
+        "human_approval_required": True,
+        "commit_performed": False,
+        "push_performed": False,
+    }
+    print(json.dumps(payload, separators=(",", ":")))
+    return EXIT_OK
+
+
 def main(argv=None):
     try:
         args = build_parser().parse_args(argv)
@@ -881,8 +1632,13 @@ def main(argv=None):
             return create_correction(args)
         elif args.command == "archive-review":
             return archive_review(args)
+        elif args.command == "ready-to-commit":
+            return ready_to_commit(args)
         else:
             raise CliUsageError("unknown command: %r" % (args.command,))
+    except ReadyToCommitReject as exc:
+        _emit_ready_to_commit_reject(args, exc.reason_code, exc.reason)
+        return EXIT_VALIDATION
     except ValidationBlock as exc:
         emit_blocked(exc.phase, exc.reason)
         return EXIT_VALIDATION

@@ -16,8 +16,12 @@ DEFAULT_COLLECT_TIMEOUT_SECONDS, never mutates git state, and never touches
 the network.
 """
 
+import hashlib
+import json
+import os
 import re
 import shlex
+import stat
 import subprocess
 from pathlib import Path
 
@@ -28,6 +32,9 @@ ALLOWED_ROOT = Path("/opt/ai/projects").resolve()
 DEFAULT_COLLECT_TIMEOUT_SECONDS = 60
 MAX_CONTENT_WINDOW_BYTES = 20_000
 MAX_CAPTURED_OUTPUT_CHARS = 4_000
+REPOSITORY_STATE_SCHEMA = "hermes.repository-state/v1"
+REPO_STATE_TIMEOUT_SECONDS = 30
+CONFLICT_STATUS_CODES = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})
 
 DEFAULT_TEST_COMMAND = "__skip__"
 MAX_CONTENT_WINDOW_LINES = 200
@@ -293,6 +300,280 @@ def _run_test_command(validated_test_command, resolved_workdir, timeout=DEFAULT_
     return record
 
 
+def _run_git_capture(argv, cwd, timeout=REPO_STATE_TIMEOUT_SECONDS):
+    """Run a read-only git argv command and return raw stdout bytes; raise ReviewBridgeError on failure.
+
+    Unlike _run_argv, this never swallows a failure into a structured record:
+    repository-state capture requires every underlying git command to
+    succeed, so a timeout or non-zero exit is raised immediately.
+    """
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            shell=False,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise ReviewBridgeError(f"git command timed out after {timeout}s: {argv!r}")
+    if completed.returncode != 0:
+        stderr_text = completed.stderr.decode("utf-8", "replace")
+        raise ReviewBridgeError(f"git command failed ({completed.returncode}): {argv!r}: {stderr_text}")
+    return completed.stdout
+
+
+def _run_git_text(argv, cwd, timeout=REPO_STATE_TIMEOUT_SECONDS):
+    return _run_git_capture(argv, cwd, timeout).decode("utf-8", "replace")
+
+
+def _git_path_list(argv, cwd):
+    """Run a git argv command that prints one path per line and return the non-empty lines."""
+    text = _run_git_text(argv, cwd)
+    return [line for line in text.split("\n") if line != ""]
+
+
+def _sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _canonical_json_sha256(obj):
+    encoded = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _gitlink_paths(resolved_workdir, paths):
+    """Return the subset of paths that are gitlinks (submodules, mode 160000) per `git ls-files -s`."""
+    if not paths:
+        return set()
+    argv = ["git", "ls-files", "-s", "--"] + list(paths)
+    text = _run_git_text(argv, resolved_workdir)
+    gitlinks = set()
+    for line in text.split("\n"):
+        if line == "":
+            continue
+        meta, _, path = line.partition("\t")
+        fields = meta.split()
+        if fields and fields[0] == "160000":
+            gitlinks.add(path)
+    return gitlinks
+
+
+def _reject_conflicts_and_submodules(resolved_workdir, staged_paths, unstaged_paths, untracked_paths):
+    """Fail closed on unresolved merge conflicts or changed submodules (gitlinks)."""
+    status_text = _run_git_text(["git", "status", "--porcelain"], resolved_workdir)
+    for line in status_text.split("\n"):
+        if line == "":
+            continue
+        code = line[:2]
+        if code in CONFLICT_STATUS_CODES:
+            raise ReviewBridgeError(f"unresolved merge conflict detected in git status: {line}")
+
+    overlap = set(staged_paths) & set(unstaged_paths)
+    if overlap:
+        raise ReviewBridgeError(
+            f"unresolved merge conflict detected (path both staged and unstaged): {sorted(overlap)}"
+        )
+
+    all_changed = sorted(set(staged_paths) | set(unstaged_paths) | set(untracked_paths))
+    gitlinks = _gitlink_paths(resolved_workdir, all_changed)
+    if gitlinks:
+        raise ReviewBridgeError(f"changed submodule (gitlink) detected: {sorted(gitlinks)}")
+
+    submodule_status_text = _run_git_text(["git", "submodule", "status"], resolved_workdir)
+    for line in submodule_status_text.split("\n"):
+        if line == "":
+            continue
+        if line[0] in ("+", "-"):
+            raise ReviewBridgeError(f"changed submodule detected via git submodule status: {line.strip()}")
+
+
+def _hash_file_bytes(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _describe_untracked_entry(resolved_workdir, relative_path):
+    """Build one untracked-entry record; raises ReviewBridgeError for anything but a file or symlink."""
+    full_path = resolved_workdir / relative_path
+    file_stat = full_path.lstat()
+
+    if stat.S_ISLNK(file_stat.st_mode):
+        target_bytes = os.fsencode(os.readlink(full_path))
+        return {
+            "path": relative_path,
+            "type": "symlink",
+            "mode": format(stat.S_IMODE(file_stat.st_mode), "04o"),
+            "size": len(target_bytes),
+            "content_sha256": hashlib.sha256(target_bytes).hexdigest(),
+        }
+
+    if stat.S_ISREG(file_stat.st_mode):
+        return {
+            "path": relative_path,
+            "type": "file",
+            "mode": format(stat.S_IMODE(file_stat.st_mode), "04o"),
+            "size": file_stat.st_size,
+            "content_sha256": _hash_file_bytes(full_path),
+        }
+
+    raise ReviewBridgeError(f"untracked path is a special file (not a regular file or symlink): {relative_path}")
+
+
+def _git_path_is_ignored(resolved_workdir, relative_path):
+    """Return whether Git excludes relative_path via ignore rules.
+
+    git check-ignore uses exit 0 for ignored and exit 1 for not ignored.
+    Any other result is an evidence-channel failure and therefore blocks.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", "--", relative_path],
+            cwd=resolved_workdir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=REPO_STATE_TIMEOUT_SECONDS,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ReviewBridgeError(
+            f"git check-ignore failed for {relative_path!r}: {exc}"
+        ) from exc
+
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+
+    stderr = result.stderr.decode("utf-8", "replace").strip()
+    raise ReviewBridgeError(
+        f"git check-ignore failed for {relative_path!r}: "
+        f"exit_code={result.returncode} stderr={stderr!r}"
+    )
+
+
+def _reject_untracked_special_entries(resolved_workdir):
+    """Reject non-ignored filesystem entries Git cannot fingerprint.
+
+    Git's untracked-file enumeration does not report FIFOs, sockets, devices,
+    and similar special filesystem objects.  Silently ignoring one would make
+    the repository-state envelope incomplete, so inspect the worktree
+    read-only and fail closed when such a non-ignored entry is present.
+
+    Regular files, directories, and symlinks remain handled by the normal
+    Git-derived changed-path/untracked machinery.  Git's own .git directory is
+    never part of worktree evidence and is pruned from traversal.
+    """
+    repo_root = Path(resolved_workdir)
+
+    try:
+        walker = os.walk(repo_root, topdown=True, followlinks=False)
+
+        for root, dirs, files in walker:
+            # Git administrative state is not worktree content.
+            dirs[:] = [name for name in dirs if name != ".git"]
+
+            for name in list(dirs) + list(files):
+                full_path = Path(root) / name
+
+                try:
+                    file_stat = full_path.lstat()
+                except OSError as exc:
+                    raise ReviewBridgeError(
+                        f"cannot inspect repository entry {full_path}: {exc}"
+                    ) from exc
+
+                mode = file_stat.st_mode
+
+                if (
+                    stat.S_ISREG(mode)
+                    or stat.S_ISDIR(mode)
+                    or stat.S_ISLNK(mode)
+                ):
+                    continue
+
+                relative_path = full_path.relative_to(repo_root).as_posix()
+
+                if _git_path_is_ignored(resolved_workdir, relative_path):
+                    continue
+
+                raise ReviewBridgeError(
+                    "unsupported non-ignored special filesystem entry "
+                    f"in worktree: {relative_path}"
+                )
+
+    except ReviewBridgeError:
+        raise
+    except OSError as exc:
+        raise ReviewBridgeError(
+            f"cannot scan worktree for special filesystem entries: {exc}"
+        ) from exc
+
+
+def _capture_repository_state_once(resolved_workdir, canonical_workdir):
+    """Capture one repository-state envelope. Read-only: no git object/index/file writes."""
+    head = _run_git_text(["git", "rev-parse", "HEAD"], resolved_workdir).strip()
+
+    staged_paths = _git_path_list(["git", "diff", "--name-only", "--cached"], resolved_workdir)
+    unstaged_paths = _git_path_list(["git", "diff", "--name-only"], resolved_workdir)
+    untracked_paths = _git_path_list(["git", "ls-files", "--others", "--exclude-standard"], resolved_workdir)
+
+    # Git does not enumerate FIFOs/sockets/devices as ordinary untracked
+    # entries. Detect non-ignored special filesystem objects separately so
+    # they cannot disappear from the repository-state fingerprint.
+    _reject_untracked_special_entries(resolved_workdir)
+
+    _reject_conflicts_and_submodules(resolved_workdir, staged_paths, unstaged_paths, untracked_paths)
+
+    changed_paths = sorted(set(staged_paths) | set(unstaged_paths) | set(untracked_paths))
+
+    staged_patch = _run_git_capture(["git", "diff", "--cached", "--binary", "--full-index"], resolved_workdir)
+    unstaged_patch = _run_git_capture(["git", "diff", "--binary", "--full-index"], resolved_workdir)
+
+    untracked_entries = [
+        _describe_untracked_entry(resolved_workdir, relative_path) for relative_path in sorted(untracked_paths)
+    ]
+
+    envelope = {
+        "schema": REPOSITORY_STATE_SCHEMA,
+        "workdir": canonical_workdir,
+        "head": head,
+        "changed_paths": changed_paths,
+        "staged_patch_sha256": _sha256_bytes(staged_patch),
+        "unstaged_patch_sha256": _sha256_bytes(unstaged_patch),
+        "untracked": untracked_entries,
+    }
+    envelope["aggregate_sha256"] = _canonical_json_sha256(envelope)
+    return envelope
+
+
+def collect_repository_state(workdir):
+    """Collect a deterministic, read-only repository-state fingerprint envelope for workdir.
+
+    Captures the envelope twice consecutively and requires exact equality,
+    raising ReviewBridgeError on any mismatch, so an in-flight or otherwise
+    unstable working tree can never silently produce a fingerprint. Every
+    changed/untracked path comes only from git itself -- never from caller
+    input. Strictly read-only: never writes git objects, the index, or any
+    file.
+    """
+    resolved_workdir = validate_workdir(workdir)
+    _verify_git_repo(resolved_workdir)
+    canonical_workdir = os.path.realpath(str(resolved_workdir))
+
+    first = _capture_repository_state_once(resolved_workdir, canonical_workdir)
+    second = _capture_repository_state_once(resolved_workdir, canonical_workdir)
+    if first != second:
+        raise ReviewBridgeError("repository state changed between consecutive captures (unstable state)")
+
+    return first
+
+
 def collect(workdir, changed_path=None, test_command=None, content_window=None):
     """Collect bounded, fresh, read-only review evidence for a single review session.
 
@@ -312,7 +593,11 @@ def collect(workdir, changed_path=None, test_command=None, content_window=None):
         full-repository dump, and never more than one file per call;
       - when test_command is supplied: validated against ALLOWED_TEST_COMMANDS
         and, if valid, executed read-only with a bounded exit code and
-        truncated stdout/stderr captured as evidence.
+        truncated stdout/stderr captured as evidence;
+      - every successful call additionally returns a deterministic
+        repository-state fingerprint envelope (see collect_repository_state)
+        under "repository_state", with its aggregate digest duplicated at
+        "repository_state_sha256".
     """
     resolved_workdir = validate_workdir(workdir)
 
@@ -349,6 +634,8 @@ def collect(workdir, changed_path=None, test_command=None, content_window=None):
         "diff_check": None,
         "content_window": None,
         "test_result": None,
+        "repository_state": None,
+        "repository_state_sha256": None,
         "status": "ok",
     }
 
@@ -373,6 +660,10 @@ def collect(workdir, changed_path=None, test_command=None, content_window=None):
 
     if validated_test_command is not None:
         evidence["test_result"] = _run_test_command(validated_test_command, resolved_workdir)
+
+    repository_state = collect_repository_state(str(resolved_workdir))
+    evidence["repository_state"] = repository_state
+    evidence["repository_state_sha256"] = repository_state["aggregate_sha256"]
 
     return evidence
 

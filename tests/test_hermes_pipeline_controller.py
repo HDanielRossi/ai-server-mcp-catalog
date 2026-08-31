@@ -1,8 +1,10 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import unittest.mock as mock
+from pathlib import Path
 
 import pytest
 
@@ -1899,3 +1901,1157 @@ def test_wait_timeout_never_calls_archive_helper(capsys, monkeypatch):
         argv = list(call.args[0])
         assert argv[:1] != [ARCHIVE_HELPER]
         assert not any("review-archive-bridge" in str(a) for a in argv)
+
+
+# === A5 B2b: ready-to-commit tests (pipeline-a5-ready-to-commit) ===
+#
+# These tests use real, hermetic temporary git repositories (with
+# hpc.ALLOWED_ROOT monkeypatched to a tmp_path root) so the extensive
+# git-based repository-state / conflict / submodule / diff-check logic in
+# ready_to_commit is exercised against real git, never reimplemented here.
+# Only the two `hermes kanban` JSON reads are stubbed; every other
+# subprocess call (git) is passed through to the real, unpatched
+# subprocess.run captured below before any test applies a mock.
+
+REAL_SUBPROCESS_RUN = subprocess.run
+
+RTC_IMPL_ID = "t_implready1"
+RTC_REVIEW_ID = "t_reviewready1"
+
+
+def _git(repo, *args):
+    result = REAL_SUBPROCESS_RUN(
+        ["git", *args], cwd=str(repo), capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError("git %r failed (rc=%s): %s" % (list(args), result.returncode, result.stderr))
+    return result
+
+
+def make_rtc_repo(tmp_path, monkeypatch):
+    root = tmp_path / "projects"
+    root.mkdir()
+    repo = root / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(hpc, "ALLOWED_ROOT", root.resolve())
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "rtc-test@example.com")
+    _git(repo, "config", "user.name", "RTC Test")
+    _git(repo, "config", "commit.gpgsign", "false")
+    # /.ai/reviews/ is git-ignored so the review-archive artifact written
+    # under .ai/reviews/ never itself shows up as an untracked
+    # repository-state delta relative to the state captured at review
+    # time. Only that exact control-plane directory is ignored — the
+    # rest of .ai/ is NOT broadly ignored, so any other unrelated
+    # untracked path (including elsewhere under .ai/) still shows up in
+    # repository-state/v1 like any other untracked path.
+    (repo / ".gitignore").write_text("/.ai/reviews/\n")
+    (repo / "README.md").write_text("hello world\n")
+    _git(repo, "add", ".gitignore", "README.md")
+    _git(repo, "commit", "-q", "-m", "initial commit")
+    return repo.resolve()
+
+
+def capture_state(repo):
+    canonical = os.path.realpath(str(repo))
+    return hpc._capture_repository_state_once(repo, canonical)
+
+
+def make_impl_task_for(workdir, **overrides):
+    t = make_task(
+        id=RTC_IMPL_ID, assignee="coder-claude", status="done",
+        workspace_kind="dir", workspace_path=str(workdir), completed_at=1000,
+    )
+    t.update(overrides)
+    return t
+
+
+def make_impl_run_for(**overrides):
+    r = make_run(id=1, profile="coder-claude", status="done", outcome="completed", summary="ok", metadata=None)
+    r.update(overrides)
+    return r
+
+
+def make_impl_show_for(workdir, runs=None, task_overrides=None):
+    task = make_impl_task_for(workdir, **(task_overrides or {}))
+    if runs is None:
+        runs = [make_impl_run_for()]
+    return make_show(task=task, parents=[], runs=runs)
+
+
+def make_review_task_for(workdir, **overrides):
+    t = make_task(
+        id=RTC_REVIEW_ID, assignee="reviewer", status="done",
+        workspace_kind="dir", workspace_path=str(workdir), completed_at=2000,
+    )
+    t.update(overrides)
+    return t
+
+
+def make_review_metadata_for(state, **overrides):
+    md = {
+        "implementation_task_id": RTC_IMPL_ID,
+        "verdict": "PASS",
+        "mutation_performed": False,
+        "repository_state": state,
+        "repository_state_sha256": state["aggregate_sha256"] if isinstance(state, dict) else None,
+    }
+    md.update(overrides)
+    return md
+
+
+def make_review_run_for(state, run_id=10, metadata=None, **overrides):
+    if metadata is None:
+        metadata = make_review_metadata_for(state)
+    r = make_run(id=run_id, profile="reviewer", status="done", outcome="completed", summary="PASS", metadata=metadata)
+    r.update(overrides)
+    return r
+
+
+def make_review_show_for(workdir, state, runs=None, task_overrides=None, parents=None, run_id=10, metadata=None):
+    task = make_review_task_for(workdir, **(task_overrides or {}))
+    if runs is None:
+        runs = [make_review_run_for(state, run_id=run_id, metadata=metadata)]
+    if parents is None:
+        parents = [RTC_IMPL_ID]
+    return make_show(task=task, parents=parents, runs=runs)
+
+
+def make_envelope_for(workdir, state, review_run_id=10, review_completed_at=2000,
+                       verdict="PASS", verdict_source="metadata", **overrides):
+    canonical = os.path.realpath(str(workdir))
+    envelope = {
+        "schema": hpc.REVIEW_ARCHIVE_SCHEMA_V2,
+        "workdir": canonical,
+        "implementation_task_id": RTC_IMPL_ID,
+        "review_task_id": RTC_REVIEW_ID,
+        "review_run_id": review_run_id,
+        "review_completed_at": review_completed_at,
+        "verdict": verdict,
+        "verdict_source": verdict_source,
+        "repository_state": state,
+    }
+    envelope.update(overrides)
+    envelope["archive_envelope_sha256"] = hpc._sha256_canonical_excluding(envelope, "archive_envelope_sha256")
+    return envelope
+
+
+RTC_ARCHIVE_FILENAME = "20240101_010203-%s.md" % RTC_REVIEW_ID
+
+
+def write_archive_artifact(workdir, envelope, filename=None):
+    reviews_dir = Path(workdir) / ".ai" / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    if filename is None:
+        filename = RTC_ARCHIVE_FILENAME
+    content = "# archive\n\n```json\n" + json.dumps(envelope, sort_keys=True) + "\n```\n"
+    path = reviews_dir / filename
+    path.write_text(content)
+    return path
+
+
+def setup_rtc_ready(tmp_path, monkeypatch):
+    repo = make_rtc_repo(tmp_path, monkeypatch)
+    state = capture_state(repo)
+    impl_show = make_impl_show_for(repo)
+    review_show = make_review_show_for(repo, state)
+    envelope = make_envelope_for(repo, state)
+    write_archive_artifact(repo, envelope)
+    return repo, state, impl_show, review_show, envelope
+
+
+def make_rtc_stub(impl_show, review_show):
+    calls = []
+
+    def run(args, **kwargs):
+        argv = list(args)
+        calls.append(argv)
+        if len(argv) >= 4 and argv[:3] == ["hermes", "kanban", "show"]:
+            tid = argv[3]
+            if tid == RTC_IMPL_ID:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(impl_show), stderr="")
+            if tid == RTC_REVIEW_ID:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(review_show), stderr="")
+            raise AssertionError("unexpected show task id: %r" % (tid,))
+        if len(argv) >= 4 and argv[:3] == ["hermes", "kanban", "runs"]:
+            tid = argv[3]
+            if tid == RTC_IMPL_ID:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(impl_show["runs"]), stderr="")
+            if tid == RTC_REVIEW_ID:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(review_show["runs"]), stderr="")
+            raise AssertionError("unexpected runs task id: %r" % (tid,))
+        if argv[:1] == [hpc.ARCHIVE_HELPER_PATH]:
+            raise AssertionError("ready-to-commit must never invoke review-archive-bridge")
+        if argv[:3] == ["hermes", "kanban", "create"]:
+            raise AssertionError("ready-to-commit must never create Kanban tasks")
+        return REAL_SUBPROCESS_RUN(args, **kwargs)
+
+    return run, calls
+
+
+def run_rtc(workdir, impl_id=RTC_IMPL_ID, review_id=RTC_REVIEW_ID):
+    return hpc.main([
+        "ready-to-commit", "--workdir", str(workdir),
+        "--implementation_task_id", impl_id, "--review_task_id", review_id,
+    ])
+
+
+def parse_rtc_success(capsys):
+    captured = capsys.readouterr()
+    lines = [l for l in captured.out.splitlines() if l.strip()]
+    assert len(lines) == 1
+    obj = json.loads(lines[0])
+    assert list(obj.keys()) == [
+        "phase", "outcome", "workdir", "implementation_task_id", "review_task_id",
+        "review_run_id", "verdict", "verdict_source", "review_archived",
+        "repository_state_sha256", "human_approval_required", "commit_performed", "push_performed",
+    ]
+    assert obj["phase"] == "ready-to-commit"
+    assert obj["outcome"] == "ready"
+    return captured, obj
+
+
+def parse_rtc_reject(capsys):
+    captured = capsys.readouterr()
+    lines = [l for l in captured.out.splitlines() if l.strip()]
+    assert len(lines) == 1
+    obj = json.loads(lines[0])
+    assert list(obj.keys()) == [
+        "phase", "outcome", "workdir", "implementation_task_id", "review_task_id",
+        "reason_code", "reason", "human_approval_required", "commit_performed", "push_performed",
+    ]
+    assert obj["phase"] == "ready-to-commit"
+    assert obj["outcome"] == "not-ready"
+    assert obj["human_approval_required"] is True
+    assert obj["commit_performed"] is False
+    assert obj["push_performed"] is False
+    return captured, obj
+
+
+PROHIBITED_GIT_SUBCOMMANDS = {
+    "add", "commit", "push", "merge", "reset", "restore", "checkout",
+    "clean", "rebase", "update-index", "hash-object", "stash", "cherry-pick",
+    "revert", "am", "apply", "rm", "mv", "tag", "init",
+}
+
+
+def snapshot_worktree(repo):
+    repo = Path(repo)
+    snapshot = {}
+    for path in sorted(repo.rglob("*")):
+        rel = path.relative_to(repo)
+        if ".git" in rel.parts:
+            continue
+        key = str(rel)
+        if path.is_symlink():
+            snapshot[key] = ("symlink", os.readlink(path))
+        elif path.is_file():
+            snapshot[key] = ("file", path.read_bytes())
+        elif path.is_dir():
+            snapshot[key] = ("dir", None)
+    return snapshot
+
+
+# --- 1/2/3: happy path, idempotency, exact success keys ---
+
+def test_rtc_happy_path_exit_0_and_success_keys(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_OK
+    assert rc != hpc.EXIT_TIMEOUT
+    captured, obj = parse_rtc_success(capsys)
+    assert obj["workdir"] == str(repo)
+    assert obj["implementation_task_id"] == RTC_IMPL_ID
+    assert obj["review_task_id"] == RTC_REVIEW_ID
+    assert obj["review_run_id"] == 10
+    assert obj["verdict"] == "PASS"
+    assert obj["verdict_source"] == "metadata"
+    assert obj["review_archived"] is True
+    assert obj["repository_state_sha256"] == state["aggregate_sha256"]
+    assert obj["human_approval_required"] is True
+    assert obj["commit_performed"] is False
+    assert obj["push_performed"] is False
+
+
+def test_rtc_idempotent_repeated_calls(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc1 = run_rtc(repo)
+        _, obj1 = parse_rtc_success(capsys)
+        rc2 = run_rtc(repo)
+        _, obj2 = parse_rtc_success(capsys)
+    assert rc1 == hpc.EXIT_OK
+    assert rc2 == hpc.EXIT_OK
+    assert obj1 == obj2
+
+
+def test_rtc_not_ready_exact_keys(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    review_show["runs"][0]["metadata"]["verdict"] = "CHANGES REQUIRED"
+    review_show["runs"][0]["summary"] = "CHANGES REQUIRED"
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    assert rc != hpc.EXIT_TIMEOUT
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["workdir"] == str(repo)
+    assert obj["implementation_task_id"] == RTC_IMPL_ID
+    assert obj["review_task_id"] == RTC_REVIEW_ID
+    assert obj["reason_code"] == "verdict_not_pass"
+
+
+# --- 5: required arguments / usage exit 3 ---
+
+@pytest.mark.parametrize("argv", [
+    ["ready-to-commit"],
+    ["ready-to-commit", "--workdir", VALID_WD],
+    ["ready-to-commit", "--implementation_task_id", RTC_IMPL_ID],
+    ["ready-to-commit", "--review_task_id", RTC_REVIEW_ID],
+    ["ready-to-commit", "--workdir", VALID_WD, "--implementation_task_id", RTC_IMPL_ID],
+    ["ready-to-commit", "--workdir", VALID_WD, "--review_task_id", RTC_REVIEW_ID],
+    ["ready-to-commit", "--implementation_task_id", RTC_IMPL_ID, "--review_task_id", RTC_REVIEW_ID],
+    ["ready-to-commit", "--workdir", VALID_WD, "--implementation_task_id", RTC_IMPL_ID,
+     "--review_task_id", RTC_REVIEW_ID, "extra"],
+])
+def test_rtc_cli_usage_errors_exit_3(capsys, argv):
+    with mock.patch.object(hpc.subprocess, "run") as m:
+        rc = hpc.main(argv)
+    assert rc == hpc.EXIT_TRANSPORT
+    m.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "usage error" in captured.err
+
+
+# --- 6: implementation identity/workspace/assignee/status/completed_at ---
+
+@pytest.mark.parametrize("mutate,expected_code", [
+    (lambda t: t.__setitem__("id", "t_other9"), "implementation_task_id_mismatch"),
+    (lambda t: t.__setitem__("workspace_kind", "git"), "implementation_workspace_kind_mismatch"),
+    (lambda t: t.__setitem__("workspace_path", "/opt/ai/projects/somewhere-else"), "implementation_workspace_mismatch"),
+    (lambda t: t.__setitem__("assignee", "reviewer"), "implementation_assignee_mismatch"),
+    (lambda t: t.__setitem__("status", "running"), "implementation_status_mismatch"),
+    (lambda t: t.__setitem__("completed_at", 0), "implementation_completed_at_invalid"),
+])
+def test_rtc_implementation_field_rejections(tmp_path, monkeypatch, capsys, mutate, expected_code):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    mutate(impl_show["task"])
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == expected_code
+
+
+# --- 7: review identity/workspace/assignee/status/completed_at ---
+
+@pytest.mark.parametrize("mutate,expected_code", [
+    (lambda t: t.__setitem__("id", "t_other9"), "review_task_id_mismatch"),
+    (lambda t: t.__setitem__("workspace_kind", "git"), "review_workspace_kind_mismatch"),
+    (lambda t: t.__setitem__("workspace_path", "/opt/ai/projects/somewhere-else"), "review_workspace_mismatch"),
+    (lambda t: t.__setitem__("assignee", "coder-claude"), "review_assignee_mismatch"),
+    (lambda t: t.__setitem__("status", "running"), "review_status_mismatch"),
+    (lambda t: t.__setitem__("completed_at", 0), "review_completed_at_invalid"),
+])
+def test_rtc_review_field_rejections(tmp_path, monkeypatch, capsys, mutate, expected_code):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    mutate(review_show["task"])
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == expected_code
+
+
+# --- 8: show.runs vs standalone runs mismatch ---
+
+def test_rtc_implementation_show_runs_mismatch(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    base_run, _ = make_rtc_stub(impl_show, review_show)
+
+    def tampered(args, **kwargs):
+        argv = list(args)
+        if len(argv) >= 4 and argv[:3] == ["hermes", "kanban", "runs"] and argv[3] == RTC_IMPL_ID:
+            different = [dict(impl_show["runs"][0], summary="different")]
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(different), stderr="")
+        return base_run(args, **kwargs)
+
+    with mock.patch.object(hpc.subprocess, "run", side_effect=tampered):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "implementation_runs_mismatch"
+
+
+def test_rtc_review_show_runs_mismatch(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    base_run, _ = make_rtc_stub(impl_show, review_show)
+
+    def tampered(args, **kwargs):
+        argv = list(args)
+        if len(argv) >= 4 and argv[:3] == ["hermes", "kanban", "runs"] and argv[3] == RTC_REVIEW_ID:
+            different = [dict(review_show["runs"][0], summary="different")]
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(different), stderr="")
+        return base_run(args, **kwargs)
+
+    with mock.patch.object(hpc.subprocess, "run", side_effect=tampered):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_runs_mismatch"
+
+
+# --- 9: latest run selected by maximum unique integer run id ---
+
+def test_rtc_review_latest_run_selected_by_max_id(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    decoy = make_review_run_for(
+        state, run_id=2, metadata=make_review_metadata_for(state, verdict="CHANGES REQUIRED"),
+        summary="CHANGES REQUIRED",
+    )
+    good = review_show["runs"][0]
+    review_show["runs"] = [decoy, good]
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_OK
+    captured, obj = parse_rtc_success(capsys)
+    assert obj["review_run_id"] == 10
+
+
+def test_rtc_implementation_latest_run_selected_by_max_id(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    decoy = make_impl_run_for(id=1, profile="reviewer")
+    good = make_impl_run_for(id=5)
+    impl_show["runs"] = [decoy, good]
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_OK
+
+
+# --- 10: duplicate/malformed run ids reject ---
+
+def test_rtc_review_duplicate_run_ids_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    review_show["runs"] = [make_review_run_for(state, run_id=10), make_review_run_for(state, run_id=10)]
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_run_selection_invalid"
+    assert "duplicate" in obj["reason"]
+
+
+@pytest.mark.parametrize("bad_id", [None, "10", True])
+def test_rtc_review_malformed_run_id_rejects(tmp_path, monkeypatch, capsys, bad_id):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    review_show["runs"][0]["id"] = bad_id
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_run_selection_invalid"
+
+
+# --- 11/12: stale latest implementation/review run rejects ---
+
+def test_rtc_stale_latest_implementation_run_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    good = impl_show["runs"][0]
+    stale = make_impl_run_for(id=99, status="running", outcome="in_progress")
+    impl_show["runs"] = [good, stale]
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] in (
+        "implementation_run_outcome_mismatch", "implementation_run_status_mismatch",
+        "implementation_run_profile_mismatch",
+    )
+
+
+def test_rtc_stale_latest_review_run_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    good = review_show["runs"][0]
+    stale = make_review_run_for(state, run_id=99, status="blocked")
+    review_show["runs"] = [good, stale]
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_run_status_mismatch"
+
+
+# --- 13/14/15/16: verdict classification ---
+
+def test_rtc_metadata_verdict_pass_authority(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    review_show["runs"][0]["summary"] = "narrative mentions CHANGES REQUIRED but is not authoritative"
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_OK
+    captured, obj = parse_rtc_success(capsys)
+    assert obj["verdict"] == "PASS"
+    assert obj["verdict_source"] == "metadata"
+
+
+def test_rtc_verdict_changes_required_blocks(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    review_show["runs"][0]["metadata"]["verdict"] = "CHANGES REQUIRED"
+    review_show["runs"][0]["summary"] = "CHANGES REQUIRED"
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "verdict_not_pass"
+    assert "CHANGES REQUIRED" in obj["reason"]
+
+
+def test_rtc_ambiguous_verdict_blocks(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    review_show["runs"][0]["metadata"] = make_review_metadata_for(state, verdict=None)
+    review_show["runs"][0]["summary"] = "no clear verdict here"
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "verdict_blocked"
+
+
+def test_rtc_invalid_metadata_verdict_blocks_even_with_pass_summary(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    review_show["runs"][0]["metadata"] = make_review_metadata_for(state, verdict="MAYBE")
+    review_show["runs"][0]["summary"] = "PASS"
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "verdict_blocked"
+    assert "invalid metadata verdict" in obj["reason"]
+
+
+# --- 17: parent mismatch ---
+
+def test_rtc_review_parent_mismatch_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    review_show["parents"] = ["t_wrongparent1"]
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_parents_mismatch"
+
+
+# --- 18: mutation_performed must be exactly False ---
+
+@pytest.mark.parametrize("bad_val", [True, "false", None, 0, 1])
+def test_rtc_mutation_performed_must_be_exact_false(tmp_path, monkeypatch, capsys, bad_val):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    review_show["runs"][0]["metadata"]["mutation_performed"] = bad_val
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_metadata_mutation_performed_invalid"
+
+
+def test_rtc_mutation_performed_missing_key_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    del review_show["runs"][0]["metadata"]["mutation_performed"]
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_metadata_mutation_performed_invalid"
+
+
+# --- 19: missing/malformed/tampered repository_state ---
+
+def test_rtc_repository_state_missing_key_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    del review_show["runs"][0]["metadata"]["repository_state"]
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_metadata_repository_state_shape"
+
+
+def test_rtc_repository_state_not_dict_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    review_show["runs"][0]["metadata"]["repository_state"] = "not-a-dict"
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_metadata_repository_state_shape"
+
+
+def test_rtc_repository_state_wrong_schema_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    bad_state = dict(state, schema="wrong/v9")
+    review_show["runs"][0]["metadata"]["repository_state"] = bad_state
+    review_show["runs"][0]["metadata"]["repository_state_sha256"] = state["aggregate_sha256"]
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_metadata_repository_state_schema_mismatch"
+
+
+def test_rtc_repository_state_workdir_mismatch_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    bad_state = dict(state, workdir="/opt/ai/projects/somewhere-else")
+    bad_state["aggregate_sha256"] = hpc._sha256_canonical_excluding(bad_state, "aggregate_sha256")
+    review_show["runs"][0]["metadata"]["repository_state"] = bad_state
+    review_show["runs"][0]["metadata"]["repository_state_sha256"] = bad_state["aggregate_sha256"]
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_metadata_repository_state_workdir_mismatch"
+
+
+def test_rtc_repository_state_aggregate_malformed_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    bad_state = dict(state, aggregate_sha256="not-hex")
+    review_show["runs"][0]["metadata"]["repository_state"] = bad_state
+    review_show["runs"][0]["metadata"]["repository_state_sha256"] = "not-hex"
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_metadata_repository_state_sha256_malformed"
+
+
+def test_rtc_repository_state_tampered_aggregate_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    bad_state = dict(state, head="f" * 40)
+    review_show["runs"][0]["metadata"]["repository_state"] = bad_state
+    review_show["runs"][0]["metadata"]["repository_state_sha256"] = bad_state["aggregate_sha256"]
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_metadata_repository_state_sha256_invalid"
+
+
+# --- 20: repository_state_sha256 duplicate mismatch ---
+
+def test_rtc_repository_state_sha256_duplicate_mismatch_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    review_show["runs"][0]["metadata"]["repository_state_sha256"] = "0" * 64
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_metadata_repository_state_sha256_mismatch"
+
+
+# --- 21: missing archive ---
+
+def test_rtc_archive_missing_directory_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    shutil.rmtree(Path(repo) / ".ai")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_archive_missing"
+
+
+def test_rtc_archive_empty_reviews_dir_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    (Path(repo) / ".ai" / "reviews" / RTC_ARCHIVE_FILENAME).unlink()
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_archive_ambiguous"
+
+
+# --- 22: multiple archives ---
+
+def test_rtc_multiple_archives_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    write_archive_artifact(repo, envelope, filename="20240102_020304-%s.md" % RTC_REVIEW_ID)
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_archive_ambiguous"
+
+
+# --- 23: nonregular archive (FIFO) ---
+
+def test_rtc_archive_fifo_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    artifact = Path(repo) / ".ai" / "reviews" / RTC_ARCHIVE_FILENAME
+    artifact.unlink()
+    os.mkfifo(artifact)
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_archive_not_regular"
+
+
+# --- 24: symlink archive ---
+
+def test_rtc_archive_symlink_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    reviews_dir = Path(repo) / ".ai" / "reviews"
+    artifact = reviews_dir / RTC_ARCHIVE_FILENAME
+    real_content = artifact.read_bytes()
+    artifact.unlink()
+    target = tmp_path / "outside_archive.md"
+    target.write_bytes(real_content)
+    artifact.symlink_to(target)
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_archive_not_regular"
+
+
+# --- 25: non-v2/historical archive ---
+
+def test_rtc_archive_historical_no_v2_block_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    artifact = Path(repo) / ".ai" / "reviews" / RTC_ARCHIVE_FILENAME
+    artifact.write_text("# legacy archive\n\nno machine-readable section here\n")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_archive_envelope_ambiguous"
+
+
+# --- 26: malformed v2 JSON ---
+
+def test_rtc_archive_malformed_json_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    artifact = Path(repo) / ".ai" / "reviews" / RTC_ARCHIVE_FILENAME
+    artifact.write_text("# archive\n\n```json\n{not valid json,,,\n```\n")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_archive_envelope_ambiguous"
+
+
+# --- 27: tampered archive_envelope_sha256 ---
+
+def test_rtc_archive_tampered_envelope_hash_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    tampered = dict(envelope, archive_envelope_sha256="0" * 64)
+    artifact = Path(repo) / ".ai" / "reviews" / RTC_ARCHIVE_FILENAME
+    artifact.write_text("# archive\n\n```json\n" + json.dumps(tampered, sort_keys=True) + "\n```\n")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_archive_envelope_sha256_mismatch"
+
+
+# --- 28: archive/Kanban identity mismatch ---
+
+def test_rtc_archive_review_task_id_field_mismatch_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    bad = dict(envelope)
+    bad["review_task_id"] = "t_wrongreview1"
+    bad["archive_envelope_sha256"] = hpc._sha256_canonical_excluding(bad, "archive_envelope_sha256")
+    artifact = Path(repo) / ".ai" / "reviews" / RTC_ARCHIVE_FILENAME
+    artifact.write_text("# archive\n\n```json\n" + json.dumps(bad, sort_keys=True) + "\n```\n")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_archive_envelope_mismatch"
+
+
+def test_rtc_archive_implementation_task_id_mismatch_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    bad = dict(envelope)
+    bad["implementation_task_id"] = "t_wrongimpl1"
+    bad["archive_envelope_sha256"] = hpc._sha256_canonical_excluding(bad, "archive_envelope_sha256")
+    artifact = Path(repo) / ".ai" / "reviews" / RTC_ARCHIVE_FILENAME
+    artifact.write_text("# archive\n\n```json\n" + json.dumps(bad, sort_keys=True) + "\n```\n")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_archive_envelope_mismatch"
+    assert "implementation_task_id" in obj["reason"]
+
+
+# --- 29: archive/review fingerprint mismatch ---
+
+def test_rtc_archive_repository_state_fingerprint_mismatch_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    other_state = dict(state, head="e" * 40)
+    other_state["aggregate_sha256"] = hpc._sha256_canonical_excluding(other_state, "aggregate_sha256")
+    bad = make_envelope_for(repo, other_state)
+    artifact = Path(repo) / ".ai" / "reviews" / RTC_ARCHIVE_FILENAME
+    artifact.write_text("# archive\n\n```json\n" + json.dumps(bad, sort_keys=True) + "\n```\n")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "review_archive_repository_state_mismatch"
+
+
+# --- 30: git diff --check failure ---
+
+def test_rtc_git_diff_check_failure_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    (Path(repo) / "README.md").write_text("hello world\nbad line with trailing space   \n")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "git_diff_check_failed"
+
+
+# --- 31: post-review HEAD change ---
+
+def test_rtc_post_review_head_change_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    (Path(repo) / "NOTES.md").write_text("notes\n")
+    _git(repo, "add", "NOTES.md")
+    _git(repo, "commit", "-q", "-m", "advance head after review")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "repository_state_mismatch_kanban"
+
+
+# --- 32: post-review changed-path/content change ---
+
+def test_rtc_post_review_content_change_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    (Path(repo) / "README.md").write_text("hello world\nan extra unstaged line\n")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "repository_state_mismatch_kanban"
+
+
+# --- 33: staging partition change ---
+
+def test_rtc_staging_partition_change_rejects(tmp_path, monkeypatch, capsys):
+    repo = make_rtc_repo(tmp_path, monkeypatch)
+    (Path(repo) / "README.md").write_text("hello world\nmodified before review\n")
+    state = capture_state(repo)
+    impl_show = make_impl_show_for(repo)
+    review_show = make_review_show_for(repo, state)
+    envelope = make_envelope_for(repo, state)
+    write_archive_artifact(repo, envelope)
+    _git(repo, "add", "README.md")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "repository_state_mismatch_kanban"
+
+
+# --- 34: untracked content/target change ---
+
+def test_rtc_untracked_content_change_rejects(tmp_path, monkeypatch, capsys):
+    repo = make_rtc_repo(tmp_path, monkeypatch)
+    (Path(repo) / "scratch.txt").write_text("original content\n")
+    state = capture_state(repo)
+    impl_show = make_impl_show_for(repo)
+    review_show = make_review_show_for(repo, state)
+    envelope = make_envelope_for(repo, state)
+    write_archive_artifact(repo, envelope)
+    (Path(repo) / "scratch.txt").write_text("changed content\n")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "repository_state_mismatch_kanban"
+
+
+# --- 35: unstable double repository capture ---
+
+def test_rtc_unstable_double_capture_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    run, calls = make_rtc_stub(impl_show, review_show)
+    real_capture_once = hpc._capture_repository_state_once
+    call_count = {"n": 0}
+
+    def flaky_capture(resolved_workdir, canonical_workdir):
+        call_count["n"] += 1
+        result = real_capture_once(resolved_workdir, canonical_workdir)
+        if call_count["n"] % 2 == 0:
+            result = dict(result, head="0" * 40)
+        return result
+
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run), \
+         mock.patch.object(hpc, "_capture_repository_state_once", side_effect=flaky_capture):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "repository_state_invalid"
+    assert "unstable" in obj["reason"]
+
+
+# --- 36: conflicts reject ---
+
+def test_rtc_merge_conflict_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (Path(repo) / "README.md").write_text("feature branch change\n")
+    _git(repo, "commit", "-q", "-am", "feature change")
+    _git(repo, "checkout", "-q", "-")
+    (Path(repo) / "README.md").write_text("main branch change\n")
+    _git(repo, "commit", "-q", "-am", "main change")
+    merge_result = REAL_SUBPROCESS_RUN(
+        ["git", "merge", "feature", "--no-edit"], cwd=str(repo), capture_output=True, text=True,
+    )
+    assert merge_result.returncode != 0
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    # `git diff --check` itself flags conflict markers, so the unresolved
+    # merge can be caught either by that gate or by the later conflict
+    # detection inside repository-state capture; both are fail-closed.
+    assert obj["reason_code"] in ("git_diff_check_failed", "repository_state_invalid")
+
+
+# --- 37: changed submodule reject ---
+
+def test_rtc_changed_submodule_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+
+    sub_src = tmp_path / "sub_source"
+    sub_src.mkdir()
+    _git(sub_src, "init", "-q")
+    _git(sub_src, "config", "user.email", "sub@example.com")
+    _git(sub_src, "config", "user.name", "Sub")
+    (sub_src / "f.txt").write_text("v1\n")
+    _git(sub_src, "add", "f.txt")
+    _git(sub_src, "commit", "-q", "-m", "sub v1")
+
+    add_result = REAL_SUBPROCESS_RUN(
+        ["git", "-c", "protocol.file.allow=always", "submodule", "add", str(sub_src), "sub"],
+        cwd=str(repo), capture_output=True, text=True,
+    )
+    assert add_result.returncode == 0, add_result.stderr
+    _git(repo, "commit", "-q", "-m", "add submodule")
+
+    sub_repo = Path(repo) / "sub"
+    _git(sub_repo, "config", "user.email", "sub@example.com")
+    _git(sub_repo, "config", "user.name", "Sub")
+    (sub_repo / "f.txt").write_text("v2\n")
+    _git(sub_repo, "commit", "-q", "-am", "sub v2")
+
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "repository_state_invalid"
+    assert "submodule" in obj["reason"]
+
+
+# --- 38: unsupported untracked special filesystem entry reject ---
+
+def test_rtc_untracked_special_entry_rejects(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    os.mkfifo(Path(repo) / "weird_fifo")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "repository_state_invalid"
+    assert "special filesystem entry" in obj["reason"]
+
+
+# --- 39/40: never archives, never creates Kanban tasks ---
+
+def test_rtc_never_invokes_archive_helper(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_OK
+    assert not any(c[:1] == [hpc.ARCHIVE_HELPER_PATH] for c in calls)
+
+
+def test_rtc_never_creates_kanban_tasks(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_OK
+    assert not any(c[:3] == ["hermes", "kanban", "create"] for c in calls)
+
+
+# --- 41: no prohibited Git mutation commands ---
+
+def test_rtc_no_prohibited_git_mutation_commands(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_OK
+    git_calls = [c for c in calls if c and c[0] == "git"]
+    assert git_calls
+    for argv in git_calls:
+        assert not any(token in PROHIBITED_GIT_SUBCOMMANDS for token in argv[1:]), argv
+
+
+# --- 42: no filesystem mutation attributable to ready-to-commit ---
+
+def test_rtc_no_filesystem_mutation(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    before = snapshot_worktree(repo)
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_OK
+    after = snapshot_worktree(repo)
+    assert after == before
+
+
+# --- 43: ready-to-commit never returns exit 4 ---
+
+def test_rtc_never_returns_exit_timeout(tmp_path, monkeypatch, capsys):
+    rc1 = hpc.main([
+        "ready-to-commit", "--workdir", "/tmp/not-allowed",
+        "--implementation_task_id", RTC_IMPL_ID, "--review_task_id", RTC_REVIEW_ID,
+    ])
+    assert rc1 != hpc.EXIT_TIMEOUT
+    capsys.readouterr()
+
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    rc2 = hpc.main([
+        "ready-to-commit", "--workdir", str(repo),
+        "--implementation_task_id", "!!", "--review_task_id", RTC_REVIEW_ID,
+    ])
+    assert rc2 != hpc.EXIT_TIMEOUT
+    capsys.readouterr()
+
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc3 = run_rtc(repo)
+    assert rc3 != hpc.EXIT_TIMEOUT
+
+
+# === A5.1: /.ai/reviews/ narrow ignore-scope integration regression tests ===
+#
+# make_rtc_repo() now git-ignores only the exact rooted path /.ai/reviews/
+# (not the broad .ai/) so a real review-archive artifact under .ai/reviews/
+# never becomes an untracked repository-state delta, while any other
+# unrelated untracked path — including elsewhere under .ai/ — still shows
+# up in repository-state/v1 and still blocks READY_TO_COMMIT.
+
+# --- a: state captured before archive creation is identical to state
+# captured after a valid archive is written beneath the ignored
+# .ai/reviews/ directory ---
+
+def test_a51_repository_state_identical_before_and_after_ignored_archive_write(tmp_path, monkeypatch):
+    repo = make_rtc_repo(tmp_path, monkeypatch)
+    state_before = capture_state(repo)
+    envelope = make_envelope_for(repo, state_before)
+    write_archive_artifact(repo, envelope)
+    state_after = capture_state(repo)
+    assert state_after == state_before
+
+
+# --- b: READY_TO_COMMIT happy path succeeds with the archive physically
+# present on disk under the ignored .ai/reviews/ directory ---
+
+def test_a51_ready_to_commit_succeeds_with_archive_physically_under_ignored_reviews_dir(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    archive_path = Path(repo) / ".ai" / "reviews" / RTC_ARCHIVE_FILENAME
+    assert archive_path.is_file()
+    status = _git(repo, "status", "--porcelain").stdout
+    assert ".ai" not in status
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_OK
+    captured, obj = parse_rtc_success(capsys)
+    assert obj["outcome"] == "ready"
+    assert obj["review_archived"] is True
+    assert obj["repository_state_sha256"] == state["aggregate_sha256"]
+
+
+# --- c: an unrelated untracked path outside .ai/reviews/ still changes
+# repository state and blocks READY_TO_COMMIT ---
+
+def test_a51_unrelated_untracked_path_outside_ai_blocks_ready_to_commit(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    (Path(repo) / "unexpected_top_level.txt").write_text("surprise\n")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "repository_state_mismatch_kanban"
+
+
+# --- d: an unrelated untracked path elsewhere under .ai/ (outside the
+# narrowly ignored .ai/reviews/) is NOT hidden and still blocks
+# READY_TO_COMMIT ---
+
+def test_a51_unrelated_untracked_path_under_ai_outside_reviews_blocks_ready_to_commit(tmp_path, monkeypatch, capsys):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    unexpected = Path(repo) / ".ai" / "unexpected.txt"
+    unexpected.parent.mkdir(parents=True, exist_ok=True)
+    unexpected.write_text("not a review archive\n")
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    captured, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == "repository_state_mismatch_kanban"

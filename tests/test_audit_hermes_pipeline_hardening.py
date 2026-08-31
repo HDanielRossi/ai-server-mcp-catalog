@@ -37,6 +37,11 @@ REPO_ONLY_FILES = [
     os.path.join("tests", "test_planner_bridge_template.py"),
     os.path.join("tests", "test_planner_bridge_wrapper.py"),
     os.path.join("docs", "hermes-pipeline.md"),
+    os.path.join("templates", "review_archive_bridge.py"),
+    os.path.join("tests", "test_review_archive_bridge_template.py"),
+    os.path.join("scripts", "hermes-pipeline-controller.py"),
+    os.path.join("tests", "test_hermes_pipeline_controller.py"),
+    ".gitignore",
 ]
 
 
@@ -448,11 +453,40 @@ def _suspicious_redirect(line):
 
 
 def test_script_source_has_no_file_write_redirection():
+    import re
+
     with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
         lines = f.readlines()
+
+    heredoc_end = None
+    heredoc_strip_tabs = False
+    heredoc_re = re.compile(
+        r"<<(-)?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
+    )
+
     for lineno, line in enumerate(lines, start=1):
+        if heredoc_end is not None:
+            candidate = line.rstrip("\r\n")
+            if heredoc_strip_tabs:
+                candidate = candidate.lstrip("\t")
+            if candidate == heredoc_end:
+                heredoc_end = None
+                heredoc_strip_tabs = False
+            continue
+
+        match = heredoc_re.search(line)
+        if match is not None:
+            heredoc_strip_tabs = match.group(1) == "-"
+            heredoc_end = next(
+                value
+                for value in match.groups()[1:]
+                if value is not None
+            )
+
         found = _suspicious_redirect(line)
-        assert found is None, f"possible file-write redirection at line {lineno}: {line!r}"
+        assert found is None, (
+            f"possible file-write redirection at line {lineno}: {line!r}"
+        )
 
 
 # 12) documentation accuracy.
@@ -616,3 +650,762 @@ def test_runtime_negative_reviewer_soul_missing_sequential_invariant(tmp_path):
     result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
     assert result.returncode == 1
     assert "reviewer_soul_missing_invariant:sequential_collects" in result.stdout
+
+
+# 14) A5 B3: repo-only hardening audit extensions covering the current A5
+# READY_TO_COMMIT contract: review_bridge repository-state/v1, the reviewer
+# SOUL A5 fingerprint requirement, review_archive_bridge hermes.review-archive/v2,
+# and the hermes-pipeline-controller.py ready-to-commit subcommand. Each
+# mutation below corrupts exactly one invariant on a copy of the current,
+# real repository file and asserts the audit fails closed with the specific
+# stable finding id; a shared positive test proves the unmodified repository
+# still passes all four new sections.
+
+def test_repo_only_a5_sections_pass_on_compliant_fixture(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 0
+    assert "PASS" in result.stdout
+    assert "satisfies repository-state/v1 hardening invariants (A5)" in result.stdout
+    assert "satisfies A5 repository-state fingerprint invariants" in result.stdout
+    assert "satisfies hermes.review-archive/v2 hardening invariants (A5)" in result.stdout
+    assert "satisfies ready-to-commit hardening invariants (A5)" in result.stdout
+
+
+# 14a) review_bridge repository-state/v1 hardening (templates/review_bridge_server.py).
+
+MUT_RB_SCHEMA_OLD = 'REPOSITORY_STATE_SCHEMA = "hermes.repository-state/v1"'
+MUT_RB_SCHEMA_NEW = 'REPOSITORY_STATE_SCHEMA = "hermes.repository-state/v0"'
+
+MUT_RB_CANONICAL_OLD = "canonical_workdir = os.path.realpath(str(resolved_workdir))"
+MUT_RB_CANONICAL_NEW = "canonical_workdir = str(resolved_workdir)"
+
+MUT_RB_HEAD_OLD = '_run_git_text(["git", "rev-parse", "HEAD"], resolved_workdir).strip()'
+MUT_RB_HEAD_NEW = '_run_git_text(["git", "show-ref", "HEAD"], resolved_workdir).strip()'
+
+MUT_RB_CHANGED_PATHS_OLD = "changed_paths = sorted(set(staged_paths) | set(unstaged_paths) | set(untracked_paths))"
+MUT_RB_CHANGED_PATHS_NEW = "changed_paths = sorted(staged_paths + unstaged_paths + untracked_paths)"
+
+MUT_RB_ENVELOPE_KEY_OLD = '"staged_patch_sha256": _sha256_bytes(staged_patch),\n'
+MUT_RB_ENVELOPE_KEY_NEW = ""
+
+MUT_RB_AGGREGATE_OLD = 'envelope["aggregate_sha256"] = _canonical_json_sha256(envelope)'
+MUT_RB_AGGREGATE_NEW = 'envelope["aggregate_digest"] = _canonical_json_sha256(envelope)'
+
+MUT_RB_DOUBLE_CAPTURE_OLD = "    second = _capture_repository_state_once(resolved_workdir, canonical_workdir)\n"
+MUT_RB_DOUBLE_CAPTURE_NEW = "    second = first\n"
+
+MUT_RB_STABILITY_OLD = (
+    "    if first != second:\n"
+    '        raise ReviewBridgeError("repository state changed between consecutive captures (unstable state)")\n'
+)
+MUT_RB_STABILITY_NEW = "    if first != second:\n        pass\n"
+
+MUT_RB_CONFLICT_OLD = (
+    "if code in CONFLICT_STATUS_CODES:\n"
+    '            raise ReviewBridgeError(f"unresolved merge conflict detected in git status: {line}")\n'
+)
+MUT_RB_CONFLICT_NEW = (
+    "if False:\n"
+    '            raise ReviewBridgeError(f"unresolved merge conflict detected in git status: {line}")\n'
+)
+
+MUT_RB_SUBMODULE_OLD = 'if fields and fields[0] == "160000":'
+MUT_RB_SUBMODULE_NEW = 'if fields and fields[0] == "999999":'
+
+MUT_RB_SPECIAL_ENTRY_OLD = (
+    "                if (\n"
+    "                    stat.S_ISREG(mode)\n"
+    "                    or stat.S_ISDIR(mode)\n"
+    "                    or stat.S_ISLNK(mode)\n"
+    "                ):\n"
+)
+MUT_RB_SPECIAL_ENTRY_NEW = (
+    "                if (\n"
+    "                    stat.S_ISREG(mode)\n"
+    "                    or stat.S_ISDIR(mode)\n"
+    "                ):\n"
+)
+
+MUT_RB_SHELL_OLD = (
+    "    try:\n"
+    "        completed = subprocess.run(\n"
+    "            argv,\n"
+    "            cwd=str(cwd),\n"
+    "            shell=False,\n"
+    "            capture_output=True,\n"
+    "            text=True,\n"
+    "            timeout=timeout,\n"
+    "            check=False,\n"
+    "        )\n"
+    "    except subprocess.TimeoutExpired:\n"
+)
+MUT_RB_SHELL_NEW = MUT_RB_SHELL_OLD.replace("shell=False,", "shell=True,")
+
+
+def _review_bridge_file(fixture):
+    return fixture / "templates" / "review_bridge_server.py"
+
+
+def test_repo_negative_review_bridge_schema_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_SCHEMA_OLD, MUT_RB_SCHEMA_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_schema_missing" in result.stdout
+
+
+def test_repo_negative_review_bridge_canonical_workdir_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_CANONICAL_OLD, MUT_RB_CANONICAL_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_canonical_workdir_missing" in result.stdout
+
+
+def test_repo_negative_review_bridge_head_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_HEAD_OLD, MUT_RB_HEAD_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_head_missing" in result.stdout
+
+
+def test_repo_negative_review_bridge_changed_paths_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_CHANGED_PATHS_OLD, MUT_RB_CHANGED_PATHS_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_changed_paths_missing" in result.stdout
+
+
+def test_repo_negative_review_bridge_envelope_key_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_ENVELOPE_KEY_OLD, MUT_RB_ENVELOPE_KEY_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_envelope_key_missing:staged_patch_sha256" in result.stdout
+
+
+def test_repo_negative_review_bridge_aggregate_sha256_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_AGGREGATE_OLD, MUT_RB_AGGREGATE_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_aggregate_sha256_missing" in result.stdout
+
+
+def test_repo_negative_review_bridge_double_capture_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_DOUBLE_CAPTURE_OLD, MUT_RB_DOUBLE_CAPTURE_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_double_capture_missing" in result.stdout
+
+
+def test_repo_negative_review_bridge_stability_check_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_STABILITY_OLD, MUT_RB_STABILITY_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_stability_check_missing" in result.stdout
+
+
+def test_repo_negative_review_bridge_conflict_rejection_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_CONFLICT_OLD, MUT_RB_CONFLICT_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_conflict_rejection_missing" in result.stdout
+
+
+def test_repo_negative_review_bridge_submodule_rejection_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_SUBMODULE_OLD, MUT_RB_SUBMODULE_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_submodule_rejection_missing" in result.stdout
+
+
+def test_repo_negative_review_bridge_special_entry_rejection_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_SPECIAL_ENTRY_OLD, MUT_RB_SPECIAL_ENTRY_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_special_entry_rejection_missing" in result.stdout
+
+
+def test_repo_negative_review_bridge_unbounded_or_shell_true_subprocess(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_bridge_file(fixture), MUT_RB_SHELL_OLD, MUT_RB_SHELL_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_bridge_repo_state_unbounded_or_shell_true_subprocess" in result.stdout
+
+
+# 14b) reviewer SOUL A5 repository-state fingerprint requirement
+# (templates/reviewer-SOUL.md).
+
+MUT_SOUL_A5_FINAL_COLLECT_OLD = "one final, successful collect(workdir) call"
+MUT_SOUL_A5_FINAL_COLLECT_NEW = "a final collect(workdir) call"
+
+MUT_SOUL_A5_SCOPE_PATHS_OLD = "scope_paths never substitutes for a fingerprint"
+MUT_SOUL_A5_SCOPE_PATHS_NEW = "scope_paths is optional documentation"
+
+
+def _reviewer_soul_file(fixture):
+    return fixture / "templates" / "reviewer-SOUL.md"
+
+
+def test_repo_negative_reviewer_soul_a5_final_collect_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_reviewer_soul_file(fixture), MUT_SOUL_A5_FINAL_COLLECT_OLD, MUT_SOUL_A5_FINAL_COLLECT_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "reviewer_soul_a5_missing_invariant:final_collect_required" in result.stdout
+
+
+def test_repo_negative_reviewer_soul_a5_scope_paths_substitute_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_reviewer_soul_file(fixture), MUT_SOUL_A5_SCOPE_PATHS_OLD, MUT_SOUL_A5_SCOPE_PATHS_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "reviewer_soul_a5_missing_invariant:scope_paths_no_substitute" in result.stdout
+
+
+# 14c) review_archive_bridge hermes.review-archive/v2 hardening
+# (templates/review_archive_bridge.py).
+
+MUT_ARC_SCHEMA_V2_OLD = 'REVIEW_ARCHIVE_SCHEMA_V2 = "hermes.review-archive/v2"'
+MUT_ARC_SCHEMA_V2_NEW = 'REVIEW_ARCHIVE_SCHEMA_V2 = "hermes.review-archive/v1"'
+
+MUT_ARC_TASKS_TABLE_OLD = '"SELECT * FROM tasks WHERE id=?",'
+MUT_ARC_TASKS_TABLE_NEW = '"SELECT * FROM items WHERE id=?",'
+
+MUT_ARC_GUESSED_RUNS_OLD = "        FROM task_runs\n"
+MUT_ARC_GUESSED_RUNS_NEW = "        FROM runs\n"
+
+MUT_ARC_GUESSED_TASK_PARENTS_OLD = "        FROM task_events\n"
+MUT_ARC_GUESSED_TASK_PARENTS_NEW = "        FROM task_parents\n"
+
+MUT_ARC_IDENTITY_OLD = (
+    '    if metadata.get("implementation_task_id") != parent:\n'
+    "        raise ArchiveValidationError(\n"
+    '            "latest run metadata implementation_task_id "\n'
+    '            "does not match task parent"\n'
+    "        )\n"
+)
+MUT_ARC_IDENTITY_NEW = "    pass\n"
+
+MUT_ARC_REPO_STATE_VALIDATION_OLD = (
+    "    recomputed = sha256_canonical_excluding(\n"
+    "        state,\n"
+    '        "aggregate_sha256",\n'
+    "    )\n"
+)
+MUT_ARC_REPO_STATE_VALIDATION_NEW = "    recomputed = aggregate\n"
+
+MUT_ARC_ENVELOPE_SHA_OLD = '    envelope["archive_envelope_sha256"] = (\n'
+MUT_ARC_ENVELOPE_SHA_NEW = '    envelope["archive_envelope_digest"] = (\n'
+
+MUT_ARC_AI_DIR_OLD = '    ai_dir = workdir / ".ai"\n'
+MUT_ARC_AI_DIR_NEW = '    ai_dir = workdir / ".ai_meta"\n'
+
+MUT_ARC_SYMLINK_OLD = (
+    "        if (\n"
+    "            not stat.S_ISREG(\n"
+    "                file_stat.st_mode\n"
+    "            )\n"
+    "            or artifact.is_symlink()\n"
+    "        ):\n"
+)
+MUT_ARC_SYMLINK_NEW = (
+    "        if (\n"
+    "            not stat.S_ISREG(\n"
+    "                file_stat.st_mode\n"
+    "            )\n"
+    "        ):\n"
+)
+
+MUT_ARC_READONLY_OLD = '            f"file:{db_path}?mode=ro",\n'
+MUT_ARC_READONLY_NEW = '            f"file:{db_path}",\n'
+
+MUT_ARC_SHELL_OLD = "            check=False,\n            shell=False,\n            timeout=GIT_TIMEOUT_SECONDS,\n"
+MUT_ARC_SHELL_NEW = "            check=False,\n            shell=True,\n            timeout=GIT_TIMEOUT_SECONDS,\n"
+
+MUT_ARC_GIT_MUTATION_OLD = '["status", "--short"]'
+MUT_ARC_GIT_MUTATION_NEW = '["commit", "-am", "wip"]'
+
+
+def _review_archive_file(fixture):
+    return fixture / "templates" / "review_archive_bridge.py"
+
+
+def test_repo_negative_review_archive_schema_v2_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_SCHEMA_V2_OLD, MUT_ARC_SCHEMA_V2_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_schema_missing" in result.stdout
+
+
+def test_repo_negative_review_archive_tasks_table_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_TASKS_TABLE_OLD, MUT_ARC_TASKS_TABLE_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_tasks_table_missing" in result.stdout
+
+
+def test_repo_negative_review_archive_guessed_runs_table_present(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_GUESSED_RUNS_OLD, MUT_ARC_GUESSED_RUNS_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_guessed_runs_table_present" in result.stdout
+
+
+def test_repo_negative_review_archive_guessed_task_parents_table_present(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_GUESSED_TASK_PARENTS_OLD, MUT_ARC_GUESSED_TASK_PARENTS_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_guessed_task_parents_table_present" in result.stdout
+
+
+def test_repo_negative_review_archive_implementation_identity_check_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_IDENTITY_OLD, MUT_ARC_IDENTITY_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_implementation_identity_check_missing" in result.stdout
+
+
+def test_repo_negative_review_archive_repository_state_validation_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_REPO_STATE_VALIDATION_OLD, MUT_ARC_REPO_STATE_VALIDATION_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_repository_state_validation_missing" in result.stdout
+
+
+def test_repo_negative_review_archive_envelope_sha256_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_ENVELOPE_SHA_OLD, MUT_ARC_ENVELOPE_SHA_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_archive_envelope_sha256_missing" in result.stdout
+
+
+def test_repo_negative_review_archive_ai_reviews_path_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_AI_DIR_OLD, MUT_ARC_AI_DIR_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_ai_reviews_path_missing" in result.stdout
+
+
+def test_repo_negative_review_archive_symlink_or_nonregular_check_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_SYMLINK_OLD, MUT_ARC_SYMLINK_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_symlink_or_nonregular_check_missing" in result.stdout
+
+
+def test_repo_negative_review_archive_readonly_kanban_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_READONLY_OLD, MUT_ARC_READONLY_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_readonly_kanban_missing" in result.stdout
+
+
+def test_repo_negative_review_archive_shell_false_subprocess_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_SHELL_OLD, MUT_ARC_SHELL_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_shell_false_subprocess_missing" in result.stdout
+
+
+def test_repo_negative_review_archive_git_mutation_command_present(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_review_archive_file(fixture), MUT_ARC_GIT_MUTATION_OLD, MUT_ARC_GIT_MUTATION_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "review_archive_v2_git_mutation_command_present:commit" in result.stdout
+
+
+# 14d) hermes-pipeline-controller.py ready-to-commit hardening
+# (scripts/hermes-pipeline-controller.py).
+
+MUT_PC_PARSER_OLD = 'ready_p = subparsers.add_parser(\n        "ready-to-commit", prog="ready-to-commit",\n'
+MUT_PC_PARSER_NEW = 'ready_p = subparsers.add_parser(\n        "readytocommit", prog="ready-to-commit",\n'
+
+MUT_PC_FLAGS_OLD = 'ready_p.add_argument("--review_task_id", required=True)'
+MUT_PC_FLAGS_NEW = 'ready_p.add_argument("--review_task_id", required=False)'
+
+MUT_PC_SUCCESS_MARKER_OLD = '"phase": "ready-to-commit",\n        "outcome": "ready",\n'
+MUT_PC_SUCCESS_MARKER_NEW = '"phase": "ready-to-commit",\n        "outcome": "ok",\n'
+
+MUT_PC_REJECT_MARKER_OLD = '"phase": "ready-to-commit",\n        "outcome": "not-ready",\n'
+MUT_PC_REJECT_MARKER_NEW = '"phase": "ready-to-commit",\n        "outcome": "rejected",\n'
+
+MUT_PC_HUMAN_APPROVAL_READY_OLD = (
+    '"repository_state_sha256": current_state["aggregate_sha256"],\n        "human_approval_required": True,\n'
+)
+MUT_PC_HUMAN_APPROVAL_READY_NEW = (
+    '"repository_state_sha256": current_state["aggregate_sha256"],\n        "human_approval_required": False,\n'
+)
+
+MUT_PC_COMMIT_PERFORMED_REJECT_OLD = (
+    '"reason": reason,\n        "human_approval_required": True,\n        "commit_performed": False,\n'
+)
+MUT_PC_COMMIT_PERFORMED_REJECT_NEW = (
+    '"reason": reason,\n        "human_approval_required": True,\n        "commit_performed": True,\n'
+)
+
+MUT_PC_PUSH_PERFORMED_READY_OLD = (
+    '"commit_performed": False,\n        "push_performed": False,\n    }\n'
+    '    print(json.dumps(payload, separators=(",", ":")))\n    return EXIT_OK\n'
+)
+MUT_PC_PUSH_PERFORMED_READY_NEW = (
+    '"commit_performed": False,\n        "push_performed": True,\n    }\n'
+    '    print(json.dumps(payload, separators=(",", ":")))\n    return EXIT_OK\n'
+)
+
+MUT_PC_REPO_STATE_SCHEMA_OLD = 'REPOSITORY_STATE_SCHEMA = "hermes.repository-state/v1"'
+MUT_PC_REPO_STATE_SCHEMA_NEW = 'REPOSITORY_STATE_SCHEMA = "hermes.repository-state/v0"'
+
+MUT_PC_ARCHIVE_V2_SCHEMA_OLD = 'REVIEW_ARCHIVE_SCHEMA_V2 = "hermes.review-archive/v2"'
+MUT_PC_ARCHIVE_V2_SCHEMA_NEW = 'REVIEW_ARCHIVE_SCHEMA_V2 = "hermes.review-archive/v1"'
+
+MUT_PC_DOUBLE_CAPTURE_OLD = "    second = _capture_repository_state_once(resolved_workdir, canonical_workdir)\n"
+MUT_PC_DOUBLE_CAPTURE_NEW = "    second = first\n"
+
+MUT_PC_STABILITY_OLD = (
+    "    if first != second:\n"
+    '        raise RepositoryStateError("repository state changed between consecutive captures (unstable state)")\n'
+)
+MUT_PC_STABILITY_NEW = "    if first != second:\n        pass\n"
+
+MUT_PC_FINGERPRINT_OLD = (
+    '    if current_state != envelope.get("repository_state"):\n'
+    "        raise ReadyToCommitReject(\n"
+    '            "repository_state_mismatch_archive",\n'
+    '            "current repository_state does not match the archived review artifact repository_state",\n'
+    "        )\n"
+)
+MUT_PC_FINGERPRINT_NEW = "    pass\n"
+
+MUT_PC_DIFF_CHECK_OLD = '["git", "diff", "--check"], cwd=str(resolved_workdir), shell=False,'
+MUT_PC_DIFF_CHECK_NEW = '["git", "diff", "--stat"], cwd=str(resolved_workdir), shell=False,'
+
+MUT_PC_SHELL_BOUND_OLD = (
+    '["git", "diff", "--check"], cwd=str(resolved_workdir), shell=False,\n'
+    "            capture_output=True, text=True, timeout=GIT_DIFF_CHECK_TIMEOUT_SECONDS,\n"
+)
+MUT_PC_SHELL_BOUND_NEW = (
+    '["git", "diff", "--check"], cwd=str(resolved_workdir), shell=True,\n'
+    "            capture_output=True, text=True, timeout=GIT_DIFF_CHECK_TIMEOUT_SECONDS,\n"
+)
+
+MUT_PC_READY_PAYLOAD_ANCHOR_OLD = '    payload = {\n        "phase": "ready-to-commit",\n        "outcome": "ready",\n'
+MUT_PC_ARCHIVE_HELPER_INSERT_NEW = (
+    "    _unused_helper_path = ARCHIVE_HELPER_PATH\n" + MUT_PC_READY_PAYLOAD_ANCHOR_OLD
+)
+MUT_PC_KANBAN_CREATE_INSERT_NEW = (
+    '    _unused_kanban_create = ["hermes", "kanban", "create"]\n' + MUT_PC_READY_PAYLOAD_ANCHOR_OLD
+)
+MUT_PC_FORBIDDEN_CALL_INSERT_NEW = "    archive_review(args)\n" + MUT_PC_READY_PAYLOAD_ANCHOR_OLD
+MUT_PC_GIT_MUTATION_INSERT_NEW = (
+    '    _unused_git_add = ["git", "add", "-A"]\n' + MUT_PC_READY_PAYLOAD_ANCHOR_OLD
+)
+MUT_PC_EXIT4_INSERT_NEW = "    if False:\n        return EXIT_TIMEOUT\n" + MUT_PC_READY_PAYLOAD_ANCHOR_OLD
+
+MUT_PC_REJECT_EXIT_OLD = (
+    "    except ReadyToCommitReject as exc:\n"
+    "        _emit_ready_to_commit_reject(args, exc.reason_code, exc.reason)\n"
+    "        return EXIT_VALIDATION\n"
+)
+MUT_PC_REJECT_EXIT_NEW = (
+    "    except ReadyToCommitReject as exc:\n"
+    "        _emit_ready_to_commit_reject(args, exc.reason_code, exc.reason)\n"
+    "        return EXIT_TRANSPORT\n"
+)
+
+MUT_PC_TRANSPORT_EXIT_OLD = (
+    "    except OSError as exc:\n"
+    '        sys.stderr.write("transport error: failed to launch hermes: " + str(exc) + "\\n")\n'
+    "        return EXIT_TRANSPORT\n"
+    "    except CliUsageError as exc:\n"
+    '        sys.stderr.write("usage error: " + str(exc) + "\\n")\n'
+    "        return EXIT_TRANSPORT\n"
+)
+MUT_PC_TRANSPORT_EXIT_NEW = (
+    "    except OSError as exc:\n"
+    '        sys.stderr.write("transport error: failed to launch hermes: " + str(exc) + "\\n")\n'
+    "        return EXIT_TRANSPORT\n"
+    "    except CliUsageError as exc:\n"
+    '        sys.stderr.write("usage error: " + str(exc) + "\\n")\n'
+    "        return EXIT_VALIDATION\n"
+)
+
+
+def _pipeline_controller_file(fixture):
+    return fixture / "scripts" / "hermes-pipeline-controller.py"
+
+
+def test_repo_negative_pipeline_controller_parser_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_PARSER_OLD, MUT_PC_PARSER_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_parser_missing" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_flags_mismatch(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_FLAGS_OLD, MUT_PC_FLAGS_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_flags_mismatch" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_success_marker_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_SUCCESS_MARKER_OLD, MUT_PC_SUCCESS_MARKER_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_success_marker_missing" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_reject_marker_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_REJECT_MARKER_OLD, MUT_PC_REJECT_MARKER_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_reject_marker_missing" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_human_approval_required_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_HUMAN_APPROVAL_READY_OLD, MUT_PC_HUMAN_APPROVAL_READY_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_human_approval_required_missing:ready" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_commit_performed_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(
+        _pipeline_controller_file(fixture), MUT_PC_COMMIT_PERFORMED_REJECT_OLD, MUT_PC_COMMIT_PERFORMED_REJECT_NEW
+    )
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_commit_performed_missing:reject" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_push_performed_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_PUSH_PERFORMED_READY_OLD, MUT_PC_PUSH_PERFORMED_READY_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_push_performed_missing:ready" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_repo_state_schema_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_REPO_STATE_SCHEMA_OLD, MUT_PC_REPO_STATE_SCHEMA_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_repo_state_schema_missing" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_archive_v2_schema_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_ARCHIVE_V2_SCHEMA_OLD, MUT_PC_ARCHIVE_V2_SCHEMA_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_archive_v2_schema_missing" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_double_capture_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_DOUBLE_CAPTURE_OLD, MUT_PC_DOUBLE_CAPTURE_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_double_capture_missing" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_stability_check_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_STABILITY_OLD, MUT_PC_STABILITY_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_stability_check_missing" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_fingerprint_equality_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_FINGERPRINT_OLD, MUT_PC_FINGERPRINT_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_fingerprint_equality_missing" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_git_diff_check_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_DIFF_CHECK_OLD, MUT_PC_DIFF_CHECK_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_git_diff_check_missing" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_unbounded_or_shell_true_subprocess(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_SHELL_BOUND_OLD, MUT_PC_SHELL_BOUND_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_unbounded_or_shell_true_subprocess" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_archive_helper_invocation_present(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(
+        _pipeline_controller_file(fixture), MUT_PC_READY_PAYLOAD_ANCHOR_OLD, MUT_PC_ARCHIVE_HELPER_INSERT_NEW
+    )
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_archive_helper_invocation_present" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_kanban_create_invocation_present(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_READY_PAYLOAD_ANCHOR_OLD, MUT_PC_KANBAN_CREATE_INSERT_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_kanban_create_invocation_present" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_forbidden_mutation_call_present(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_READY_PAYLOAD_ANCHOR_OLD, MUT_PC_FORBIDDEN_CALL_INSERT_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_forbidden_mutation_call:archive_review" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_git_mutation_command_present(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_READY_PAYLOAD_ANCHOR_OLD, MUT_PC_GIT_MUTATION_INSERT_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_git_mutation_command_present:add" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_exit4_path_present(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_READY_PAYLOAD_ANCHOR_OLD, MUT_PC_EXIT4_INSERT_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_exit4_path_present" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_reject_exit_code_wrong(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_REJECT_EXIT_OLD, MUT_PC_REJECT_EXIT_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_reject_exit_code_wrong" in result.stdout
+
+
+def test_repo_negative_pipeline_controller_usage_transport_exit_code_wrong(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_pipeline_controller_file(fixture), MUT_PC_TRANSPORT_EXIT_OLD, MUT_PC_TRANSPORT_EXIT_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "ready_to_commit_usage_transport_exit_code_wrong" in result.stdout
+
+
+# 14b) A5.1 /.ai/reviews/ narrow ignore-scope integration invariant.
+
+def _gitignore_file(fixture):
+    return fixture / ".gitignore"
+
+
+def _controller_test_file(fixture):
+    return fixture / "tests" / "test_hermes_pipeline_controller.py"
+
+
+MUT_A51_GITIGNORE_REMOVE_OLD = "/.ai/reviews/\n"
+MUT_A51_GITIGNORE_REMOVE_NEW = ""
+
+MUT_A51_GITIGNORE_BROAD_DOT_AI_OLD = "/.ai/reviews/\n"
+MUT_A51_GITIGNORE_BROAD_DOT_AI_NEW = ".ai/\n"
+
+MUT_A51_GITIGNORE_BROAD_ROOTED_DOT_AI_OLD = "/.ai/reviews/\n"
+MUT_A51_GITIGNORE_BROAD_ROOTED_DOT_AI_NEW = "/.ai/\n"
+
+MUT_A51_CONTROLLER_FIXTURE_REGRESS_OLD = '(repo / ".gitignore").write_text("/.ai/reviews/\\n")'
+MUT_A51_CONTROLLER_FIXTURE_REGRESS_NEW = '(repo / ".gitignore").write_text(".ai/\\n")'
+
+
+def test_repo_only_a51_section_passes_on_compliant_fixture(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 0
+    assert "PASS" in result.stdout
+    assert ".gitignore contains the exact rooted rule: /.ai/reviews/" in result.stdout
+    assert "controller test fixture (make_rtc_repo) uses the narrow /.ai/reviews/ ignore rule" in result.stdout
+    assert (
+        "controller tests cover an unrelated untracked path elsewhere under .ai/ "
+        "still blocking READY_TO_COMMIT" in result.stdout
+    )
+
+
+def test_repo_negative_a51_gitignore_missing_rooted_reviews_rule(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_gitignore_file(fixture), MUT_A51_GITIGNORE_REMOVE_OLD, MUT_A51_GITIGNORE_REMOVE_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert ".gitignore missing the exact rooted rule: /.ai/reviews/" in result.stdout
+
+
+def test_repo_negative_a51_gitignore_replaced_with_broad_dot_ai(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(_gitignore_file(fixture), MUT_A51_GITIGNORE_BROAD_DOT_AI_OLD, MUT_A51_GITIGNORE_BROAD_DOT_AI_NEW)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert ".gitignore missing the exact rooted rule: /.ai/reviews/" in result.stdout
+    assert ".gitignore must not rely on the overly broad ignore rule: .ai/" in result.stdout
+
+
+def test_repo_negative_a51_gitignore_replaced_with_broad_rooted_dot_ai(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(
+        _gitignore_file(fixture), MUT_A51_GITIGNORE_BROAD_ROOTED_DOT_AI_OLD, MUT_A51_GITIGNORE_BROAD_ROOTED_DOT_AI_NEW
+    )
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert ".gitignore missing the exact rooted rule: /.ai/reviews/" in result.stdout
+    assert ".gitignore must not rely on the overly broad ignore rule: /.ai/" in result.stdout
+
+
+def test_repo_negative_a51_controller_fixture_regresses_to_broad_dot_ai(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _mutate_file(
+        _controller_test_file(fixture),
+        MUT_A51_CONTROLLER_FIXTURE_REGRESS_OLD,
+        MUT_A51_CONTROLLER_FIXTURE_REGRESS_NEW,
+    )
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert (
+        "controller test fixture (make_rtc_repo) must use the narrow /.ai/reviews/ ignore rule, "
+        "not a broad .ai/ rule" in result.stdout
+    )
+    assert (
+        "controller test fixture (make_rtc_repo) must not regress to the broad .ai/ ignore rule" in result.stdout
+    )
