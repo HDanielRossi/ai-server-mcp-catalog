@@ -204,3 +204,91 @@ The human operator commits only after implementation completion, final review PA
 The controller remains the sole policy authority — workdir policy, Kanban validation, verdict classification, correction policy, repository-state/v1, archive validation, and READY_TO_COMMIT policy are all implemented exclusively in the controller, never in the adapter. `archive_review` and `ready_to_commit` remain separate, explicit operations; the adapter never chains one into the other, and READY_TO_COMMIT remains a technical, read-only attestation — it never infers or grants human commit/push approval.
 
 A6 is repository-only: this task performs no live deployment, installation, or configuration change. Exposing the MCP adapter at a live path and wiring it into a profile's tool configuration is a separate, human-authorized rollout performed later by the operator, after review PASS. See "A6" in `docs/hermes-pipeline.md` for the full contract.
+
+## A7 production `pipeline_controller` runtime boundary
+
+A7 does not change the production repository's human commit/push policy. It adds a controlled future runtime exposure path for the seven-tool `pipeline-controller` MCP façade.
+
+### Phase boundary
+
+Treat these as separate gates:
+
+1. **A7.1 repository-only hardening** — audit/tests/docs only; no live installation.
+2. **A7.2 final repository review/release gate** — reviewer PASS, matching `hermes.review-archive/v2`, successful `ready-to-commit`, then separate human commit and push approvals.
+3. **A7.3 operator runtime rollout** — a new, separately human-authorized host operation after the repository release gate.
+
+Repository audit PASS or READY_TO_COMMIT never authorizes runtime installation.
+
+### Required future live layout
+
+The accepted A7.3 paths are:
+
+```text
+/usr/local/bin/hermes-pipeline-controller
+/usr/local/lib/pipeline-controller-mcp/server.py
+/usr/local/lib/pipeline-controller-mcp/.venv/
+```
+
+Do not install the adapter under `/usr/local/lib/pipeline-bridge-mcp/`.
+
+The installed controller and adapter must have exact SHA-256 parity with the reviewed repository sources. The dedicated `.venv` must contain a non-empty `pyvenv.cfg` and an executable `bin/python3` or `bin/python`.
+
+### Default-only registration
+
+The Hermes registration key is `pipeline_controller`, as an immediate child of the top-level `mcp_servers` mapping:
+
+```yaml
+mcp_servers:
+  pipeline_controller:
+    ...
+```
+
+Only the default/global profile may register it.
+
+It must remain absent from:
+
+- `reviewer`
+- `coder`
+- `coder-claude`
+- `planner-codex`
+- `sysadmin`
+
+`sysadmin` may execute an explicitly human-authorized rollout as an operator action, but it must not receive the pipeline orchestration MCP itself.
+
+Unrelated existing `mcp_servers` entries must be preserved.
+
+### Tool and approval boundary
+
+The installed adapter exposes exactly:
+
+```text
+check_task
+create_implementation
+create_review
+create_correction
+wait_task
+archive_review
+ready_to_commit
+```
+
+No additional tool is allowed. No `commit*` or `push*` tool is allowed.
+
+`ready_to_commit` remains read-only technical attestation. Successful READY_TO_COMMIT still requires explicit human commit approval, followed by a separate explicit human push approval before push.
+
+### Operator rollout checklist
+
+Before any A7.3 mutation:
+
+- capture backups sufficient to restore every pre-existing target byte-for-byte;
+- verify the reviewed repository state is the intended rollout source;
+- keep `pipeline-controller` out of the `pipeline-bridge` ownership path;
+- install the controller, dedicated adapter, and dedicated `.venv`;
+- register `pipeline_controller` only in the default/global profile;
+- run `scripts/audit-hermes-pipeline-hardening.sh --runtime` or `--all`;
+- verify source/runtime SHA-256 parity;
+- verify the exact seven-tool roster and no commit/push capability;
+- perform bounded read-only MCP discovery/smoke probes without creating Kanban tasks solely for smoke testing;
+- restart the Hermes gateway only if required and separately human-authorized;
+- on failure, restore the captured pre-rollout state.
+
+A7.3 runtime rollout is not part of ordinary repository onboarding and must never be inferred from a repository task's PASS result.

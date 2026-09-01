@@ -137,3 +137,90 @@ When the pipeline is driven through the `pipeline-controller` MCP server (`templ
 - `archive_review` and `ready_to_commit` remain separate, explicit operations — the adapter never chains one into the other.
 - `ready_to_commit` remains strictly read-only technical attestation through the MCP adapter exactly as through the CLI: it never stages, commits, pushes, or infers human approval.
 - Runtime exposure of the MCP adapter (installing and wiring it into a live profile) is a separate, human-authorized step outside of this repository contract.
+
+## A7 `pipeline_controller` runtime exposure boundary
+
+Use of the `pipeline-controller` MCP does not authorize live deployment, commit, or push.
+
+The A7 lifecycle is deliberately separated:
+
+1. **A7.1 — repository-only hardening and verification.**
+2. **A7.2 — final read-only review, matching `hermes.review-archive/v2`, successful `ready-to-commit`, then explicit human commit and push approvals.**
+3. **A7.3 — separate human-authorized runtime rollout.**
+
+Completion of A7.1 or A7.2 never implicitly authorizes A7.3.
+
+### Future runtime ownership
+
+If this environment later exposes `pipeline-controller`, the accepted runtime ownership is:
+
+```text
+/usr/local/bin/hermes-pipeline-controller
+/usr/local/lib/pipeline-controller-mcp/server.py
+/usr/local/lib/pipeline-controller-mcp/.venv/
+```
+
+The adapter must not be installed in `/usr/local/lib/pipeline-bridge-mcp/`.
+
+The installed adapter and controller must preserve exact SHA-256 parity with their reviewed repository sources.
+
+The dedicated `.venv` must contain:
+
+- a non-empty `.venv/pyvenv.cfg`;
+- an executable `.venv/bin/python3` or `.venv/bin/python`.
+
+### Exact MCP surface
+
+The MCP server identity is `pipeline-controller`. The Hermes registration key is `pipeline_controller`.
+
+The only authorized MCP tools are:
+
+- `check_task`
+- `create_implementation`
+- `create_review`
+- `create_correction`
+- `wait_task`
+- `archive_review`
+- `ready_to_commit`
+
+No additional tool is authorized. No `commit*`, `push*`, staging, arbitrary argv, executable, command, or shell capability is authorized.
+
+### Default-only privilege rule
+
+`pipeline_controller` may be registered only as an immediate child of the default/global top-level `mcp_servers` mapping:
+
+```yaml
+mcp_servers:
+  pipeline_controller:
+    ...
+```
+
+It must not be registered in these Hermes profiles:
+
+- `reviewer`
+- `coder`
+- `coder-claude`
+- `planner-codex`
+- `sysadmin`
+
+A top-level occurrence outside `mcp_servers` or a nested occurrence below another MCP entry does not satisfy the registration contract.
+
+Other legitimate MCP registrations remain permitted and must not be removed solely to satisfy this rule.
+
+`sysadmin` may perform a separately human-authorized host rollout as an operator action, but it must not receive the pipeline orchestration MCP itself.
+
+### Human authorization remains mandatory
+
+A successful `ready_to_commit` result is technical attestation only and must preserve the equivalent of:
+
+- `human_approval_required=true`
+- `commit_performed=false`
+- `push_performed=false`
+
+Commit requires explicit human authorization after READY_TO_COMMIT succeeds.
+
+Push requires a second, separate explicit human authorization. Commit authorization never implies push authorization.
+
+Runtime installation is also a distinct human-authorized operation. Repository review or commit approval never silently authorizes A7.3 deployment.
+
+Before any A7.3 live mutation, the operator must preserve enough pre-rollout state to restore replaced runtime/configuration targets byte-for-byte if validation fails.

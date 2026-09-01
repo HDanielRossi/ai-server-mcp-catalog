@@ -1194,3 +1194,102 @@ The adapter exposes no commit, push, or staging capability of any kind. `archive
 ### Deployment boundary
 
 A6 is repository-only: no live deployment, installation, or configuration change occurs as part of this task. Exposing `pipeline_controller_server.py` as a running MCP server (installing it at a live path, wiring it into a profile's tool config, etc.) is a separate, human-authorized rollout performed later by the operator, after review PASS.
+
+## A7 — `pipeline-controller` MCP future-runtime rollout
+
+A7 promotes the repository-only A6 façade toward a future production runtime without weakening the controller, review, READY_TO_COMMIT, or human-approval boundaries.
+
+The lifecycle is deliberately split:
+
+1. **A7.1 — repository-only rollout hardening.** Audit logic, hermetic tests, and documentation define and verify the runtime contract. No live install, profile mutation, service restart, commit, or push occurs.
+2. **A7.2 — repository release gate.** The complete A7.1 state receives final read-only reviewer PASS, matching `hermes.review-archive/v2`, and successful `ready-to-commit`. Commit and push remain separate explicit human approvals.
+3. **A7.3 — human-authorized runtime rollout.** Only after A7.2 may an operator install and expose the runtime.
+
+### Future runtime ownership
+
+The accepted A7.3 layout is:
+
+```text
+/usr/local/bin/hermes-pipeline-controller
+/usr/local/lib/pipeline-controller-mcp/server.py
+/usr/local/lib/pipeline-controller-mcp/.venv/
+```
+
+The dedicated `.venv` must contain a non-empty `pyvenv.cfg` and an executable `bin/python3` or `bin/python`.
+
+`pipeline-controller` must never be installed at `/usr/local/lib/pipeline-bridge-mcp/server.py`; that location belongs to the separate `pipeline-bridge` MCP. Runtime audit rejects a pipeline-controller adapter there by exact SHA-256 match or structural `MCPServer("pipeline-controller")` identity, and fails closed when an existing bridge file's MCP identity cannot be determined.
+
+### Source/runtime parity and tool surface
+
+A future installation must preserve exact SHA-256 parity:
+
+- `templates/pipeline_controller_server.py` == `/usr/local/lib/pipeline-controller-mcp/server.py`
+- `scripts/hermes-pipeline-controller.py` == `/usr/local/bin/hermes-pipeline-controller`
+
+The runtime adapter exposes exactly:
+
+- `check_task`
+- `create_implementation`
+- `create_review`
+- `create_correction`
+- `wait_task`
+- `archive_review`
+- `ready_to_commit`
+
+No eighth tool is allowed. No `commit*` or `push*` tool is allowed. There is no staging, arbitrary argv, executable, command, or shell façade. `ready_to_commit` remains the A5 read-only technical attestation and never authorizes or performs commit or push.
+
+### Default-only registration boundary
+
+The MCP server identity is `pipeline-controller` (hyphen). Its Hermes registration key is `pipeline_controller` (underscore).
+
+The valid registration shape is:
+
+```yaml
+mcp_servers:
+  pipeline_controller:
+    ...
+```
+
+`pipeline_controller` must be an immediate child of the top-level `mcp_servers` mapping. A top-level occurrence outside `mcp_servers`, an occurrence nested beneath another child, a comment, or a substring does not count.
+
+Only the default/global profile may register this orchestration MCP. It must remain absent from:
+
+- `reviewer`
+- `coder`
+- `coder-claude`
+- `planner-codex`
+- `sysadmin`
+
+`sysadmin` may separately execute a human-authorized host rollout as an operator action, but it must not receive the pipeline orchestration MCP itself. Unrelated legitimate MCP registrations under `mcp_servers` remain permitted.
+
+### A7 audit contract
+
+`scripts/audit-hermes-pipeline-hardening.sh` enforces this contract fail-closed:
+
+- `--repo-only` checks repository-side A7 invariants without requiring an A7.3 runtime.
+- `--runtime` checks the dedicated adapter, controller binary, dedicated `.venv`, SHA-256 parity, exact tool roster, pipeline-bridge isolation, and default-only registration.
+- `--all` runs both suites and fails if either fails.
+- `AUDIT_RUNTIME_ROOT` redirects the same runtime checks into a hermetic fixture tree; A7 runtime checks are not skipped merely because a fixture root is used.
+
+A repository-only PASS does not mean the runtime is installed.
+
+### A7.2 and A7.3 human boundary
+
+A7.2 preserves the A5 sequence:
+
+```text
+final implementation state
+→ final read-only reviewer PASS
+→ hermes.review-archive/v2
+→ ready-to-commit returns ready
+→ explicit human commit approval
+→ commit
+→ separate explicit human push approval
+→ push
+```
+
+A7.3 is a separate operational mutation and is not implicitly authorized by A7.1, A7.2, READY_TO_COMMIT, or commit approval.
+
+Before A7.3 changes live state, the operator must capture enough pre-rollout state to restore every replaced runtime/configuration target byte-for-byte. The rollout must install the trusted controller, the dedicated adapter, and its dedicated `.venv`; register `pipeline_controller` only in the default/global `mcp_servers`; preserve the forbidden-profile boundary; verify source/runtime SHA-256 parity and the exact seven-tool roster; perform bounded read-only MCP discovery/smoke probes without creating Kanban tasks merely for smoke testing; and restart the Hermes gateway only if actually required and separately human-authorized.
+
+If validation fails, rollback restores the captured pre-rollout state. A7.3 never installs the adapter under `/usr/local/lib/pipeline-bridge-mcp/`.

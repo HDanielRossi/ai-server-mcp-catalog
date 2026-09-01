@@ -12,6 +12,7 @@ the script itself under an AUDIT_RUNTIME_ROOT override, so no real Hermes
 installation is ever required.
 """
 
+import hashlib
 import os
 import shutil
 import stat
@@ -23,6 +24,20 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_PATH = os.path.join(REPO_ROOT, "scripts", "audit-hermes-pipeline-hardening.sh")
 CLAUDE_BRIDGE_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "claude_bridge_server.py")
 REVIEWER_SOUL_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "reviewer-SOUL.md")
+PIPELINE_CONTROLLER_MCP_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "pipeline_controller_server.py")
+HERMES_PIPELINE_CONTROLLER_PATH = os.path.join(REPO_ROOT, "scripts", "hermes-pipeline-controller.py")
+PIPELINE_BRIDGE_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "pipeline_bridge_server.py")
+
+# A7.1: locks the CURRENT SHA-256 of the two frozen A6 files this task must
+# never modify, so any drift in either file (this task's or a future one's)
+# fails loudly instead of silently invalidating the A7.1 SHA-256 parity
+# checks' assumptions.
+FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
+    "681834f1180145d5ced38e8e34f202a3c25f326a43d99344423c5a9970327eb9"
+)
+FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256 = (
+    "16c1ed5f459457ddd721538d1beaf30c1118432339aa4d11290727852599cec4"
+)
 
 REPO_ONLY_FILES = [
     os.path.join("templates", "review_bridge_server.py"),
@@ -95,10 +110,12 @@ def _build_runtime_fixture(tmp_path, compliant=True):
         # An empty root: every file-based runtime check must fail closed.
         return root
 
-    (pipeline_dir / "server.py").write_text(
-        'key = stable_key(str(path), feature, f"review:{implementation_task_id}")\n',
-        encoding="utf-8",
-    )
+    # Verbatim copy (not hand-written) so the A7.1 bridge-location-rejection
+    # check sees a real MCPServer("pipeline-bridge") identity (distinct from
+    # "pipeline-controller") and the A4.1-era "installed pipeline_bridge"
+    # compliance check still finds its required marker, instead of relying on
+    # a stale hand-written stub.
+    shutil.copy(PIPELINE_BRIDGE_TEMPLATE_PATH, pipeline_dir / "server.py")
     (review_dir / "server.py").write_text(
         'ALLOWED_TEST_COMMANDS = ["__skip__", "./scripts/audit-hermes-pipeline-hardening.sh"]\n',
         encoding="utf-8",
@@ -107,8 +124,15 @@ def _build_runtime_fixture(tmp_path, compliant=True):
     # audit (REQUIRED_CLAUDE_FLAGS / _tool_run task_id) sees the real,
     # currently-compliant repo template rather than a stale hand-written stub.
     shutil.copy(CLAUDE_BRIDGE_TEMPLATE_PATH, claude_dir / "server.py")
+    # A7.1: the real Hermes config shape nests MCP registrations under a
+    # top-level "mcp_servers:" mapping; pipeline_controller must be an
+    # immediate child of that mapping, never a column-0 top-level key.
     (hermes_dir / "config.yaml").write_text(
-        "review_archive_bridge:\n  enabled: true\n",
+        "mcp_servers:\n"
+        "  review_archive_bridge:\n"
+        "    enabled: true\n"
+        "  pipeline_controller:\n"
+        "    enabled: true\n",
         encoding="utf-8",
     )
     (hermes_dir / "SOUL.md").write_text(
@@ -122,6 +146,45 @@ def _build_runtime_fixture(tmp_path, compliant=True):
     # Verbatim copy (not hand-written) so the A4.1 reviewer collect protocol
     # invariant audit sees the real, currently-compliant repo SOUL text.
     shutil.copy(REVIEWER_SOUL_TEMPLATE_PATH, reviewer_dir / "SOUL.md")
+
+    # A7.1: coder/coder-claude/planner-codex/sysadmin profile configs are
+    # present (mirroring the reviewer profile), none registering the
+    # default-only pipeline_controller MCP.
+    for profile_name, mcp_entry in (
+        ("coder", "claude_bridge"),
+        ("coder-claude", "claude_bridge"),
+        ("planner-codex", "planner_bridge"),
+        ("sysadmin", "review_bridge"),
+    ):
+        profile_dir = hermes_dir / "profiles" / profile_name
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        (profile_dir / "config.yaml").write_text(
+            f"{mcp_entry}:\n  enabled: true\n",
+            encoding="utf-8",
+        )
+
+    # A7.1: dedicated pipeline-controller-mcp runtime layout + trusted
+    # controller binary, both verbatim copies (not hand-written) so the
+    # source/runtime SHA-256 parity and exact-roster checks see the real,
+    # currently-compliant repo files rather than a stale hand-written stub.
+    controller_mcp_dir = root / "usr" / "local" / "lib" / "pipeline-controller-mcp"
+    controller_mcp_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(PIPELINE_CONTROLLER_MCP_TEMPLATE_PATH, controller_mcp_dir / "server.py")
+
+    # A7.1: dedicated virtualenv, modeled structurally (directory + nonempty
+    # pyvenv.cfg + executable bin/python3); no real interpreter/site-packages
+    # tree is required or created.
+    controller_venv_dir = controller_mcp_dir / ".venv"
+    controller_venv_bin_dir = controller_venv_dir / "bin"
+    controller_venv_bin_dir.mkdir(parents=True, exist_ok=True)
+    (controller_venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\nversion = 3.11.0\n", encoding="utf-8")
+    controller_venv_python3 = controller_venv_bin_dir / "python3"
+    controller_venv_python3.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    controller_venv_python3.chmod(0o755)
+
+    controller_bin_dir = root / "usr" / "local" / "bin"
+    controller_bin_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(HERMES_PIPELINE_CONTROLLER_PATH, controller_bin_dir / "hermes-pipeline-controller")
     return root
 
 
@@ -1552,3 +1615,506 @@ def test_repo_negative_a6_archive_review_chains_ready_to_commit(tmp_path):
     result = _run(["--repo-only"], cwd=str(fixture))
     assert result.returncode == 1
     assert "pipeline_controller_mcp_archive_review_chains_ready_to_commit" in result.stdout
+
+
+# 16) A7.1: pipeline-controller MCP future-runtime rollout contract (runtime
+# mode) — dedicated runtime layout, trusted controller binary, source/runtime
+# SHA-256 parity, virtualenv structural validity, bridge-location rejection,
+# and the default-only privilege boundary. All fixtures are plain directories
+# under tmp_path; no real venv, no hermes CLI, no network, no service ops.
+
+
+def test_a7_frozen_source_files_sha256_unchanged():
+    """Locks the CURRENT SHA-256 of the two frozen A6 source files this task
+    must never modify. If either file drifts (this task's edits or a future
+    task's), this fails loudly instead of silently invalidating every A7.1
+    SHA-256 parity assertion below, which assumes these exact bytes."""
+    with open(PIPELINE_CONTROLLER_MCP_TEMPLATE_PATH, "rb") as f:
+        assert hashlib.sha256(f.read()).hexdigest() == FROZEN_PIPELINE_CONTROLLER_MCP_SHA256
+    with open(HERMES_PIPELINE_CONTROLLER_PATH, "rb") as f:
+        assert hashlib.sha256(f.read()).hexdigest() == FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256
+
+
+def test_a7_runtime_passes_on_compliant_fixture(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 0
+    assert "PASS" in result.stdout
+    assert "a7_pipeline_controller_" not in result.stdout
+
+
+def test_a7_runtime_negative_dedicated_adapter_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    dedicated = runtime_root / "usr" / "local" / "lib" / "pipeline-controller-mcp" / "server.py"
+    assert dedicated.exists()
+    dedicated.unlink()
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "a7_pipeline_controller_dedicated_runtime_missing_or_empty" in result.stdout
+
+
+def test_a7_runtime_negative_binary_missing(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    controller_bin = runtime_root / "usr" / "local" / "bin" / "hermes-pipeline-controller"
+    assert controller_bin.exists()
+    controller_bin.unlink()
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "a7_pipeline_controller_binary_missing_or_empty" in result.stdout
+
+
+def test_a7_runtime_negative_venv_dir_absent(tmp_path):
+    """Deletes the .venv directory entirely from beneath AUDIT_RUNTIME_ROOT
+    and asserts the marker fires with that exact path: this proves the audit
+    inspects the .venv beneath the runtime root (rather than some fixed
+    live-host path or a probe silently skipped under a fixture override),
+    since the only thing that changed is content under AUDIT_RUNTIME_ROOT."""
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    venv_dir = runtime_root / "usr" / "local" / "lib" / "pipeline-controller-mcp" / ".venv"
+    assert venv_dir.is_dir()
+    shutil.rmtree(venv_dir)
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert f"a7_pipeline_controller_venv_missing_or_invalid:{venv_dir}:not_a_directory" in result.stdout
+
+
+def test_a7_runtime_negative_venv_pyvenv_cfg_empty(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    venv_dir = runtime_root / "usr" / "local" / "lib" / "pipeline-controller-mcp" / ".venv"
+    pyvenv_cfg = venv_dir / "pyvenv.cfg"
+    assert pyvenv_cfg.read_text(encoding="utf-8") != ""
+    pyvenv_cfg.write_text("", encoding="utf-8")
+    assert os.access(venv_dir / "bin" / "python3", os.X_OK)
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert f"a7_pipeline_controller_venv_missing_or_invalid:{venv_dir}:no_pyvenv_cfg" in result.stdout
+
+
+def test_a7_runtime_negative_venv_no_executable_python(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    venv_dir = runtime_root / "usr" / "local" / "lib" / "pipeline-controller-mcp" / ".venv"
+    (venv_dir / "bin" / "python3").chmod(0o644)
+    assert not (venv_dir / "bin" / "python").exists()
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert f"a7_pipeline_controller_venv_missing_or_invalid:{venv_dir}:no_venv_python_executable" in result.stdout
+
+
+def test_a7_runtime_negative_bridge_location_rejected(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    bridge_server = runtime_root / "usr" / "local" / "lib" / "pipeline-bridge-mcp" / "server.py"
+    impostor_source = (
+        '"""Impostor pipeline-controller adapter placed at the pipeline-bridge runtime path."""\n'
+        'mcp_server = MCPServer("pipeline-controller")\n'
+    )
+    assert hashlib.sha256(impostor_source.encode("utf-8")).hexdigest() != FROZEN_PIPELINE_CONTROLLER_MCP_SHA256
+    bridge_server.write_text(impostor_source, encoding="utf-8")
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert (
+        f"a7_pipeline_controller_bridge_location_rejected:{bridge_server}:mcp_identity=pipeline-controller"
+        in result.stdout
+    )
+
+
+def test_a7_runtime_negative_adapter_sha256_mismatch(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    dedicated = runtime_root / "usr" / "local" / "lib" / "pipeline-controller-mcp" / "server.py"
+    with open(dedicated, "a", encoding="utf-8") as f:
+        f.write("# a7.1 mutation: byte-level drift only, AST/tool-roster unaffected\n")
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "a7_pipeline_controller_adapter_sha256_mismatch" in result.stdout
+
+
+def test_a7_runtime_negative_binary_sha256_mismatch(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    controller_bin = runtime_root / "usr" / "local" / "bin" / "hermes-pipeline-controller"
+    with open(controller_bin, "a", encoding="utf-8") as f:
+        f.write("# a7.1 mutation: byte-level drift only\n")
+    result = _run(["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)})
+    assert result.returncode == 1
+    assert "a7_pipeline_controller_binary_sha256_mismatch" in result.stdout
+
+
+# 17) A7.1 R2b: exact runtime tool roster, default-only registration
+# boundary, and A7-specific audit mode behavior. These extend the same
+# tmp_path/AUDIT_RUNTIME_ROOT fixture framework used by the R2a tests above.
+
+
+def _a7_runtime_adapter(runtime_root):
+    return runtime_root / "usr" / "local" / "lib" / "pipeline-controller-mcp" / "server.py"
+
+
+def _a7_default_config(runtime_root):
+    return runtime_root / "home" / ".hermes" / "config.yaml"
+
+
+def _a7_profile_config(runtime_root, profile_name):
+    return runtime_root / "home" / ".hermes" / "profiles" / profile_name / "config.yaml"
+
+
+def _a7_registered_tool_names(path):
+    """Return literal @*.tool(name="...") names without importing/executing
+    the adapter under test."""
+    ast = __import__("ast")
+    with open(path, "r", encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=str(path))
+
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for dec in node.decorator_list:
+            if (
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Attribute)
+                and dec.func.attr == "tool"
+            ):
+                for kw in dec.keywords:
+                    if (
+                        kw.arg == "name"
+                        and isinstance(kw.value, ast.Constant)
+                        and isinstance(kw.value.value, str)
+                    ):
+                        names.add(kw.value.value)
+    return names
+
+
+def _a7_replace_runtime_tool_name(adapter_path, old_name, new_name):
+    """Rename one literal tool registration in a tmp_path adapter copy."""
+    re = __import__("re")
+    text = adapter_path.read_text(encoding="utf-8")
+    pattern = rf'(\bname\s*=\s*)(["\']){re.escape(old_name)}\2'
+
+    def repl(match):
+        quote = match.group(2)
+        return f"{match.group(1)}{quote}{new_name}{quote}"
+
+    mutated, count = re.subn(pattern, repl, text, count=1)
+    assert count == 1, f"tool registration not found: {old_name}"
+    assert mutated != text
+    adapter_path.write_text(mutated, encoding="utf-8")
+
+
+A7_EXPECTED_RUNTIME_TOOLS = {
+    "check_task",
+    "create_implementation",
+    "create_review",
+    "create_correction",
+    "wait_task",
+    "archive_review",
+    "ready_to_commit",
+}
+
+
+def test_a7_runtime_exact_tool_roster_passes(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    adapter = _a7_runtime_adapter(runtime_root)
+
+    assert _a7_registered_tool_names(PIPELINE_CONTROLLER_MCP_TEMPLATE_PATH) == A7_EXPECTED_RUNTIME_TOOLS
+    assert _a7_registered_tool_names(adapter) == A7_EXPECTED_RUNTIME_TOOLS
+
+    result = _run(
+        ["--runtime"],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 0
+    assert "pipeline-controller installed runtime adapter exposes exactly the expected 7-tool roster" in result.stdout
+    assert "pipeline-controller MCP installed runtime roster exposes no commit*/push* tool" in result.stdout
+    assert "a7_pipeline_controller_tool_roster_mismatch" not in result.stdout
+    assert "a7_pipeline_controller_commit_or_push_tool_present" not in result.stdout
+
+
+def test_a7_runtime_negative_tool_removed(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    adapter = _a7_runtime_adapter(runtime_root)
+
+    _a7_replace_runtime_tool_name(adapter, "check_task", "check_task_removed")
+
+    assert "check_task" not in _a7_registered_tool_names(adapter)
+    assert "check_task_removed" in _a7_registered_tool_names(adapter)
+
+    result = _run(
+        ["--runtime"],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 1
+    assert "a7_pipeline_controller_tool_roster_mismatch" in result.stdout
+
+
+def test_a7_runtime_negative_eighth_tool(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    adapter = _a7_runtime_adapter(runtime_root)
+
+    with open(adapter, "a", encoding="utf-8") as f:
+        f.write(
+            '\n\n@mcp_server.tool(name="a7_eighth_probe")\n'
+            'def a7_eighth_probe():\n'
+            '    return {"ok": True}\n'
+        )
+
+    assert _a7_registered_tool_names(adapter) == (
+        A7_EXPECTED_RUNTIME_TOOLS | {"a7_eighth_probe"}
+    )
+
+    result = _run(
+        ["--runtime"],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 1
+    assert "a7_pipeline_controller_tool_roster_mismatch" in result.stdout
+
+
+def test_a7_runtime_negative_commit_push_facade(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    adapter = _a7_runtime_adapter(runtime_root)
+
+    with open(adapter, "a", encoding="utf-8") as f:
+        f.write(
+            '\n\n@mcp_server.tool(name="push_changes")\n'
+            'def push_changes():\n'
+            '    return {"forbidden": True}\n'
+        )
+
+    assert "push_changes" in _a7_registered_tool_names(adapter)
+
+    result = _run(
+        ["--runtime"],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 1
+    assert "a7_pipeline_controller_tool_roster_mismatch" in result.stdout
+    assert (
+        "a7_pipeline_controller_commit_or_push_tool_present:"
+        "installed runtime:push_changes"
+        in result.stdout
+    )
+
+
+def test_a7_registration_default_and_unrelated_mcp_pass(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    default_cfg = _a7_default_config(runtime_root)
+
+    config = default_cfg.read_text(encoding="utf-8")
+    assert "mcp_servers:" in config
+    assert "review_archive_bridge:" in config
+    assert "pipeline_controller:" in config
+
+    result = _run(
+        ["--runtime"],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 0
+    assert "default/global profile registers pipeline_controller MCP" in result.stdout
+    assert "a7_pipeline_controller_registration_missing" not in result.stdout
+    assert "a7_pipeline_controller_registration_forbidden" not in result.stdout
+
+
+def test_a7_registration_missing_from_default_mcp_servers_fails(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    default_cfg = _a7_default_config(runtime_root)
+
+    default_cfg.write_text(
+        "mcp_servers:\n"
+        "  review_archive_bridge:\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        ["--runtime"],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 1
+    assert (
+        f"a7_pipeline_controller_registration_missing:default:{default_cfg}"
+        in result.stdout
+    )
+
+
+def test_a7_registration_top_level_key_outside_mcp_servers_does_not_count(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    default_cfg = _a7_default_config(runtime_root)
+
+    default_cfg.write_text(
+        "pipeline_controller:\n"
+        "  enabled: true\n"
+        "mcp_servers:\n"
+        "  review_archive_bridge:\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        ["--runtime"],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 1
+    assert (
+        f"a7_pipeline_controller_registration_missing:default:{default_cfg}"
+        in result.stdout
+    )
+
+
+def test_a7_registration_nested_key_does_not_count(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    default_cfg = _a7_default_config(runtime_root)
+
+    default_cfg.write_text(
+        "mcp_servers:\n"
+        "  review_archive_bridge:\n"
+        "    enabled: true\n"
+        "  wrapper:\n"
+        "    pipeline_controller:\n"
+        "      enabled: true\n",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        ["--runtime"],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 1
+    assert (
+        f"a7_pipeline_controller_registration_missing:default:{default_cfg}"
+        in result.stdout
+    )
+
+
+@pytest.mark.parametrize(
+    "profile_name",
+    ["reviewer", "coder", "coder-claude", "planner-codex", "sysadmin"],
+)
+def test_a7_registration_forbidden_profile_fails(tmp_path, profile_name):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    profile_cfg = _a7_profile_config(runtime_root, profile_name)
+
+    original = profile_cfg.read_text(encoding="utf-8")
+    profile_cfg.write_text(
+        original.rstrip()
+        + "\n"
+        + "mcp_servers:\n"
+        + "  harmless_other_mcp:\n"
+        + "    enabled: true\n"
+        + "  pipeline_controller:\n"
+        + "    enabled: true\n",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        ["--runtime"],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 1
+    assert (
+        f"a7_pipeline_controller_registration_forbidden:"
+        f"{profile_name}:{profile_cfg}"
+        in result.stdout
+    )
+
+
+def test_a7_unrelated_mcp_children_remain_accepted(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    default_cfg = _a7_default_config(runtime_root)
+
+    default_cfg.write_text(
+        "mcp_servers:\n"
+        "  review_archive_bridge:\n"
+        "    enabled: true\n"
+        "  pipeline_bridge:\n"
+        "    enabled: true\n"
+        "  another_unrelated_mcp:\n"
+        "    enabled: true\n"
+        "  pipeline_controller:\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        ["--runtime"],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 0
+    assert "default/global profile registers pipeline_controller MCP" in result.stdout
+    assert "a7_pipeline_controller_registration_missing" not in result.stdout
+
+
+def test_a7_repo_only_does_not_require_pipeline_controller_runtime(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    absent_runtime = tmp_path / "a7_runtime_intentionally_absent"
+
+    assert not absent_runtime.exists()
+
+    result = _run(
+        ["--repo-only"],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(absent_runtime)},
+    )
+
+    assert result.returncode == 0
+    assert "pipeline-controller MCP source roster" in result.stdout
+    assert "has exactly 7 registered tools" in result.stdout
+    assert "a7_pipeline_controller_dedicated_runtime_missing_or_empty" not in result.stdout
+    assert "a7_pipeline_controller_binary_missing_or_empty" not in result.stdout
+    assert "a7_pipeline_controller_registration_missing" not in result.stdout
+
+
+@pytest.mark.parametrize("mode", ["--runtime", "--all"])
+def test_a7_runtime_and_all_fail_same_missing_adapter_marker(tmp_path, mode):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    dedicated = _a7_runtime_adapter(runtime_root)
+
+    dedicated.unlink()
+
+    result = _run(
+        [mode],
+        cwd=str(fixture),
+        env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 1
+    assert (
+        f"a7_pipeline_controller_dedicated_runtime_missing_or_empty:{dedicated}"
+        in result.stdout
+    )

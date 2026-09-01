@@ -52,6 +52,13 @@ Environment:
                           home/.hermes/SOUL.md
                           home/.hermes/profiles/reviewer/config.yaml
                           home/.hermes/profiles/reviewer/SOUL.md
+                          usr/local/lib/pipeline-controller-mcp/server.py
+                          usr/local/lib/pipeline-controller-mcp/.venv/
+                          usr/local/bin/hermes-pipeline-controller
+                          home/.hermes/profiles/coder/config.yaml
+                          home/.hermes/profiles/coder-claude/config.yaml
+                          home/.hermes/profiles/planner-codex/config.yaml
+                          home/.hermes/profiles/sysadmin/config.yaml
 
 Exit codes: 0 = pass, 1 = genuine audit failure, 2 = usage error.
 EOF
@@ -157,6 +164,13 @@ runtime_path() {
       hermes_soul)            echo "$root/home/.hermes/SOUL.md" ;;
       reviewer_config)        echo "$root/home/.hermes/profiles/reviewer/config.yaml" ;;
       reviewer_soul)          echo "$root/home/.hermes/profiles/reviewer/SOUL.md" ;;
+      pipeline_controller_dedicated_server) echo "$root/usr/local/lib/pipeline-controller-mcp/server.py" ;;
+      pipeline_controller_venv_dir)         echo "$root/usr/local/lib/pipeline-controller-mcp/.venv" ;;
+      pipeline_controller_binary)           echo "$root/usr/local/bin/hermes-pipeline-controller" ;;
+      coder_config)           echo "$root/home/.hermes/profiles/coder/config.yaml" ;;
+      coder_claude_config)    echo "$root/home/.hermes/profiles/coder-claude/config.yaml" ;;
+      planner_codex_config)   echo "$root/home/.hermes/profiles/planner-codex/config.yaml" ;;
+      sysadmin_config)        echo "$root/home/.hermes/profiles/sysadmin/config.yaml" ;;
     esac
   else
     case "$kind" in
@@ -167,6 +181,13 @@ runtime_path() {
       hermes_soul)            echo "$HOME/.hermes/SOUL.md" ;;
       reviewer_config)        echo "$HOME/.hermes/profiles/reviewer/config.yaml" ;;
       reviewer_soul)          echo "$HOME/.hermes/profiles/reviewer/SOUL.md" ;;
+      pipeline_controller_dedicated_server) echo "/usr/local/lib/pipeline-controller-mcp/server.py" ;;
+      pipeline_controller_venv_dir)         echo "/usr/local/lib/pipeline-controller-mcp/.venv" ;;
+      pipeline_controller_binary)           echo "/usr/local/bin/hermes-pipeline-controller" ;;
+      coder_config)           echo "$HOME/.hermes/profiles/coder/config.yaml" ;;
+      coder_claude_config)    echo "$HOME/.hermes/profiles/coder-claude/config.yaml" ;;
+      planner_codex_config)   echo "$HOME/.hermes/profiles/planner-codex/config.yaml" ;;
+      sysadmin_config)        echo "$HOME/.hermes/profiles/sysadmin/config.yaml" ;;
     esac
   fi
 }
@@ -1587,6 +1608,355 @@ PY
   fi
 }
 
+# --- A7.1: pipeline-controller MCP future-runtime (A7.3) rollout contract.
+# Deterministic, hermetic (AUDIT_RUNTIME_ROOT-aware) probes for the future
+# dedicated runtime layout, trusted controller binary, source/runtime
+# SHA-256 parity, and the default-only MCP privilege boundary. Never
+# deploys anything, never calls the hermes CLI, never mutates /usr/local or
+# ~/.hermes. The tool roster is derived by parsing
+# templates/pipeline_controller_server.py (the frozen A6 source of truth)
+# rather than re-hardcoded a second time here.
+pipeline_controller_a7_source_tool_roster() {
+  AUDIT_A7_TARGET_PATH="$REPO_DIR/templates/pipeline_controller_server.py" python3 - <<'PY'
+import ast
+import os
+
+PATH = os.environ["AUDIT_A7_TARGET_PATH"]
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=PATH)
+except (OSError, SyntaxError):
+    raise SystemExit(0)
+
+names = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef):
+        for dec in node.decorator_list:
+            if (
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Attribute)
+                and dec.func.attr == "tool"
+            ):
+                for kw in dec.keywords:
+                    if kw.arg == "name" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        names.add(kw.value.value)
+for name in sorted(names):
+    print(name)
+PY
+}
+
+pipeline_controller_a7_tool_roster_of() {
+  local file="$1"
+  AUDIT_A7_TARGET_PATH="$file" python3 - <<'PY'
+import ast
+import os
+
+PATH = os.environ["AUDIT_A7_TARGET_PATH"]
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=PATH)
+except (OSError, SyntaxError):
+    raise SystemExit(0)
+
+names = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef):
+        for dec in node.decorator_list:
+            if (
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Attribute)
+                and dec.func.attr == "tool"
+            ):
+                for kw in dec.keywords:
+                    if kw.arg == "name" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        names.add(kw.value.value)
+for name in sorted(names):
+    print(name)
+PY
+}
+
+sha256_of() {
+  sha256sum "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# Structurally parses a Python source file's AST (host python3, stdlib only,
+# read-only; never imports/execs the file) to determine the MCPServer(...)
+# identity/name from the first MCPServer(...) instantiation found: either its
+# first positional string literal argument, or a string-literal name= keyword
+# argument. Prints "IDENTITY:<name>" when positively determined, or
+# "UNDETERMINED" when no MCPServer(...) call is found, the identity argument
+# is not a string literal, or the file cannot be parsed. Callers must treat
+# UNDETERMINED as fail-closed, not as an absence of the pipeline-controller
+# identity.
+pipeline_controller_a7_mcp_identity_of() {
+  local file="$1"
+  AUDIT_A7_BRIDGE_IDENTITY_PATH="$file" python3 - <<'PY'
+import ast
+import os
+
+PATH = os.environ["AUDIT_A7_BRIDGE_IDENTITY_PATH"]
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=PATH)
+except (OSError, SyntaxError):
+    print("UNDETERMINED")
+    raise SystemExit(0)
+
+identity = None
+for node in ast.walk(tree):
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "MCPServer"
+    ):
+        if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+            identity = node.args[0].value
+        else:
+            for kw in node.keywords:
+                if kw.arg == "name" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                    identity = kw.value.value
+        break
+
+if identity is not None:
+    print("IDENTITY:%s" % identity)
+else:
+    print("UNDETERMINED")
+PY
+}
+
+# Deterministically parses a Hermes profile/agents YAML-style config for the
+# immediate mapping children of the top-level (column-0) "mcp_servers:" key
+# only, ignoring comments, blank lines, deeper-nested content, and any
+# occurrence of the child key name outside that mapping (as a column-0
+# top-level key, inside a comment, as a substring, or nested inside some
+# other unrelated child object). The actual Hermes config shape is:
+#   mcp_servers:
+#     review_archive_bridge:
+#       ...
+#     pipeline_bridge:
+#       ...
+# so pipeline_controller registration must be checked as an immediate
+# mcp_servers mapping child, never as a column-0 top-level key.
+hermes_config_mcp_servers_children() {
+  local file="$1"
+  AUDIT_HERMES_CONFIG_PATH="$file" python3 - <<'PY'
+import os
+import re
+
+PATH = os.environ["AUDIT_HERMES_CONFIG_PATH"]
+KEY_RE = re.compile(r'^([A-Za-z0-9_.\-]+):(?:\s|$)')
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+except OSError:
+    raise SystemExit(0)
+
+
+def indent_of(line):
+    return len(line) - len(line.lstrip(" \t"))
+
+
+mcp_servers_idx = None
+for i, line in enumerate(lines):
+    if line.startswith((" ", "\t")):
+        continue
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+    m = KEY_RE.match(line)
+    if m and m.group(1) == "mcp_servers":
+        mcp_servers_idx = i
+        break
+
+if mcp_servers_idx is None:
+    raise SystemExit(0)
+
+child_indent = None
+for line in lines[mcp_servers_idx + 1:]:
+    stripped = line.strip()
+    if not stripped:
+        continue
+    indent = indent_of(line)
+    if indent == 0:
+        break
+    if stripped.startswith("#"):
+        continue
+    if child_indent is None:
+        child_indent = indent
+    if indent < child_indent:
+        break
+    if indent > child_indent:
+        continue
+    m = KEY_RE.match(stripped)
+    if m:
+        print(m.group(1))
+PY
+}
+
+hermes_config_has_mcp_servers_child() {
+  local file="$1"
+  local key="$2"
+  local k
+  while IFS= read -r k; do
+    [[ "$k" == "$key" ]] && return 0
+  done < <(hermes_config_mcp_servers_children "$file")
+  return 1
+}
+
+# C8: the human-approval boundary requires that no tool in a given roster is
+# named commit*/push* (case-insensitive) — the facade must expose no
+# commit/push capability under any name.
+pipeline_controller_a7_check_no_commit_push_tool() {
+  local context="$1"
+  local roster="$2"
+  local forbidden
+  forbidden="$(printf '%s\n' "$roster" | grep -iE '^(commit|push)' || true)"
+  if [[ -z "$forbidden" ]]; then
+    check_ok "pipeline-controller MCP $context roster exposes no commit*/push* tool"
+  else
+    check_fail "a7_pipeline_controller_commit_or_push_tool_present:$context:$(printf '%s' "$forbidden" | tr '\n' ',')"
+  fi
+}
+
+# Repo-only: sanity-lock the frozen source roster at exactly 7 tools
+# (derived, never re-hardcoded). Only reads
+# templates/pipeline_controller_server.py: no live-path dependence.
+pipeline_controller_a7_repo_only_audit() {
+  local roster
+  roster="$(pipeline_controller_a7_source_tool_roster)"
+  local count
+  count="$(printf '%s\n' "$roster" | grep -c .)"
+  if [[ "$count" -eq 7 ]]; then
+    check_ok "pipeline-controller MCP source roster (templates/pipeline_controller_server.py) has exactly 7 registered tools"
+  else
+    check_fail "a7_pipeline_controller_tool_roster_source_count_wrong:expected=7;actual=$count"
+  fi
+  pipeline_controller_a7_check_no_commit_push_tool "source" "$roster"
+}
+
+# Runtime/all: fail-closed dedicated-layout, SHA-256 parity, and
+# default-only privilege-boundary probes for the future A7.3 rollout.
+pipeline_controller_a7_runtime_audit() {
+  local source_adapter="$REPO_DIR/templates/pipeline_controller_server.py"
+  local source_controller="$REPO_DIR/scripts/hermes-pipeline-controller.py"
+  local source_roster
+  source_roster="$(pipeline_controller_a7_source_tool_roster)"
+  local source_sha
+  source_sha="$(sha256_of "$source_adapter")"
+  local controller_source_sha
+  controller_source_sha="$(sha256_of "$source_controller")"
+
+  # dedicated runtime layout is required, with adapter source/runtime
+  # SHA-256 parity and exact tool-roster parity.
+  local dedicated
+  dedicated="$(runtime_path pipeline_controller_dedicated_server)"
+  if [[ ! -s "$dedicated" ]]; then
+    check_fail "a7_pipeline_controller_dedicated_runtime_missing_or_empty:$dedicated"
+  else
+    check_ok "pipeline-controller dedicated runtime adapter present at $dedicated"
+    local dedicated_sha
+    dedicated_sha="$(sha256_of "$dedicated")"
+    if [[ "$dedicated_sha" == "$source_sha" ]]; then
+      check_ok "pipeline-controller adapter source/runtime SHA-256 parity holds"
+    else
+      check_fail "a7_pipeline_controller_adapter_sha256_mismatch:source=$source_sha;runtime=$dedicated_sha"
+    fi
+    local dedicated_roster
+    dedicated_roster="$(pipeline_controller_a7_tool_roster_of "$dedicated")"
+    if [[ "$dedicated_roster" == "$source_roster" ]]; then
+      check_ok "pipeline-controller installed runtime adapter exposes exactly the expected 7-tool roster"
+    else
+      check_fail "a7_pipeline_controller_tool_roster_mismatch:expected=$(printf '%s' "$source_roster" | tr '\n' ',');actual=$(printf '%s' "$dedicated_roster" | tr '\n' ',')"
+    fi
+    pipeline_controller_a7_check_no_commit_push_tool "installed runtime" "$dedicated_roster"
+  fi
+
+  # dedicated virtualenv is essential: an adapter installed without its own
+  # venv cannot be trusted to run with its pinned dependency set, so a
+  # missing or structurally invalid venv fails closed exactly like a missing
+  # adapter file. This must be hermetically auditable: behavior is identical
+  # for the real live path and for an AUDIT_RUNTIME_ROOT fixture root (the
+  # fixture only needs a directory, a pyvenv.cfg file, and an executable bit
+  # to model a venv structurally; no real interpreter/site-packages tree is
+  # required), so this check is never skipped.
+  local venv_dir
+  venv_dir="$(runtime_path pipeline_controller_venv_dir)"
+  if [[ ! -d "$venv_dir" ]]; then
+    check_fail "a7_pipeline_controller_venv_missing_or_invalid:$venv_dir:not_a_directory"
+  elif [[ ! -s "$venv_dir/pyvenv.cfg" ]]; then
+    check_fail "a7_pipeline_controller_venv_missing_or_invalid:$venv_dir:no_pyvenv_cfg"
+  elif [[ ! -x "$venv_dir/bin/python3" && ! -x "$venv_dir/bin/python" ]]; then
+    check_fail "a7_pipeline_controller_venv_missing_or_invalid:$venv_dir:no_venv_python_executable"
+  else
+    check_ok "pipeline-controller dedicated virtualenv present and structurally valid at $venv_dir"
+  fi
+
+  # pipeline-bridge runtime path is rejected for this MCP: neither the
+  # adapter's exact byte content (source/runtime SHA-256 match, kept as an
+  # additional rejection signal) nor its structurally-determined MCPServer
+  # identity may ever be found co-located at the pipeline-bridge MCP's own
+  # runtime path. An identity that cannot be positively determined from the
+  # AST fails closed rather than passing.
+  local bridge_path
+  bridge_path="$(runtime_path pipeline_bridge_server)"
+  if [[ -s "$bridge_path" ]]; then
+    local bridge_sha
+    bridge_sha="$(sha256_of "$bridge_path")"
+    local bridge_identity
+    bridge_identity="$(pipeline_controller_a7_mcp_identity_of "$bridge_path")"
+    if [[ "$bridge_sha" == "$source_sha" ]]; then
+      check_fail "a7_pipeline_controller_bridge_location_rejected:$bridge_path:sha256_match"
+    elif [[ "$bridge_identity" == "IDENTITY:pipeline-controller" ]]; then
+      check_fail "a7_pipeline_controller_bridge_location_rejected:$bridge_path:mcp_identity=pipeline-controller"
+    elif [[ "$bridge_identity" != "IDENTITY:"* ]]; then
+      check_fail "a7_pipeline_controller_bridge_location_rejected:$bridge_path:mcp_identity_undetermined"
+    else
+      check_ok "pipeline-bridge runtime path does not host the pipeline-controller adapter"
+    fi
+  fi
+
+  # trusted controller runtime target is required, with SHA-256 parity.
+  local controller_bin
+  controller_bin="$(runtime_path pipeline_controller_binary)"
+  if [[ ! -s "$controller_bin" ]]; then
+    check_fail "a7_pipeline_controller_binary_missing_or_empty:$controller_bin"
+  else
+    check_ok "trusted pipeline-controller binary present at $controller_bin"
+    local controller_bin_sha
+    controller_bin_sha="$(sha256_of "$controller_bin")"
+    if [[ "$controller_bin_sha" == "$controller_source_sha" ]]; then
+      check_ok "pipeline-controller source/runtime SHA-256 parity holds"
+    else
+      check_fail "a7_pipeline_controller_binary_sha256_mismatch:source=$controller_source_sha;runtime=$controller_bin_sha"
+    fi
+  fi
+
+  # default-only MCP privilege boundary: exactly the default/global profile
+  # may register pipeline_controller as an immediate mcp_servers mapping
+  # child; every other profile must not.
+  local default_cfg
+  default_cfg="$(runtime_path hermes_config)"
+  if [[ -s "$default_cfg" ]] && hermes_config_has_mcp_servers_child "$default_cfg" "pipeline_controller"; then
+    check_ok "default/global profile registers pipeline_controller MCP"
+  else
+    check_fail "a7_pipeline_controller_registration_missing:default:$default_cfg"
+  fi
+
+  local pair kind name cfg
+  for pair in reviewer_config:reviewer coder_config:coder coder_claude_config:coder-claude planner_codex_config:planner-codex sysadmin_config:sysadmin; do
+    kind="${pair%%:*}"
+    name="${pair##*:}"
+    cfg="$(runtime_path "$kind")"
+    if [[ -s "$cfg" ]] && hermes_config_has_mcp_servers_child "$cfg" "pipeline_controller"; then
+      check_fail "a7_pipeline_controller_registration_forbidden:$name:$cfg"
+    else
+      check_ok "$name profile does not register the forbidden pipeline_controller MCP"
+    fi
+  done
+}
+
 run_repo_only() {
   ACTIVE_FAILURES_ARR="REPO_FAILURES"
 
@@ -1967,6 +2337,10 @@ run_repo_only() {
   echo "13) pipeline-controller MCP adapter hardening (A6 thin MCP facade):"
   PIPELINE_CONTROLLER_MCP_FILE="$REPO_DIR/templates/pipeline_controller_server.py"
   pipeline_controller_mcp_audit "pipeline-controller MCP adapter template" "$PIPELINE_CONTROLLER_MCP_FILE"
+
+  echo
+  echo "14) pipeline-controller MCP A7.1 future-runtime rollout contract (repo-only tool-roster sanity lock):"
+  pipeline_controller_a7_repo_only_audit
 }
 
 run_runtime() {
@@ -2175,6 +2549,10 @@ PY
       fi
     done
   fi
+
+  echo
+  echo "18) pipeline-controller MCP A7.1 future-runtime rollout contract (dedicated layout, SHA-256 parity, default-only privilege boundary):"
+  pipeline_controller_a7_runtime_audit
 }
 
 report_suite() {
