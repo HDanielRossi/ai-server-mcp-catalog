@@ -1957,6 +1957,371 @@ pipeline_controller_a7_runtime_audit() {
   done
 }
 
+# --- A8: default-profile Kanban lifecycle ownership invariant audit ------
+#
+# 15 invariants (INV-01..INV-15) verified hermetically against
+# repository-versioned artifacts and repository MCP source only (design
+# decision D1): A8.3 live runtime policy/config rollout is out of scope, so
+# none of these checks ever read live Hermes runtime state. Paths are
+# overridable via SOUL_TEMPLATE_PATH, CONTRACT_PATH, REPO_ROOT, and
+# PIPELINE_CONTROLLER_SRC so tests can exercise negative cases against
+# fixtures. Each invariant prints exactly one line:
+#   INV-xx [name] PASS
+#   INV-xx [name] FAIL: <one-line rationale>
+# and a FAIL also feeds check_fail so the surrounding suite's exit code
+# reflects it.
+
+a8_report() {
+  local id="$1"
+  local name="$2"
+  local ok="$3"
+  local reason="${4:-}"
+  if [[ "$ok" -eq 0 ]]; then
+    echo "$id [$name] PASS"
+  else
+    echo "$id [$name] FAIL: $reason"
+    check_fail "$id [$name]: $reason"
+  fi
+}
+
+a8_soul_has_exact_line() {
+  local soul="$1"
+  local line="$2"
+  if [[ ! -s "$soul" ]]; then
+    return 1
+  fi
+  grep_line_exact "$soul" "$line"
+}
+
+run_a8_invariant_audit() {
+  local soul="${SOUL_TEMPLATE_PATH:-$REPO_DIR/templates/default-SOUL.md}"
+  local contract="${CONTRACT_PATH:-$REPO_DIR/templates/hermes-repo-contract.md}"
+  local repo_root="${REPO_ROOT:-$REPO_DIR}"
+  local controller_src="${PIPELINE_CONTROLLER_SRC:-$repo_root/templates/pipeline_controller_server.py}"
+
+  echo
+  echo "===== A8: default profile Kanban lifecycle ownership (15 invariants) ====="
+
+  if [[ ! -s "$soul" ]]; then
+    local i
+    for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15; do
+      a8_report "INV-$i" "default-SOUL-template" 1 "$soul missing or empty"
+    done
+    return
+  fi
+
+  # INV-01: default registers planner_bridge (planning only).
+  if a8_soul_has_exact_line "$soul" "A8-MANDATE-01: default profile must register planner_bridge (planning only)."; then
+    a8_report "INV-01" "default-registers-planner_bridge" 0
+  else
+    a8_report "INV-01" "default-registers-planner_bridge" 1 "$soul missing exact A8-MANDATE-01 marker line"
+  fi
+
+  # INV-02: default registers pipeline_controller as sole Kanban lifecycle
+  # owner (A8-MANDATE-02 + A8-OWNERSHIP-01 together).
+  if a8_soul_has_exact_line "$soul" "A8-MANDATE-02: default profile must register pipeline_controller (sole Kanban lifecycle interface)." \
+    && a8_soul_has_exact_line "$soul" "A8-OWNERSHIP-01: default is the sole owner of the Kanban graph (create, check, wait, review, correction, archive, READY_TO_COMMIT)."; then
+    a8_report "INV-02" "default-registers-pipeline_controller" 0
+  else
+    a8_report "INV-02" "default-registers-pipeline_controller" 1 "$soul missing exact A8-MANDATE-02 and/or A8-OWNERSHIP-01 marker line(s)"
+  fi
+
+  # INV-03: default MUST NOT register or use pipeline_bridge directly.
+  if a8_soul_has_exact_line "$soul" "A8-PROHIBIT-01: default profile MUST NOT register or use pipeline_bridge directly."; then
+    a8_report "INV-03" "default-prohibits-pipeline_bridge" 0
+  else
+    a8_report "INV-03" "default-prohibits-pipeline_bridge" 1 "$soul missing exact A8-PROHIBIT-01 marker line"
+  fi
+
+  # INV-04: default MUST NOT register or use review_archive_bridge directly.
+  if a8_soul_has_exact_line "$soul" "A8-PROHIBIT-02: default profile MUST NOT register or use review_archive_bridge directly."; then
+    a8_report "INV-04" "default-prohibits-review_archive_bridge" 0
+  else
+    a8_report "INV-04" "default-prohibits-review_archive_bridge" 1 "$soul missing exact A8-PROHIBIT-02 marker line"
+  fi
+
+  # INV-05: reviewer role remains read-only, uses review_bridge.
+  if a8_soul_has_exact_line "$soul" "A8-ROLES-01: reviewer: read-only, uses review_bridge."; then
+    a8_report "INV-05" "reviewer-role-boundary" 0
+  else
+    a8_report "INV-05" "reviewer-role-boundary" 1 "$soul missing exact A8-ROLES-01 marker line"
+  fi
+
+  # INV-06: coder-claude role remains implementation-only, uses claude_bridge.
+  if a8_soul_has_exact_line "$soul" "A8-ROLES-02: coder-claude: implementation, uses claude_bridge."; then
+    a8_report "INV-06" "coder-claude-role-boundary" 0
+  else
+    a8_report "INV-06" "coder-claude-role-boundary" 1 "$soul missing exact A8-ROLES-02 marker line"
+  fi
+
+  # INV-07: pipeline_controller forbidden in non-default profiles.
+  if a8_soul_has_exact_line "$soul" "A8-PROHIBIT-03: pipeline_controller is forbidden in profiles: reviewer, coder, coder-claude, planner-codex, sysadmin."; then
+    a8_report "INV-07" "pipeline_controller-forbidden-profiles" 0
+  else
+    a8_report "INV-07" "pipeline_controller-forbidden-profiles" 1 "$soul missing exact A8-PROHIBIT-03 marker line"
+  fi
+
+  # INV-08: pipeline_controller exposes exactly the seven authorized tools.
+  local tool_findings
+  tool_findings="$(AUDIT_A8_CONTROLLER_SRC="$controller_src" python3 - <<'PY'
+import ast
+import os
+import sys
+
+PATH = os.environ["AUDIT_A8_CONTROLLER_SRC"]
+EXPECTED = {
+    "check_task", "create_implementation", "create_review", "create_correction",
+    "wait_task", "archive_review", "ready_to_commit",
+}
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=PATH)
+except (OSError, SyntaxError) as e:
+    print("a8_controller_probe_error:cannot_parse_source:%s" % (e,))
+    sys.exit(1)
+
+found = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef):
+        for dec in node.decorator_list:
+            if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr == "tool":
+                for kw in dec.keywords:
+                    if kw.arg == "name" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        found.add(kw.value.value)
+
+if found != EXPECTED:
+    missing = EXPECTED - found
+    unexpected = found - EXPECTED
+    print(
+        "a8_tool_roster_mismatch:missing=%s;unexpected=%s"
+        % (",".join(sorted(missing)) or "none", ",".join(sorted(unexpected)) or "none")
+    )
+    sys.exit(1)
+sys.exit(0)
+PY
+)"
+  if [[ -z "$tool_findings" ]]; then
+    a8_report "INV-08" "exactly-seven-controller-tools" 0
+  else
+    a8_report "INV-08" "exactly-seven-controller-tools" 1 "$tool_findings"
+  fi
+
+  # INV-09: no commit*/push*/staging* facade names anywhere in the repo's MCP
+  # tool definitions (planner_bridge, pipeline_bridge, review_archive_bridge,
+  # pipeline_controller, review_bridge, claude_bridge -- whichever exist).
+  local mcp_files=(
+    "$repo_root/templates/planner_bridge_server.py"
+    "$repo_root/templates/pipeline_bridge_server.py"
+    "$repo_root/templates/review_archive_bridge.py"
+    "$repo_root/templates/pipeline_controller_server.py"
+    "$repo_root/templates/review_bridge_server.py"
+    "$repo_root/templates/claude_bridge_server.py"
+  )
+  local facade_findings
+  facade_findings="$(AUDIT_A8_MCP_FILES="${mcp_files[*]}" python3 - <<'PY'
+import ast
+import os
+import re
+import sys
+
+FILES = os.environ["AUDIT_A8_MCP_FILES"].split()
+FORBIDDEN_RE = re.compile(r"^(commit|push|staging)", re.IGNORECASE)
+
+findings = []
+for path in FILES:
+    if not os.path.isfile(path):
+        continue
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=path)
+    except (OSError, SyntaxError) as e:
+        findings.append("a8_facade_probe_error:%s:cannot_parse_source:%s" % (path, e))
+        continue
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for dec in node.decorator_list:
+                tool_call = (
+                    isinstance(dec, ast.Call)
+                    and isinstance(dec.func, ast.Attribute)
+                    and dec.func.attr == "tool"
+                )
+                if not tool_call:
+                    continue
+                tool_name = None
+                for kw in dec.keywords:
+                    if kw.arg == "name" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        tool_name = kw.value.value
+                if tool_name is None:
+                    tool_name = node.name
+                if FORBIDDEN_RE.match(tool_name):
+                    findings.append("a8_forbidden_facade_name:%s:%s" % (path, tool_name))
+
+for finding in findings:
+    print(finding)
+sys.exit(1 if findings else 0)
+PY
+)"
+  if [[ -z "$facade_findings" ]]; then
+    a8_report "INV-09" "no-commit-push-staging-facades" 0
+  else
+    a8_report "INV-09" "no-commit-push-staging-facades" 1 "$(printf '%s' "$facade_findings" | tr '\n' ';')"
+  fi
+
+  # INV-10: default uses pipeline_controller for the complete Kanban lifecycle.
+  if a8_soul_has_exact_line "$soul" "A8-MANDATE-02: default profile must register pipeline_controller (sole Kanban lifecycle interface)." \
+    && a8_soul_has_exact_line "$soul" "A8-OWNERSHIP-01: default is the sole owner of the Kanban graph (create, check, wait, review, correction, archive, READY_TO_COMMIT)."; then
+    a8_report "INV-10" "controller-lifecycle" 0
+  else
+    a8_report "INV-10" "controller-lifecycle" 1 "$soul missing exact A8-MANDATE-02 and/or A8-OWNERSHIP-01 lifecycle marker line(s)"
+  fi
+
+  # INV-11: default policy contains no instruction to use pipeline_bridge directly.
+  if a8_soul_has_exact_line "$soul" "A8-PROHIBIT-01: default profile MUST NOT register or use pipeline_bridge directly."; then
+    a8_report "INV-11" "no-direct-pipeline_bridge-instruction" 0
+  else
+    a8_report "INV-11" "no-direct-pipeline_bridge-instruction" 1 "$soul missing exact A8-PROHIBIT-01 direct-use prohibition"
+  fi
+
+  # INV-12: default policy contains no instruction to use review_archive_bridge directly.
+  if a8_soul_has_exact_line "$soul" "A8-PROHIBIT-02: default profile MUST NOT register or use review_archive_bridge directly."; then
+    a8_report "INV-12" "no-direct-review_archive_bridge-instruction" 0
+  else
+    a8_report "INV-12" "no-direct-review_archive_bridge-instruction" 1 "$soul missing exact A8-PROHIBIT-02 direct-use prohibition"
+  fi
+
+  # Supplemental canonical A8 policy markers. These remain gating requirements
+  # but are not assigned incorrect INV numbers.
+  if a8_soul_has_exact_line "$soul" "A8-READY-01: READY_TO_COMMIT is read-only; no MCP tool performs a commit."; then
+    check_ok "A8 supplemental marker A8-READY-01 present"
+  else
+    check_fail "A8 supplemental marker A8-READY-01 missing"
+  fi
+
+  if a8_soul_has_exact_line "$soul" "A8-PHASES-01: A8.1 = repository implementation. A8.2 = read-only review + archive + READY_TO_COMMIT + human commit/push. A8.3 = runtime policy/config rollout (separate human authorization)."; then
+    check_ok "A8 supplemental marker A8-PHASES-01 present"
+  else
+    check_fail "A8 supplemental marker A8-PHASES-01 missing"
+  fi
+
+  if a8_soul_has_exact_line "$soul" "A8-TEMPLATE-01: This file is a versioned, installable TEMPLATE of the default profile SOUL policy. It is NOT the live executable SOUL and is not on any runtime path."; then
+    check_ok "A8 supplemental marker A8-TEMPLATE-01 present"
+  else
+    check_fail "A8 supplemental marker A8-TEMPLATE-01 missing"
+  fi
+
+  # INV-13: planner_bridge is planning-only (no lifecycle task creation).
+  if a8_soul_has_exact_line "$soul" "A8-PLANNER-01: planner_bridge is planning-only (no lifecycle task creation)."; then
+    a8_report "INV-13" "planner_bridge-planning-only" 0
+  else
+    a8_report "INV-13" "planner_bridge-planning-only" 1 "$soul missing exact A8-PLANNER-01 marker line"
+  fi
+
+  # INV-14: commit approval and push approval are two separate explicit
+  # human authorizations (dual-approval, never bundled).
+  if a8_soul_has_exact_line "$soul" "A8-APPROVAL-01: commit approval requires one explicit human authorization." \
+    && a8_soul_has_exact_line "$soul" "A8-APPROVAL-02: push approval requires a separate, explicit human authorization (dual-approval: commit and push are never bundled)."; then
+    a8_report "INV-14" "dual-approval-commit-push" 0
+  else
+    a8_report "INV-14" "dual-approval-commit-push" 1 "$soul missing exact A8-APPROVAL-01 and/or A8-APPROVAL-02 marker line(s)"
+  fi
+
+  # A8 contract cross-check: the same A8 policy claims verified above against
+  # templates/default-SOUL.md must also hold in the versioned repository
+  # contract (templates/hermes-repo-contract.md), so this audit genuinely
+  # verifies "docs/templates/contract" as documented, rather than only the
+  # SOUL template. Hermetic: pure containment check of the contract file's
+  # own current, real A8 section text.
+  # Keep the semantic claim used in diagnostics separate from the complete
+  # Markdown line required in the versioned contract. Several A8 claims share
+  # a physical line, so substring matching is too weak while claim-only exact
+  # matching cannot succeed against the actual contract representation.
+  local contract_strings=(
+    'The default profile must not register or use `pipeline_bridge` directly, and must not register or use `review_archive_bridge` directly.'
+    '`pipeline_controller` exposes exactly seven tools: `check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`.'
+    'No MCP tool defined in this repository (`planner_bridge`, `pipeline_bridge`, `review_archive_bridge`, `pipeline_controller`, `review_bridge`, `claude_bridge`) is named `commit*`, `push*`, or `staging*`.'
+    '`planner_bridge` remains planning-only: it never creates, checks, waits on, reviews, corrects, archives, or attests readiness for any Kanban task.'
+    '`pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, `coder-claude`, `planner-codex`, and `sysadmin` profiles.'
+    'Commit approval requires one explicit human authorization; push approval requires a second, separate explicit human authorization.'
+  )
+
+  local contract_lines=(
+    'The default profile'\''s Kanban lifecycle ownership is exercised exclusively through `pipeline_controller`. The default profile must not register or use `pipeline_bridge` directly, and must not register or use `review_archive_bridge` directly.'
+    '- `pipeline_controller` exposes exactly seven tools: `check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`. No MCP tool defined in this repository (`planner_bridge`, `pipeline_bridge`, `review_archive_bridge`, `pipeline_controller`, `review_bridge`, `claude_bridge`) is named `commit*`, `push*`, or `staging*`.'
+    '- `pipeline_controller` exposes exactly seven tools: `check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`. No MCP tool defined in this repository (`planner_bridge`, `pipeline_bridge`, `review_archive_bridge`, `pipeline_controller`, `review_bridge`, `claude_bridge`) is named `commit*`, `push*`, or `staging*`.'
+    '- `planner_bridge` remains planning-only: it never creates, checks, waits on, reviews, corrects, archives, or attests readiness for any Kanban task.'
+    '- `pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, `coder-claude`, `planner-codex`, and `sysadmin` profiles.'
+    '- `ready_to_commit` remains strictly read-only technical attestation (A5). Commit approval requires one explicit human authorization; push approval requires a second, separate explicit human authorization. Commit authorization never implies push authorization.'
+  )
+
+  if [[ ! -s "$contract" ]]; then
+    check_fail "A8 contract cross-check: $contract missing or empty"
+  else
+    local idx cstr cline
+    for idx in "${!contract_strings[@]}"; do
+      cstr="${contract_strings[$idx]}"
+      cline="${contract_lines[$idx]}"
+
+      if grep_line_exact "$contract" "$cline"; then
+        check_ok "A8 contract (hermes-repo-contract.md) contains: $cstr"
+      else
+        check_fail "A8 contract (hermes-repo-contract.md) missing required A8 policy text: $cstr"
+      fi
+    done
+  fi
+
+  # INV-15: A8.1 performs no live runtime mutation. Verified statically and
+  # hermetically by scanning this audit script's own source for any
+  # live-runtime-mutating command token (service management, package
+  # installation, or a write into /usr/local or ~/.hermes). This does not
+  # read git status or any other ambient repository state, so it behaves
+  # identically against the real repository and any hermetic test fixture
+  # that copies this same script.
+  local inv15_findings
+  inv15_findings="$(AUDIT_A8_MUTATION_SCRIPT="$repo_root/scripts/audit-hermes-pipeline-hardening.sh" python3 - <<'PY'
+import os
+import re
+import sys
+
+PATH = os.environ["AUDIT_A8_MUTATION_SCRIPT"]
+
+FORBIDDEN_PATTERNS = [
+    r"\bsystemctl\b",
+    r"\bdocker\b",
+    r"\bapt-get\b",
+    r"\bpip\s+" + r"inst" + r"all\b",
+    r">\s*/usr/local",
+    r">\s*\$HOME/\.hermes",
+    r">\s*~/\.hermes",
+    r"\bcp\b[^\n]*(/usr/local|\.hermes)",
+    r"\bmv\b[^\n]*(/usr/local|\.hermes)",
+    r"\binstall\b[^\n]*(/usr/local|\.hermes)",
+]
+
+try:
+    with open(PATH, "r", encoding="utf-8") as f:
+        source = f.read()
+except OSError as e:
+    print("a8_inv15_probe_error:cannot_read_file:%s" % (e,))
+    sys.exit(1)
+
+findings = []
+for pattern in FORBIDDEN_PATTERNS:
+    if re.search(pattern, source):
+        findings.append("a8_inv15_live_mutation_token_present:%s" % pattern)
+
+for finding in findings:
+    print(finding)
+sys.exit(1 if findings else 0)
+PY
+)"
+  if [[ -z "$inv15_findings" ]]; then
+    a8_report "INV-15" "no-live-runtime-mutation" 0
+  else
+    a8_report "INV-15" "no-live-runtime-mutation" 1 "$inv15_findings"
+  fi
+}
+
 run_repo_only() {
   ACTIVE_FAILURES_ARR="REPO_FAILURES"
 
@@ -1982,6 +2347,8 @@ run_repo_only() {
   require_file_nonempty "templates/pipeline_controller_server.py"
   require_file_nonempty "tests/test_pipeline_controller_template.py"
   require_file_nonempty ".gitignore"
+  require_file_nonempty "templates/default-SOUL.md"
+  require_file_nonempty "tests/test_default_soul_template.py"
 
   echo
   echo "2) docs A3.5 marker:"
@@ -2341,6 +2708,8 @@ run_repo_only() {
   echo
   echo "14) pipeline-controller MCP A7.1 future-runtime rollout contract (repo-only tool-roster sanity lock):"
   pipeline_controller_a7_repo_only_audit
+
+  run_a8_invariant_audit
 }
 
 run_runtime() {
@@ -2426,13 +2795,18 @@ run_runtime() {
   fi
 
   echo
-  echo "14) global/default must expose review_archive_bridge:"
+  echo "14) global/default review_archive_bridge registration (informational only under A8):"
+  # A8-PROHIBIT-02 declares the repository target state as default MUST NOT
+  # register or use review_archive_bridge directly; live deregistration is a
+  # separate, later, human-authorized A8.3 operation. This check therefore
+  # never gates the audit result -- it only reports the live config's
+  # current registration state for operator awareness.
   if [[ ! -s "$hermes_config" ]]; then
-    check_fail "global/default config missing or empty at $hermes_config"
+    echo "INFO(live): global/default config missing or empty at $hermes_config"
   elif grep -qF -- 'review_archive_bridge:' "$hermes_config" 2>/dev/null; then
-    check_ok "global/default exposes review_archive_bridge"
+    echo "INFO(live): global/default still registers review_archive_bridge (A8.3 live deregistration not yet performed; repository target state per A8-PROHIBIT-02 is no direct default registration)"
   else
-    check_fail "global/default missing review_archive_bridge"
+    echo "INFO(live): global/default does not register review_archive_bridge (matches A8-PROHIBIT-02 target state)"
   fi
 
   echo

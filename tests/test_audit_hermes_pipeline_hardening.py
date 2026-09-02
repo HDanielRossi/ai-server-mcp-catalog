@@ -59,6 +59,10 @@ REPO_ONLY_FILES = [
     os.path.join("templates", "pipeline_controller_server.py"),
     os.path.join("tests", "test_pipeline_controller_template.py"),
     ".gitignore",
+    os.path.join("docs", "production-repo-onboarding.md"),
+    os.path.join("templates", "hermes-repo-contract.md"),
+    os.path.join("templates", "default-SOUL.md"),
+    os.path.join("tests", "test_default_soul_template.py"),
 ]
 
 
@@ -2118,3 +2122,212 @@ def test_a7_runtime_and_all_fail_same_missing_adapter_marker(tmp_path, mode):
         f"a7_pipeline_controller_dedicated_runtime_missing_or_empty:{dedicated}"
         in result.stdout
     )
+
+
+# 15) A8: default-profile Kanban lifecycle ownership invariant audit
+# (INV-01..INV-15), verified hermetically against templates/default-SOUL.md,
+# templates/hermes-repo-contract.md, and templates/pipeline_controller_server.py.
+# One shared positive test proves the unmodified repository passes all 15
+# invariants plus the contract cross-check; each negative test corrupts
+# exactly one invariant on a copy of the current, real repository file and
+# asserts the audit fails closed with the specific stable finding.
+
+A8_SECTION_HEADER = "===== A8: default profile Kanban lifecycle ownership (15 invariants) ====="
+
+# (invariant_id, report_name, exact marker line in templates/default-SOUL.md)
+A8_SOUL_MARKER_CASES = [
+    ("INV-01", "default-registers-planner_bridge",
+     "A8-MANDATE-01: default profile must register planner_bridge (planning only)."),
+    ("INV-02", "default-registers-pipeline_controller",
+     "A8-MANDATE-02: default profile must register pipeline_controller (sole Kanban lifecycle interface)."),
+    ("INV-02", "default-registers-pipeline_controller",
+     "A8-OWNERSHIP-01: default is the sole owner of the Kanban graph (create, check, wait, review, correction, archive, READY_TO_COMMIT)."),
+    ("INV-03", "default-prohibits-pipeline_bridge",
+     "A8-PROHIBIT-01: default profile MUST NOT register or use pipeline_bridge directly."),
+    ("INV-04", "default-prohibits-review_archive_bridge",
+     "A8-PROHIBIT-02: default profile MUST NOT register or use review_archive_bridge directly."),
+    ("INV-05", "reviewer-role-boundary",
+     "A8-ROLES-01: reviewer: read-only, uses review_bridge."),
+    ("INV-06", "coder-claude-role-boundary",
+     "A8-ROLES-02: coder-claude: implementation, uses claude_bridge."),
+    ("INV-07", "pipeline_controller-forbidden-profiles",
+     "A8-PROHIBIT-03: pipeline_controller is forbidden in profiles: reviewer, coder, coder-claude, planner-codex, sysadmin."),
+    ("INV-10", "controller-lifecycle",
+     "A8-OWNERSHIP-01: default is the sole owner of the Kanban graph (create, check, wait, review, correction, archive, READY_TO_COMMIT)."),
+    ("INV-11", "no-direct-pipeline_bridge-instruction",
+     "A8-PROHIBIT-01: default profile MUST NOT register or use pipeline_bridge directly."),
+    ("INV-12", "no-direct-review_archive_bridge-instruction",
+     "A8-PROHIBIT-02: default profile MUST NOT register or use review_archive_bridge directly."),
+    ("INV-13", "planner_bridge-planning-only",
+     "A8-PLANNER-01: planner_bridge is planning-only (no lifecycle task creation)."),
+    ("INV-14", "dual-approval-commit-push",
+     "A8-APPROVAL-01: commit approval requires one explicit human authorization."),
+    ("INV-14", "dual-approval-commit-push",
+     "A8-APPROVAL-02: push approval requires a separate, explicit human authorization (dual-approval: commit and push are never bundled)."),
+]
+
+A8_ALL_INV_IDS = [
+    "INV-01", "INV-02", "INV-03", "INV-04", "INV-05", "INV-06", "INV-07",
+    "INV-08", "INV-09", "INV-10", "INV-11", "INV-12", "INV-13", "INV-14", "INV-15",
+]
+
+A8_CONTRACT_STRINGS = [
+    "The default profile must not register or use `pipeline_bridge` directly, "
+    "and must not register or use `review_archive_bridge` directly.",
+    "`pipeline_controller` exposes exactly seven tools: `check_task`, "
+    "`create_implementation`, `create_review`, `create_correction`, `wait_task`, "
+    "`archive_review`, `ready_to_commit`.",
+    "No MCP tool defined in this repository (`planner_bridge`, `pipeline_bridge`, "
+    "`review_archive_bridge`, `pipeline_controller`, `review_bridge`, `claude_bridge`) "
+    "is named `commit*`, `push*`, or `staging*`.",
+    "`planner_bridge` remains planning-only: it never creates, checks, waits on, "
+    "reviews, corrects, archives, or attests readiness for any Kanban task.",
+    "`pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, "
+    "`coder-claude`, `planner-codex`, and `sysadmin` profiles.",
+    "Commit approval requires one explicit human authorization; push approval "
+    "requires a second, separate explicit human authorization.",
+]
+
+
+def _default_soul_file(fixture):
+    return fixture / "templates" / "default-SOUL.md"
+
+
+def _hermes_contract_file(fixture):
+    return fixture / "templates" / "hermes-repo-contract.md"
+
+
+def _pipeline_controller_mcp_file(fixture):
+    return fixture / "templates" / "pipeline_controller_server.py"
+
+
+def test_a8_compliant_fixture_passes_all_fifteen_invariants(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 0
+    assert "PASS" in result.stdout
+    assert A8_SECTION_HEADER in result.stdout
+    for inv_id in A8_ALL_INV_IDS:
+        assert f"{inv_id} [" in result.stdout
+    # every A8 invariant line must report PASS, never FAIL, on the compliant fixture
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if any(stripped.startswith(f"{inv_id} [") for inv_id in A8_ALL_INV_IDS):
+            assert stripped.endswith("PASS"), f"unexpected A8 finding on compliant fixture: {stripped}"
+    for cstr in A8_CONTRACT_STRINGS:
+        assert f"A8 contract (hermes-repo-contract.md) contains: {cstr}" in result.stdout
+
+
+def test_a8_missing_soul_template_fails_all_fifteen_invariants(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _default_soul_file(fixture).unlink()
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    for inv_id in A8_ALL_INV_IDS:
+        assert f"{inv_id} [default-SOUL-template] FAIL:" in result.stdout
+
+
+@pytest.mark.parametrize("inv_id,name,marker_line", A8_SOUL_MARKER_CASES)
+def test_a8_soul_negative_missing_marker_line(tmp_path, inv_id, name, marker_line):
+    fixture = _build_repo_fixture(tmp_path)
+    soul_file = _default_soul_file(fixture)
+    _mutate_file(soul_file, marker_line, marker_line + " MUTATED")
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert f"{inv_id} [{name}] FAIL:" in result.stdout
+
+
+def test_a8_inv08_negative_controller_tool_roster_mismatch(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    controller_file = _pipeline_controller_mcp_file(fixture)
+    _mutate_file(controller_file, 'name="ready_to_commit"', 'name="ready_to_commit_v2"')
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "INV-08 [exactly-seven-controller-tools] FAIL:" in result.stdout
+    assert "a8_tool_roster_mismatch" in result.stdout
+    assert "missing=ready_to_commit" in result.stdout
+    assert "unexpected=ready_to_commit_v2" in result.stdout
+
+
+def test_a8_inv09_negative_forbidden_facade_name_detected(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    controller_file = _pipeline_controller_mcp_file(fixture)
+    original = controller_file.read_text(encoding="utf-8")
+    controller_file.write_text(
+        original
+        + "\n\n@mcp_server.tool(name=\"commit_changes\")\n"
+        + "def _tool_commit_changes():\n"
+        + "    return {}\n",
+        encoding="utf-8",
+    )
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "INV-09 [no-commit-push-staging-facades] FAIL:" in result.stdout
+    assert "a8_forbidden_facade_name" in result.stdout
+    assert "commit_changes" in result.stdout
+
+
+def test_a8_inv15_negative_live_mutation_token_detected(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    script_file = fixture / "scripts" / "audit-hermes-pipeline-hardening.sh"
+    original = script_file.read_text(encoding="utf-8")
+    script_file.write_text(
+        original + "\n# regression probe (never executed): systemctl restart hermes-gateway.service\n",
+        encoding="utf-8",
+    )
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "INV-15 [no-live-runtime-mutation] FAIL:" in result.stdout
+    assert r"a8_inv15_live_mutation_token_present:\bsystemctl\b" in result.stdout
+
+
+def test_a8_inv15_positive_absent_on_compliant_fixture(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 0
+    assert "INV-15 [no-live-runtime-mutation] PASS" in result.stdout
+    assert "a8_inv15_live_mutation_token_present" not in result.stdout
+
+
+@pytest.mark.parametrize("contract_string", A8_CONTRACT_STRINGS)
+def test_a8_contract_cross_check_negative(tmp_path, contract_string):
+    fixture = _build_repo_fixture(tmp_path)
+    contract_file = _hermes_contract_file(fixture)
+    _mutate_file(contract_file, contract_string, contract_string + " MUTATED")
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert (
+        f"A8 contract (hermes-repo-contract.md) missing required A8 policy text: {contract_string}"
+        in result.stdout
+    )
+
+
+def test_a8_contract_missing_file_fails_cross_check(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    _hermes_contract_file(fixture).unlink()
+    result = _run(["--repo-only"], cwd=str(fixture))
+    assert result.returncode == 1
+    assert "A8 contract cross-check:" in result.stdout
+    assert "missing or empty" in result.stdout
+
+
+def test_a8_soul_override_path_env_var_used_for_hermetic_negative(tmp_path):
+    """SOUL_TEMPLATE_PATH lets a caller point run_a8_invariant_audit at an
+    arbitrary fixture file without touching templates/default-SOUL.md at all,
+    proving the audit's A8 section is driven purely by the given path."""
+    fixture = _build_repo_fixture(tmp_path)
+    broken_soul = tmp_path / "broken-SOUL.md"
+    broken_soul.write_text("not a real SOUL template\n", encoding="utf-8")
+    result = _run(
+        ["--repo-only"],
+        cwd=str(fixture),
+        env_overrides={"SOUL_TEMPLATE_PATH": str(broken_soul)},
+    )
+    assert result.returncode == 1
+    assert f"INV-01 [default-registers-planner_bridge] FAIL: {broken_soul} missing exact A8-MANDATE-01 marker line" in result.stdout
+    assert f"INV-05 [reviewer-role-boundary] FAIL: {broken_soul} missing exact A8-ROLES-01 marker line" in result.stdout
+    # invariants independent of SOUL content (controller roster, facade names,
+    # live-mutation token scan) are unaffected by this override and still pass
+    assert "INV-08 [exactly-seven-controller-tools] PASS" in result.stdout
+    assert "INV-09 [no-commit-push-staging-facades] PASS" in result.stdout
+    assert "INV-15 [no-live-runtime-mutation] PASS" in result.stdout

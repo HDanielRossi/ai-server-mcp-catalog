@@ -30,7 +30,10 @@ Responsibilities:
 ```text
 - Receive the user request from Discord or CLI.
 - Use planner_bridge for planning.
-- Use pipeline_bridge to create implementation, review, and correction Kanban tasks.
+- Use pipeline_controller as the sole interface for the Kanban lifecycle: create
+  implementation, review, and correction tasks; check and wait on tasks; archive
+  reviews; and attest READY_TO_COMMIT (see "A8" below).
+- Do not register or use pipeline_bridge or review_archive_bridge directly.
 - Own the workflow graph.
 - Do not directly implement code.
 - Do not create Kanban tasks assigned to planner-codex.
@@ -73,6 +76,8 @@ key = stable_key(str(path), feature, f"review:{implementation_task_id}")
 ```
 
 This prevents a review task created after a correction from accidentally reusing an older review task for the same feature.
+
+Under A8, `default` no longer registers or calls `pipeline_bridge` directly; the sole default lifecycle interface is `pipeline_controller` (see "A8" below). This section is retained as the historical record of the validated task-creation contract.
 
 ### coder-claude
 
@@ -160,6 +165,8 @@ mcp__review_archive_bridge__persist_review_artifact
 ```
 
 The bridge writes only inside `.ai/reviews/`. It does not execute the review, modify code, commit, or push.
+
+Under A8, `default` no longer registers or calls `review_archive_bridge` directly; archival is performed exclusively through `pipeline_controller`'s `archive_review` tool, which invokes the same underlying helper (see "A8" below).
 
 `.ai/reviews/` is control-plane evidence storage, not reviewed source-state. See "A5.1 — `/.ai/reviews/` narrow ignore-scope integration precondition" below for the Git-ignore contract that keeps archive artifacts from becoming spurious repository-state changes.
 
@@ -1293,3 +1300,47 @@ A7.3 is a separate operational mutation and is not implicitly authorized by A7.1
 Before A7.3 changes live state, the operator must capture enough pre-rollout state to restore every replaced runtime/configuration target byte-for-byte. The rollout must install the trusted controller, the dedicated adapter, and its dedicated `.venv`; register `pipeline_controller` only in the default/global `mcp_servers`; preserve the forbidden-profile boundary; verify source/runtime SHA-256 parity and the exact seven-tool roster; perform bounded read-only MCP discovery/smoke probes without creating Kanban tasks merely for smoke testing; and restart the Hermes gateway only if actually required and separately human-authorized.
 
 If validation fails, rollback restores the captured pre-rollout state. A7.3 never installs the adapter under `/usr/local/lib/pipeline-bridge-mcp/`.
+
+## A8 — Default profile Kanban lifecycle ownership (repository-only artifacts)
+
+A8 declares `pipeline_controller` the sole Kanban lifecycle interface for the default profile, and formally prohibits default from registering or using `pipeline_bridge` or `review_archive_bridge` directly.
+
+- SCOPE: A8.1 is repository-only. It updates documentation, the repository contract, the hardening audit, and adds a versioned, installable `templates/default-SOUL.md` policy template. A8.1 makes no change to any live SOUL, live Hermes config, systemd unit, Docker configuration, or MCP runtime. Live deregistration of `pipeline_bridge`/`review_archive_bridge` from the running default profile is a separate A8.3 phase requiring its own explicit human authorization.
+
+### Phases
+
+```text
+A8.1 = repository implementation (this task).
+A8.2 = read-only review + archive + READY_TO_COMMIT + human commit/push.
+A8.3 = runtime policy/config rollout (separate human authorization).
+```
+
+Completion of A8.1 never implicitly authorizes A8.2 or A8.3.
+
+### Sole lifecycle interface
+
+`pipeline_controller` is the only interface the default profile uses to create, check, wait on, review, correct, archive, or attest readiness for Kanban tasks. It exposes exactly seven tools, unchanged from A6/A7: `check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`. No MCP tool in this repository (`planner_bridge`, `pipeline_bridge`, `review_archive_bridge`, `pipeline_controller`, `review_bridge`, `claude_bridge`) has a name matching `^commit`, `^push`, or `^staging`.
+
+### Prohibited direct use
+
+The default profile must not register or use `pipeline_bridge` directly, and must not register or use `review_archive_bridge` directly. `planner_bridge` remains planning-only: it never creates, checks, waits on, reviews, corrects, archives, or attests readiness for any Kanban task.
+
+`pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, `coder-claude`, `planner-codex`, and `sysadmin` profiles, exactly as established in A7.
+
+### Role boundaries unchanged
+
+`reviewer` remains read-only and uses only `review_bridge`. `coder-claude` implements only through `claude_bridge`. Neither role gains Kanban lifecycle authority; that authority is exercised exclusively by default through `pipeline_controller`.
+
+### READY_TO_COMMIT and human approval
+
+`READY_TO_COMMIT` remains strictly read-only technical attestation (A5); no MCP tool in this repository performs a commit. Commit approval requires one explicit human authorization; push approval requires a second, separate explicit human authorization. Commit authorization never implies push authorization.
+
+### Policy template
+
+`templates/default-SOUL.md` is the versioned, installable SOUL policy template that encodes this target state for the default profile. It is not the live executable SOUL and is not on any runtime path; installing it is a separate, human-authorized operator action that happens later, after review PASS.
+
+### Audit and deployment boundary
+
+`scripts/audit-hermes-pipeline-hardening.sh` (`--repo-only`, the default bare invocation) verifies all 15 A8 invariants hermetically against `templates/default-SOUL.md`, `templates/hermes-repo-contract.md`, and repository MCP source — never against live runtime state. The audit does not fail merely because the live default profile still lists `pipeline_bridge`/`review_archive_bridge`; deregistering them live is A8.3, a separate, later, human-authorized operation. Any pre-existing live-state check that would otherwise contradict this A8.1 target state is reported as a non-gating `INFO(live):` line rather than a failure.
+
+Repository audit PASS never implies A8.3 has happened.

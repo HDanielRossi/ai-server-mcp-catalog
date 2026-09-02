@@ -94,26 +94,28 @@ Avoid as first task:
 
 ## Pipeline flow for production repositories
 
-Expected flow:
+Expected flow (A8: `pipeline_controller` is the sole default lifecycle interface; `default` never registers or calls `pipeline_bridge` or `review_archive_bridge` directly):
 
 1. User requests task.
 2. default calls planner_bridge.
-3. default calls pipeline_bridge to create implementation task.
+3. default calls pipeline_controller's `create_implementation` to create the implementation task.
 4. default stops and reports implementation task ID.
 5. coder-claude implements through claude_bridge.
 6. User verifies implementation task completed.
-7. default or user creates review task through pipeline_bridge.
+7. default or user creates a review task through pipeline_controller's `create_review`.
 8. reviewer reviews through review_bridge.
-9. If PASS, user commits.
-10. If CHANGES REQUIRED, default creates correction task.
+9. If PASS, user commits after explicit human commit authorization (see "A8 production commit gate" below).
+10. If CHANGES REQUIRED, default creates a correction task through pipeline_controller's `create_correction`.
 11. reviewer reviews correction.
-12. User commits only after final PASS.
+12. User commits only after final PASS, and pushes only after a separate explicit human push authorization.
 
 ## Hard stop rules
 
 Stop immediately if any of the following happens:
 
 - default calls review_bridge directly.
+- default registers or calls pipeline_bridge directly (see "A8" below; default's sole lifecycle interface is pipeline_controller).
+- default registers or calls review_archive_bridge directly (see "A8" below; archival happens only through pipeline_controller's archive_review).
 - default creates review or correction before implementation is complete.
 - reviewer uses direct terminal, file, or code execution.
 - reviewer completes without mcp__review_bridge__collect.
@@ -292,3 +294,18 @@ Before any A7.3 mutation:
 - on failure, restore the captured pre-rollout state.
 
 A7.3 runtime rollout is not part of ordinary repository onboarding and must never be inferred from a repository task's PASS result.
+
+## A8 production onboarding: pipeline_controller as the sole default lifecycle interface
+
+A8 does not change the production repository's commit/push policy. It changes how `default` is onboarded to drive the Kanban lifecycle: exclusively through `pipeline_controller`, never through direct `pipeline_bridge` or `review_archive_bridge` registration.
+
+New onboarding for a production repository must:
+
+- Use `pipeline_controller`'s `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, and `ready_to_commit` tools for every Kanban lifecycle step above.
+- Never register `pipeline_bridge` or `review_archive_bridge` in the default profile's tool configuration.
+- Keep `planner_bridge` planning-only, exactly as in the base pipeline contract.
+- Keep `reviewer` and `coder-claude` unchanged: `reviewer` uses only `review_bridge`; `coder-claude` implements only through `claude_bridge`.
+
+`READY_TO_COMMIT` remains strictly read-only technical attestation. A successful result still requires a separate explicit human commit authorization, followed by a separate explicit human push authorization; commit authorization never implies push authorization.
+
+See `templates/hermes-repo-contract.md` and `docs/hermes-pipeline.md` ("A8") for the full contract, and `templates/default-SOUL.md` for the versioned, installable default-profile policy template. A8.1 (this repository implementation) makes no live change: registering `pipeline_controller` and deregistering `pipeline_bridge`/`review_archive_bridge` on a live default profile remains a separate, human-authorized A8.3 runtime rollout, not something a repository task's PASS result ever implies.

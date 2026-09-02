@@ -224,3 +224,23 @@ Push requires a second, separate explicit human authorization. Commit authorizat
 Runtime installation is also a distinct human-authorized operation. Repository review or commit approval never silently authorizes A7.3 deployment.
 
 Before any A7.3 live mutation, the operator must preserve enough pre-rollout state to restore replaced runtime/configuration targets byte-for-byte if validation fails.
+
+## A8 `pipeline_controller` sole default lifecycle interface
+
+The default profile's Kanban lifecycle ownership is exercised exclusively through `pipeline_controller`. The default profile must not register or use `pipeline_bridge` directly, and must not register or use `review_archive_bridge` directly.
+
+- `pipeline_controller` exposes exactly seven tools: `check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`. No MCP tool defined in this repository (`planner_bridge`, `pipeline_bridge`, `review_archive_bridge`, `pipeline_controller`, `review_bridge`, `claude_bridge`) is named `commit*`, `push*`, or `staging*`.
+- `planner_bridge` remains planning-only: it never creates, checks, waits on, reviews, corrects, archives, or attests readiness for any Kanban task.
+- `reviewer` remains read-only and uses only `review_bridge`. `coder-claude` implements only through `claude_bridge`. Neither role gains direct Kanban lifecycle authority.
+- `pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, `coder-claude`, `planner-codex`, and `sysadmin` profiles.
+- `ready_to_commit` remains strictly read-only technical attestation (A5). Commit approval requires one explicit human authorization; push approval requires a second, separate explicit human authorization. Commit authorization never implies push authorization.
+
+### Phases
+
+```text
+A8.1 = repository implementation (documentation, contract, audit, and templates/default-SOUL.md).
+A8.2 = read-only review + archive + READY_TO_COMMIT + human commit/push.
+A8.3 = runtime policy/config rollout (separate human authorization).
+```
+
+Completion of A8.1 never implicitly authorizes A8.2 or A8.3. The repository audit (`scripts/audit-hermes-pipeline-hardening.sh`, bare invocation / `--repo-only`) verifies this contract hermetically against `templates/default-SOUL.md`, this contract file, and repository MCP source — never against live runtime state. The audit does not fail merely because a live default profile still lists `pipeline_bridge`/`review_archive_bridge`; deregistering them live is a separate, later, human-authorized A8.3 operation. `templates/default-SOUL.md` is the versioned, installable policy template for this target state; it is not the live executable SOUL and installing it live is a separate operator action.
