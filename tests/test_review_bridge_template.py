@@ -11,12 +11,14 @@ import hashlib
 import importlib.util
 import json
 import os
+from pathlib import Path
 import shlex
 import subprocess
 
 import pytest
 
-TEMPLATE_PATH = "/opt/ai/projects/ai-server-mcp-catalog/templates/review_bridge_server.py"
+REPO_ROOT = str(Path(__file__).resolve().parents[1])
+TEMPLATE_PATH = str(Path(REPO_ROOT) / "templates" / "review_bridge_server.py")
 
 
 def _load_module_with_subprocess_spy():
@@ -38,6 +40,15 @@ def _load_module_with_subprocess_spy():
     return module, calls
 
 
+def _load_module_with_env(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("HERMES_REVIEW_BRIDGE_COLLECT_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_REVIEW_BRIDGE_COLLECT_TIMEOUT_SECONDS", value)
+    module, _calls = _load_module_with_subprocess_spy()
+    return module
+
+
 review_bridge_server, IMPORT_TIME_SUBPROCESS_CALLS = _load_module_with_subprocess_spy()
 
 ReviewBridgeError = review_bridge_server.ReviewBridgeError
@@ -48,8 +59,6 @@ validate_content_window = review_bridge_server.validate_content_window
 validate_workdir = review_bridge_server.validate_workdir
 collect = review_bridge_server.collect
 ALLOWED_ROOT = review_bridge_server.ALLOWED_ROOT
-
-REPO_ROOT = "/opt/ai/projects/ai-server-mcp-catalog"
 
 
 def _init_git_repo(repo_dir):
@@ -73,12 +82,61 @@ def test_defaults():
     assert review_bridge_server.DEFAULT_INCLUDE_DIFF is False
     assert review_bridge_server.DEFAULT_INCLUDE_REPO_EVIDENCE is True
     assert review_bridge_server.MAX_CONTENT_WINDOW_LINES == 200
+    assert review_bridge_server.DEFAULT_COLLECT_TIMEOUT_SECONDS == 60
+    assert review_bridge_server.COLLECT_TIMEOUT_SECONDS == 60
 
     result = collect_evidence()
     assert result["test_command"] == "__skip__"
     assert result["changed_paths"] == []
     assert result["include_diff"] is False
     assert result["include_repo_evidence"] is True
+
+
+def test_collect_timeout_env_override(monkeypatch):
+    module = _load_module_with_env(monkeypatch, "150")
+    assert module.COLLECT_TIMEOUT_ENV == "HERMES_REVIEW_BRIDGE_COLLECT_TIMEOUT_SECONDS"
+    assert module.DEFAULT_COLLECT_TIMEOUT_SECONDS == 60
+    assert module.COLLECT_TIMEOUT_SECONDS == 150
+
+
+@pytest.mark.parametrize("raw_value", ["", "0", "-1", "not-an-int"])
+def test_collect_timeout_invalid_env_falls_back_to_default(monkeypatch, raw_value):
+    module = _load_module_with_env(monkeypatch, raw_value)
+    assert module.COLLECT_TIMEOUT_SECONDS == module.DEFAULT_COLLECT_TIMEOUT_SECONDS
+
+
+def test_collect_timeout_upper_bound_is_capped(monkeypatch):
+    module = _load_module_with_env(monkeypatch, "999999")
+    assert module.MAX_COLLECT_TIMEOUT_SECONDS == 900
+    assert module.COLLECT_TIMEOUT_SECONDS == module.MAX_COLLECT_TIMEOUT_SECONDS
+
+
+def test_test_command_uses_resolved_collect_timeout_by_default(monkeypatch):
+    module = _load_module_with_env(monkeypatch, "150")
+    captured = {}
+
+    def fake_run_argv(argv, cwd, timeout=module.COLLECT_TIMEOUT_SECONDS):
+        captured["argv"] = argv
+        captured["cwd"] = cwd
+        captured["timeout"] = timeout
+        return {
+            "command": list(argv),
+            "exit_code": 0,
+            "timed_out": False,
+            "stdout": "",
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(module, "_run_argv", fake_run_argv)
+
+    result = module._run_test_command(
+        "./scripts/audit-hermes-pipeline-hardening.sh",
+        Path(REPO_ROOT),
+    )
+
+    assert captured["argv"] == ["./scripts/audit-hermes-pipeline-hardening.sh"]
+    assert captured["timeout"] == 150
+    assert result["skipped"] is False
 
 
 def test_allowlist_accepts_all_three_commands():

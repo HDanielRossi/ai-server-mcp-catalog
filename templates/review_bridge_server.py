@@ -11,9 +11,8 @@ The deterministic, pure-logic helpers below (normalize_changed_paths,
 validate_test_command, validate_content_window, collect_evidence) remain
 side-effect free and are reused by the real `collect` entrypoint for input
 validation before any subprocess is spawned. All subprocess invocation is
-argv-list only (never shell=True), bounded by
-DEFAULT_COLLECT_TIMEOUT_SECONDS, never mutates git state, and never touches
-the network.
+argv-list only (never shell=True), bounded by COLLECT_TIMEOUT_SECONDS,
+never mutates git state, and never touches the network.
 """
 
 import hashlib
@@ -29,7 +28,9 @@ from mcp.server import MCPServer
 
 
 ALLOWED_ROOT = Path("/opt/ai/projects").resolve()
+COLLECT_TIMEOUT_ENV = "HERMES_REVIEW_BRIDGE_COLLECT_TIMEOUT_SECONDS"
 DEFAULT_COLLECT_TIMEOUT_SECONDS = 60
+MAX_COLLECT_TIMEOUT_SECONDS = 900
 MAX_CONTENT_WINDOW_BYTES = 20_000
 MAX_CAPTURED_OUTPUT_CHARS = 4_000
 REPOSITORY_STATE_SCHEMA = "hermes.repository-state/v1"
@@ -55,6 +56,38 @@ ALLOWED_TEST_COMMANDS = frozenset(
 
 class ReviewBridgeError(Exception):
     """Raised when review evidence inputs fail validation."""
+
+
+def _resolve_collect_timeout_seconds(raw_value=None):
+    """Resolve the bounded subprocess timeout for collect test commands.
+
+    Invalid, empty, zero, or negative values fall back to the historical
+    default. Values above MAX_COLLECT_TIMEOUT_SECONDS are capped so a runtime
+    configuration mistake cannot make reviewer subprocess execution
+    effectively unbounded.
+    """
+    if raw_value is None:
+        raw_value = os.environ.get(COLLECT_TIMEOUT_ENV)
+    if raw_value is None:
+        return DEFAULT_COLLECT_TIMEOUT_SECONDS
+
+    stripped = str(raw_value).strip()
+    if stripped == "":
+        return DEFAULT_COLLECT_TIMEOUT_SECONDS
+
+    try:
+        parsed = int(stripped, 10)
+    except ValueError:
+        return DEFAULT_COLLECT_TIMEOUT_SECONDS
+
+    if parsed <= 0:
+        return DEFAULT_COLLECT_TIMEOUT_SECONDS
+    if parsed > MAX_COLLECT_TIMEOUT_SECONDS:
+        return MAX_COLLECT_TIMEOUT_SECONDS
+    return parsed
+
+
+COLLECT_TIMEOUT_SECONDS = _resolve_collect_timeout_seconds()
 
 
 def normalize_changed_paths(changed_paths):
@@ -206,7 +239,7 @@ def _truncate_output(text, max_chars=MAX_CAPTURED_OUTPUT_CHARS):
     return text[:max_chars] + f"\n...[truncated to {max_chars} chars]"
 
 
-def _run_argv(argv, cwd, timeout=DEFAULT_COLLECT_TIMEOUT_SECONDS):
+def _run_argv(argv, cwd, timeout=COLLECT_TIMEOUT_SECONDS):
     """Run argv as a bounded, read-only subprocess (shell=False, no shell interpolation).
 
     Never raises on timeout or a non-zero exit status: both are captured as a
@@ -289,7 +322,7 @@ def _read_content_window(resolved_path, start_line, end_line):
     return "".join(lines)
 
 
-def _run_test_command(validated_test_command, resolved_workdir, timeout=DEFAULT_COLLECT_TIMEOUT_SECONDS):
+def _run_test_command(validated_test_command, resolved_workdir, timeout=COLLECT_TIMEOUT_SECONDS):
     """Execute an already-allowlist-validated test_command read-only, as an argv list."""
     if validated_test_command == DEFAULT_TEST_COMMAND:
         return {"command": validated_test_command, "skipped": True}
