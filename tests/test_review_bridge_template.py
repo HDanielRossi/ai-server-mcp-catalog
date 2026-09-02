@@ -76,16 +76,17 @@ def test_module_loaded_from_repo_path():
     assert review_bridge_server.__file__ == TEMPLATE_PATH
 
 
-def test_defaults():
-    assert review_bridge_server.DEFAULT_TEST_COMMAND == "__skip__"
-    assert review_bridge_server.DEFAULT_CHANGED_PATHS == ""
-    assert review_bridge_server.DEFAULT_INCLUDE_DIFF is False
-    assert review_bridge_server.DEFAULT_INCLUDE_REPO_EVIDENCE is True
-    assert review_bridge_server.MAX_CONTENT_WINDOW_LINES == 200
-    assert review_bridge_server.DEFAULT_COLLECT_TIMEOUT_SECONDS == 60
-    assert review_bridge_server.COLLECT_TIMEOUT_SECONDS == 60
+def test_defaults(monkeypatch):
+    module = _load_module_with_env(monkeypatch, None)
+    assert module.DEFAULT_TEST_COMMAND == "__skip__"
+    assert module.DEFAULT_CHANGED_PATHS == ""
+    assert module.DEFAULT_INCLUDE_DIFF is False
+    assert module.DEFAULT_INCLUDE_REPO_EVIDENCE is True
+    assert module.MAX_CONTENT_WINDOW_LINES == 200
+    assert module.DEFAULT_COLLECT_TIMEOUT_SECONDS == 60
+    assert module.COLLECT_TIMEOUT_SECONDS == 60
 
-    result = collect_evidence()
+    result = module.collect_evidence()
     assert result["test_command"] == "__skip__"
     assert result["changed_paths"] == []
     assert result["include_diff"] is False
