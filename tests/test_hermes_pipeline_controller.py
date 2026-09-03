@@ -148,15 +148,20 @@ def test_bootstrap_registration_create_failure_does_not_complete(monkeypatch, ca
 
 def test_committed_scope_matches_exact_base_to_head_paths():
     repo = Path(MODULE_PATH).resolve().parents[1]
+    implementation = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                                    capture_output=True, text=True).stdout.strip()
     scope = hpc.capture_committed_implementation_scope(
-        repo, "a50235ebb31eb8b9c0f43b9b6b252fe79a9e2dbf", "9375b6679c6cbed093e03246a601d9b3b5f295f2"
+        repo, "a50235ebb31eb8b9c0f43b9b6b252fe79a9e2dbf", implementation
     )
     assert scope["changed_paths"] == [
         "docs/hermes-pipeline.md",
         "scripts/audit-hermes-pipeline-hardening.sh",
         "scripts/hermes-pipeline-controller.py",
+        "templates/review_bridge_server.py",
+        "templates/reviewer-SOUL.md",
         "tests/test_audit_hermes_pipeline_hardening.py",
         "tests/test_hermes_pipeline_controller.py",
+        "tests/test_review_bridge_template.py",
     ]
     assert scope["changed_paths"] == sorted(set(scope["changed_paths"]))
 

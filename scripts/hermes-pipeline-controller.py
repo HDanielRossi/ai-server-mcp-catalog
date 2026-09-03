@@ -1256,7 +1256,7 @@ def _describe_untracked_entry(resolved_workdir, relative_path):
 
 def _capture_repository_state_once(resolved_workdir, canonical_workdir):
     """Capture one repository-state/v1 envelope. Read-only: no git object/index/file writes."""
-    head = _run_git_text(["git", "rev-parse", "--verify", "HEAD^{commit}"], resolved_workdir).strip()
+    head = _run_git_text(["git", "rev-parse", "HEAD"], resolved_workdir).strip()
 
     staged_paths = _git_path_list(["git", "diff", "--name-only", "--cached"], resolved_workdir)
     unstaged_paths = _git_path_list(["git", "diff", "--name-only"], resolved_workdir)
@@ -1310,7 +1310,9 @@ def capture_committed_implementation_scope(resolved_workdir, base_sha, implement
         ).strip()
         if resolved != sha:
             raise RepositoryStateError("%s-sha does not resolve to the requested commit" % label)
-    head = _run_git_text(["git", "rev-parse", "HEAD"], resolved_workdir).strip()
+    head = _run_git_text(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"], resolved_workdir
+    ).strip()
     if head != implementation_sha:
         raise RepositoryStateError("implementation-sha does not match repository HEAD")
     raw = _run_git_capture(
