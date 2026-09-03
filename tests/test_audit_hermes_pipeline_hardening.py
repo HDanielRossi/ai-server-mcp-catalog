@@ -36,7 +36,7 @@ FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
     "681834f1180145d5ced38e8e34f202a3c25f326a43d99344423c5a9970327eb9"
 )
 FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256 = (
-    "1548c8bdde59d20ccaf02f35e11445d6bdd6576e0bb616ab8ee39744a17f814b"
+    "ec947f638c030fdcfa5b214e83f48150f25c61699f6e7b20d711067d664c3bbd"
 )
 
 REPO_ONLY_FILES = [
@@ -1137,10 +1137,14 @@ MUT_PC_COMMIT_PERFORMED_REJECT_NEW = (
 
 MUT_PC_PUSH_PERFORMED_READY_OLD = (
     '"commit_performed": False,\n        "push_performed": False,\n    }\n'
+    '    if implementation_provenance == "operator-bootstrap":\n'
+    '        payload["implementation_provenance"] = implementation_provenance\n'
     '    print(json.dumps(payload, separators=(",", ":")))\n    return EXIT_OK\n'
 )
 MUT_PC_PUSH_PERFORMED_READY_NEW = (
     '"commit_performed": False,\n        "push_performed": True,\n    }\n'
+    '    if implementation_provenance == "operator-bootstrap":\n'
+    '        payload["implementation_provenance"] = implementation_provenance\n'
     '    print(json.dumps(payload, separators=(",", ":")))\n    return EXIT_OK\n'
 )
 

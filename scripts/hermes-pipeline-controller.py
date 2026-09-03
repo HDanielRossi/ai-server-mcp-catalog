@@ -66,6 +66,8 @@ REVIEW_ARCHIVE_ENVELOPE_KEYS = frozenset({
 REVIEW_ARCHIVE_FILENAME_RE_TEMPLATE = r"^\d{8}_\d{6}-%s\.md$"
 REVIEW_ARCHIVE_JSON_BLOCK_RE = re.compile(r"```json\r?\n(.*?)\r?\n```", re.DOTALL)
 FORMAL_REVIEW_MARKER = "HERMES_FORMAL_REVIEW_V1"
+BOOTSTRAP_PROVENANCE_SCHEMA = "hermes.implementation-provenance/operator-bootstrap/v1"
+BOOTSTRAP_REASON = "IMPLEMENTATION_BOOTSTRAP_PROVENANCE_GAP"
 
 
 class CliUsageError(Exception):
@@ -136,6 +138,18 @@ def build_parser():
     create_impl.add_argument("--workdir", required=True)
     create_impl.add_argument("--feature", required=True)
     create_impl.add_argument("--body", default=None)
+
+    bootstrap = subparsers.add_parser(
+        "register-bootstrap-implementation", prog="register-bootstrap-implementation",
+        description="register an explicitly operator-authored implementation provenance record",
+    )
+    bootstrap.add_argument("--workdir", required=True)
+    bootstrap.add_argument("--feature", required=True)
+    bootstrap.add_argument("--reason", required=True)
+    bootstrap.add_argument("--base-sha", required=True)
+    bootstrap.add_argument("--implementation-sha", required=True)
+    bootstrap.add_argument("--validation-evidence", required=True,
+                           help="JSON array of structured validation result objects")
 
     create_review = subparsers.add_parser(
         "create-review", prog="create-review",
@@ -727,6 +741,80 @@ def create_implementation(args):
     return EXIT_OK
 
 
+def register_bootstrap_implementation(args):
+    """Register operator-authored provenance without impersonating a worker."""
+    phase = "register-bootstrap-implementation"
+    resolved = validate_phase_inputs(phase, args.workdir, args.feature)
+    if args.reason != BOOTSTRAP_REASON:
+        raise ValidationBlock(phase, "unsupported bootstrap reason: %r" % args.reason)
+    sha_re = r"[0-9a-f]{40}"
+    if not re.fullmatch(sha_re, args.base_sha) or not re.fullmatch(sha_re, args.implementation_sha):
+        raise ValidationBlock(phase, "base-sha and implementation-sha must be 40 lowercase hex characters")
+    try:
+        evidence = json.loads(args.validation_evidence)
+    except (TypeError, ValueError) as exc:
+        raise ValidationBlock(phase, "validation-evidence must be valid JSON: %s" % exc)
+    if not isinstance(evidence, list) or not evidence or not all(isinstance(item, dict) for item in evidence):
+        raise ValidationBlock(phase, "validation-evidence must be a non-empty JSON array of objects")
+    required_ops = {"pytest_full", "audit", "git_diff_check"}
+    seen = set()
+    for item in evidence:
+        if set(item) != {"operation", "exit_code", "status"}:
+            raise ValidationBlock(phase, "each validation record must contain exactly operation, exit_code, status")
+        if not isinstance(item["operation"], str) or item["operation"] in seen:
+            raise ValidationBlock(phase, "validation operations must be unique strings")
+        if item["status"] != "PASS" or item["exit_code"] != 0:
+            raise ValidationBlock(phase, "all validation operations must have status PASS and exit_code 0")
+        seen.add(item["operation"])
+    if not required_ops.issubset(seen):
+        raise ValidationBlock(phase, "missing mandatory validation operations: %s" % sorted(required_ops - seen))
+    try:
+        state = capture_repository_state(resolved)
+    except (RepositoryStateError, TransportError) as exc:
+        raise ValidationBlock(phase, "cannot capture repository state: %s" % exc)
+    if state["changed_paths"]:
+        raise ValidationBlock(phase, "bootstrap provenance requires a clean worktree")
+    head = state.get("head")
+    if head != args.implementation_sha:
+        raise ValidationBlock(phase, "implementation-sha does not match repository HEAD")
+    provenance = {
+        "schema": BOOTSTRAP_PROVENANCE_SCHEMA,
+        "implementation_provenance": "operator-bootstrap",
+        "implementation_task_id": "PENDING",
+        "reason": args.reason,
+        "workdir": os.path.realpath(str(resolved)),
+        "base_sha": args.base_sha,
+        "implementation_sha": args.implementation_sha,
+        "repository_state": state,
+        "repository_state_sha256": state["aggregate_sha256"],
+        "changed_paths": [],
+        "mutation_scope": "operator-authored repository implementation only; no worker run",
+        "validation": evidence,
+        "coder_worker_run": False,
+    }
+    key = stable_key(str(resolved), args.feature, "bootstrap-implementation")
+    body = "Operator bootstrap implementation for %s. Explicit provenance; no coder worker run." % args.feature
+    create = run_hermes_command([
+        "hermes", "kanban", "create", "Bootstrap %s in %s" % (args.feature, resolved.name),
+        "--body", body, "--workspace", "dir:" + str(resolved),
+        "--idempotency-key", key, "--created-by", "pipeline_controller",
+        "--max-retries", "0", "--json",
+    ])
+    task_id = extract_real_id(parse_json_stdout(create, "hermes kanban create"))
+    provenance["implementation_task_id"] = task_id
+    complete = run_hermes_command([
+        "hermes", "kanban", "complete", task_id,
+        "--summary", "operator-bootstrap provenance registered",
+        "--metadata", json.dumps(provenance, separators=(",", ":")),
+    ])
+    if complete.returncode != 0:
+        raise TransportError("hermes kanban complete failed: %s" % (complete.stderr or complete.stdout).strip())
+    print(json.dumps({"phase": phase, "task_id": task_id, "workdir": str(resolved),
+                      "implementation_provenance": "operator-bootstrap", "repository_state_sha256": state["aggregate_sha256"]},
+                     separators=(",", ":")))
+    return EXIT_OK
+
+
 def create_review(args):
     phase = "review"
     resolved = validate_phase_inputs(phase, args.workdir, args.feature)
@@ -1282,10 +1370,10 @@ def _validate_implementation_task(task, task_id, canonical_workdir):
             "implementation task workspace %r does not match requested workdir %r"
             % (workspace_path, canonical_workdir),
         )
-    if task.get("assignee") != "coder-claude":
+    if task.get("assignee") not in ("coder-claude", None):
         raise ReadyToCommitReject(
             "implementation_assignee_mismatch",
-            "implementation task.assignee is %r, expected 'coder-claude'" % (task.get("assignee"),),
+            "implementation task.assignee is %r, expected 'coder-claude' or null" % (task.get("assignee"),),
         )
     if task.get("status") != "done":
         raise ReadyToCommitReject(
@@ -1302,21 +1390,63 @@ def _validate_implementation_task(task, task_id, canonical_workdir):
 
 
 def _validate_implementation_latest_run(run):
+    if run.get("profile") == "coder-claude":
+        if run.get("outcome") != "completed":
+            raise ReadyToCommitReject(
+                "implementation_run_outcome_mismatch",
+                "implementation latest run outcome is %r, expected 'completed'" % (run.get("outcome"),),
+            )
+        if run.get("status") not in ("done", "completed"):
+            raise ReadyToCommitReject(
+                "implementation_run_status_mismatch",
+                "implementation latest run status is %r, expected 'done' or 'completed'" % (run.get("status"),),
+            )
+        return "coder-worker"
+    metadata = run.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("schema") == BOOTSTRAP_PROVENANCE_SCHEMA:
+        if run.get("outcome") != "completed" or run.get("status") not in ("done", "completed"):
+            raise ReadyToCommitReject("bootstrap_run_status_invalid", "bootstrap provenance run is not completed")
+        if metadata.get("implementation_provenance") != "operator-bootstrap":
+            raise ReadyToCommitReject("bootstrap_provenance_mode_invalid", "bootstrap provenance mode is invalid")
+        if metadata.get("coder_worker_run") is not False:
+            raise ReadyToCommitReject("bootstrap_coder_run_invalid", "bootstrap provenance must state no coder worker run")
+        return "operator-bootstrap"
     if run.get("profile") != "coder-claude":
         raise ReadyToCommitReject(
             "implementation_run_profile_mismatch",
             "implementation latest run profile is %r, expected 'coder-claude'" % (run.get("profile"),),
         )
-    if run.get("outcome") != "completed":
-        raise ReadyToCommitReject(
-            "implementation_run_outcome_mismatch",
-            "implementation latest run outcome is %r, expected 'completed'" % (run.get("outcome"),),
-        )
-    if run.get("status") not in ("done", "completed"):
-        raise ReadyToCommitReject(
-            "implementation_run_status_mismatch",
-            "implementation latest run status is %r, expected 'done' or 'completed'" % (run.get("status"),),
-        )
+    raise AssertionError("unreachable")
+
+
+def _validate_bootstrap_provenance(run, task, task_id, canonical_workdir):
+    metadata = run.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ReadyToCommitReject("bootstrap_provenance_shape", "bootstrap provenance metadata must be an object")
+    if task.get("assignee") is not None or task.get("created_by") != "pipeline_controller":
+        raise ReadyToCommitReject("bootstrap_task_identity_invalid", "bootstrap task must be operator-owned and unassigned")
+    exact = {
+        "schema", "implementation_provenance", "implementation_task_id", "reason", "workdir",
+        "base_sha", "implementation_sha", "repository_state", "repository_state_sha256",
+        "changed_paths", "mutation_scope", "validation", "coder_worker_run",
+    }
+    if set(metadata) != exact:
+        raise ReadyToCommitReject("bootstrap_provenance_keys", "bootstrap provenance keys are not exact")
+    if metadata["implementation_task_id"] != task_id or metadata["reason"] != BOOTSTRAP_REASON:
+        raise ReadyToCommitReject("bootstrap_provenance_identity", "bootstrap provenance identity/reason mismatch")
+    if metadata["workdir"] != canonical_workdir or metadata["changed_paths"] != []:
+        raise ReadyToCommitReject("bootstrap_provenance_scope", "bootstrap workdir or changed paths invalid")
+    if not re.fullmatch(r"[0-9a-f]{40}", metadata["base_sha"]) or not re.fullmatch(r"[0-9a-f]{40}", metadata["implementation_sha"]):
+        raise ReadyToCommitReject("bootstrap_provenance_sha", "bootstrap base/implementation SHA malformed")
+    state = metadata["repository_state"]
+    if not isinstance(state, dict) or state.get("schema") != REPOSITORY_STATE_SCHEMA:
+        raise ReadyToCommitReject("bootstrap_repository_state_invalid", "bootstrap repository_state is invalid")
+    if metadata["repository_state_sha256"] != state.get("aggregate_sha256") or _sha256_canonical_excluding(state, "aggregate_sha256") != state.get("aggregate_sha256"):
+        raise ReadyToCommitReject("bootstrap_repository_state_hash", "bootstrap repository state hash mismatch")
+    validation = metadata["validation"]
+    if not isinstance(validation, list) or not validation or any(not isinstance(item, dict) or item.get("status") != "PASS" or item.get("exit_code") != 0 for item in validation):
+        raise ReadyToCommitReject("bootstrap_validation_invalid", "bootstrap validation evidence is invalid")
+    return state
 
 
 def _validate_review_task(task, task_id, canonical_workdir):
@@ -1606,9 +1736,15 @@ def ready_to_commit(args):
     # --- implementation task ---
     impl_show, impl_runs = _fetch_show_and_runs(implementation_task_id)
     _require_show_runs_match("implementation", impl_show, impl_runs)
-    _validate_implementation_task(impl_show.get("task"), implementation_task_id, canonical_workdir)
+    impl_task = impl_show.get("task")
+    _validate_implementation_task(impl_task, implementation_task_id, canonical_workdir)
     impl_latest = _select_latest_run_reject("implementation_run_selection_invalid", impl_show.get("runs"))
-    _validate_implementation_latest_run(impl_latest)
+    implementation_provenance = _validate_implementation_latest_run(impl_latest)
+    bootstrap_state = None
+    if implementation_provenance == "operator-bootstrap":
+        bootstrap_state = _validate_bootstrap_provenance(
+            impl_latest, impl_task, implementation_task_id, canonical_workdir,
+        )
 
     # --- review task ---
     review_show, review_runs = _fetch_show_and_runs(review_task_id)
@@ -1654,6 +1790,11 @@ def ready_to_commit(args):
             "repository_state_mismatch_archive",
             "current repository_state does not match the archived review artifact repository_state",
         )
+    if bootstrap_state is not None and current_state != bootstrap_state:
+        raise ReadyToCommitReject(
+            "bootstrap_repository_state_mismatch",
+            "current repository_state does not match bootstrap provenance",
+        )
 
     payload = {
         "phase": "ready-to-commit",
@@ -1670,6 +1811,8 @@ def ready_to_commit(args):
         "commit_performed": False,
         "push_performed": False,
     }
+    if implementation_provenance == "operator-bootstrap":
+        payload["implementation_provenance"] = implementation_provenance
     print(json.dumps(payload, separators=(",", ":")))
     return EXIT_OK
 

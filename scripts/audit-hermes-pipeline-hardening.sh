@@ -1188,7 +1188,7 @@ if ready_fn is not None:
             and isinstance(node.ops[0], ast.NotEq)
         ):
             fingerprint_compare_count += 1
-if fingerprint_compare_count < 2:
+if fingerprint_compare_count < 3:
     findings.append("ready_to_commit_fingerprint_equality_missing")
 
 # 7) git diff --check gate

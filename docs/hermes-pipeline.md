@@ -1358,3 +1358,12 @@ The default profile must not register or use `pipeline_bridge` directly, and mus
 `scripts/audit-hermes-pipeline-hardening.sh` (`--repo-only`, the default bare invocation) verifies all 15 A8 invariants hermetically against `templates/default-SOUL.md`, `templates/hermes-repo-contract.md`, and repository MCP source — never against live runtime state. The audit does not fail merely because the live default profile still lists `pipeline_bridge`/`review_archive_bridge`; deregistering them live is A8.3, a separate, later, human-authorized operation. Any pre-existing live-state check that would otherwise contradict this A8.1 target state is reported as a non-gating `INFO(live):` line rather than a failure.
 
 Repository audit PASS never implies A8.3 has happened.
+
+## Operator-bootstrap implementation provenance
+
+`register-bootstrap-implementation` explicitly records
+`hermes.implementation-provenance/operator-bootstrap/v1` for infrastructure
+changes that cannot yet be validated by the implementation worker. It records
+exact commits, stable repository state, changed paths, and structured PASS
+validation evidence; it never fabricates a `coder-claude` run and never bypasses
+formal review, archive-v2, READY_TO_COMMIT, or separate human approvals.
