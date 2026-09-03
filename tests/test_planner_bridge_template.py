@@ -9,7 +9,8 @@ import importlib.util
 import inspect
 import os
 
-TEMPLATE_PATH = "/opt/ai/projects/ai-server-mcp-catalog/templates/planner_bridge_server.py"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "planner_bridge_server.py")
 
 spec = importlib.util.spec_from_file_location("planner_bridge_server", TEMPLATE_PATH)
 planner_bridge_server = importlib.util.module_from_spec(spec)
@@ -145,6 +146,19 @@ def test_subprocess_invocation_uses_argv_list_not_shell_true():
         source = f.read()
     assert "shell=True" not in source
     assert "subprocess.run(" in source
+
+
+def test_outer_timeout_is_structured(monkeypatch):
+    import subprocess
+
+    def fake_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["planner-bridge"], timeout=900)
+
+    monkeypatch.setattr(planner_bridge_server.subprocess, "run", fake_run)
+    repo_dir = REPO_ROOT
+    result = planner_bridge_server.run(repo_dir, "plan something")
+    assert '"error":"PLANNER_TIMEOUT"' in result
+    assert "exit_code=124" in result
 
 
 def test_workdir_containment_preserved():

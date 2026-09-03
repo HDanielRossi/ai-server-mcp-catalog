@@ -12,6 +12,9 @@ set -Eeuo pipefail
 MAX_CONTEXT_FILES=12
 MAX_CONTEXT_FILE_BYTES=262144
 MAX_CONTEXT_TOTAL_BYTES=524288
+DEFAULT_PLANNER_TIMEOUT_SECONDS=600
+MAX_PLANNER_TIMEOUT_SECONDS=899
+DEFAULT_RESERVED_OUTPUT_TOKENS=4096
 
 usage() {
   echo "Usage: planner-bridge <workdir> <prompt> [--context-file <relative-path> ...]"
@@ -67,6 +70,33 @@ case "$REAL_WORKDIR" in
 esac
 
 cd "$REAL_WORKDIR"
+
+resolve_positive_bounded_integer() {
+  local name="$1"
+  local raw="$2"
+  local default_value="$3"
+  local maximum="$4"
+  if [[ -z "$raw" ]]; then
+    printf '%s' "$default_value"
+    return 0
+  fi
+  if [[ ! "$raw" =~ ^[0-9]+$ ]] || (( raw < 1 || raw > maximum )); then
+    echo "${name} must be a positive integer <= ${maximum}: ${raw}" >&2
+    return 2
+  fi
+  printf '%s' "$raw"
+}
+
+PLANNER_TIMEOUT_SECONDS="$(resolve_positive_bounded_integer \
+  HERMES_PLANNER_BRIDGE_TIMEOUT_SECONDS \
+  "${HERMES_PLANNER_BRIDGE_TIMEOUT_SECONDS:-}" \
+  "$DEFAULT_PLANNER_TIMEOUT_SECONDS" "$MAX_PLANNER_TIMEOUT_SECONDS")" || exit $?
+
+RESERVED_OUTPUT_TOKENS="$(resolve_positive_bounded_integer \
+  HERMES_PLANNER_RESERVED_OUTPUT_TOKENS \
+  "${HERMES_PLANNER_RESERVED_OUTPUT_TOKENS:-}" \
+  "$DEFAULT_RESERVED_OUTPUT_TOKENS" 1000000)" || exit $?
+export HERMES_PLANNER_RESERVED_OUTPUT_TOKENS="$RESERVED_OUTPUT_TOKENS"
 
 # ===== EXPLICIT CONTEXT VALIDATION =====
 # Every --context-file is fully validated (existence, regular-file, containment
@@ -239,7 +269,8 @@ if [[ ! -x "$PLANNER_CODEX_PYTHON" ]]; then
   exit 1
 fi
 
-RUNNER_CODE='import os
+RUNNER_CODE='import json
+import os
 import sys
 
 workdir = sys.argv[1]
@@ -252,10 +283,64 @@ sys.argv = ["hermes", "-p", "planner-codex"]
 from hermes_cli.main import _run_and_exit_oneshot
 
 prompt = sys.stdin.read()
+
+# This gate runs after the complete request string has been assembled and
+# before Hermes initializes or calls a provider.  It deliberately does not
+# reduce context: every byte remains in ``prompt`` or the request is rejected.
+from agent.model_metadata import estimate_tokens_rough
+from hermes_cli.config import load_config_readonly
+
+cfg = load_config_readonly()
+model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+if not isinstance(model_cfg, dict):
+    model_cfg = {}
+context_limit = model_cfg.get("context_length")
+if not isinstance(context_limit, int) or isinstance(context_limit, bool) or context_limit < 1:
+    print(json.dumps({
+        "error": "CONTEXT_LIMIT_UNAVAILABLE",
+        "message": "planner model.context_length is not configured",
+    }, sort_keys=True))
+    raise SystemExit(78)
+
+reserved_output = int(os.environ["HERMES_PLANNER_RESERVED_OUTPUT_TOKENS"])
+# Hermes existing estimator is the provider integration compatible rough
+# estimator.  UTF-8 bytes are also charged as a deterministic conservative
+# floor, avoiding the unsafe assumption that bytes equal the usual 4-char
+# English estimate.  The fixed envelope accounts for request framing and
+# provider message overhead not represented in the plain prompt string.
+rough_tokens = estimate_tokens_rough(prompt)
+utf8_tokens = len(prompt.encode("utf-8"))
+envelope_tokens = 128
+input_tokens = max(rough_tokens, utf8_tokens) + envelope_tokens
+total_tokens = input_tokens + reserved_output
+budget = {
+    "effective_context_limit": context_limit,
+    "estimated_input_tokens": input_tokens,
+    "reserved_output_tokens": reserved_output,
+    "total_reserved_tokens": total_tokens,
+    "remaining_tokens": context_limit - total_tokens,
+    "counting_method": "max(Hermes estimate_tokens_rough, UTF-8 byte count) + 128-token request envelope",
+}
+if total_tokens > context_limit:
+    print(json.dumps({"error": "CONTEXT_BUDGET_EXCEEDED", **budget}, sort_keys=True))
+    raise SystemExit(78)
+if os.environ.get("HERMES_PLANNER_PREFLIGHT_ONLY") == "1":
+    print(json.dumps({"result": "CONTEXT_BUDGET_OK", **budget}, sort_keys=True))
+    raise SystemExit(0)
+
 _run_and_exit_oneshot(
     prompt,
     toolsets="clarify,context_engine,memory",
 )
 '
 
-printf '%s' "$PROMPT" | "$PLANNER_CODEX_PYTHON" -c "$RUNNER_CODE" "$REAL_WORKDIR"
+set +e
+printf '%s' "$PROMPT" | timeout -k 5 "$PLANNER_TIMEOUT_SECONDS" \
+  "$PLANNER_CODEX_PYTHON" -c "$RUNNER_CODE" "$REAL_WORKDIR"
+PLANNER_RC=${PIPESTATUS[1]}
+set -e
+if [[ "$PLANNER_RC" -eq 124 || "$PLANNER_RC" -eq 137 ]]; then
+  printf '%s\n' "{\"error\":\"PLANNER_TIMEOUT\",\"timeout_seconds\":${PLANNER_TIMEOUT_SECONDS}}"
+  exit 124
+fi
+exit "$PLANNER_RC"

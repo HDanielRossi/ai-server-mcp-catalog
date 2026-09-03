@@ -2545,7 +2545,7 @@ run_repo_only() {
     'sys.argv = ["hermes", "-p", "planner-codex"]'
     'prompt = sys.stdin.read()'
     'from hermes_cli.main import _run_and_exit_oneshot'
-    'printf '\''%s'\'' "$PROMPT" | "$PLANNER_CODEX_PYTHON"'
+    'printf '\''%s'\'' "$PROMPT" | timeout -k 5'
   )
   for s in "${PLANNER_WRAPPER_STRINGS[@]}"; do
     if grep_ok "$PLANNER_WRAPPER_FILE" "$s"; then
