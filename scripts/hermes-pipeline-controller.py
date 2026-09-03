@@ -1830,6 +1830,8 @@ def main(argv=None):
             return check_task(args.task_id)
         elif args.command == "create-implementation":
             return create_implementation(args)
+        elif args.command == "register-bootstrap-implementation":
+            return register_bootstrap_implementation(args)
         elif args.command == "create-review":
             return create_review(args)
         elif args.command == "create-correction":

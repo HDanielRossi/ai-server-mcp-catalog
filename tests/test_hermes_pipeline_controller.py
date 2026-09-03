@@ -18,6 +18,30 @@ spec.loader.exec_module(hpc)
 TASK_ID = "t_pipeline_controller_a1"
 
 
+def test_bootstrap_command_reaches_main_handler(monkeypatch):
+    seen = {}
+
+    def fake_handler(args):
+        seen.update(vars(args))
+        return hpc.EXIT_OK
+
+    monkeypatch.setattr(hpc, "register_bootstrap_implementation", fake_handler)
+    rc = hpc.main([
+        "register-bootstrap-implementation", "--workdir", "/opt/ai/projects/x",
+        "--feature", "x", "--reason", "IMPLEMENTATION_BOOTSTRAP_PROVENANCE_GAP",
+        "--base-sha", "a" * 40, "--implementation-sha", "b" * 40,
+        "--validation-evidence", "[]",
+    ])
+    assert rc == hpc.EXIT_OK
+    assert seen["command"] == "register-bootstrap-implementation"
+
+
+def test_bootstrap_command_missing_required_argument_is_usage_error(capsys):
+    rc = hpc.main(["register-bootstrap-implementation", "--workdir", "/opt/ai/projects/x"])
+    assert rc == hpc.EXIT_TRANSPORT
+    assert "usage error:" in capsys.readouterr().err
+
+
 def make_task(**overrides):
     t = {
         "id": TASK_ID,
