@@ -375,6 +375,90 @@ def test_create_implementation_success(capsys):
     ]
 
 
+def test_formal_review_check_rejects_narrative_pass_without_metadata(capsys):
+    task = make_task(
+        id="t_formalreview1", title="formal review", assignee="reviewer",
+        body=hpc.FORMAL_REVIEW_MARKER + "\nReview this change",
+        workspace_path=VALID_WD,
+    )
+    run = make_run(
+        id=2, profile="reviewer", status="done", outcome="completed",
+        summary="PASS", metadata=None,
+    )
+    show = make_show(task=task, parents=[IMPL_ID], runs=[run])
+    with stub_hermes(show, [run]):
+        rc = hpc.main(["check", "t_formalreview1"])
+    assert rc == hpc.EXIT_VALIDATION
+    _, obj = parse_stdout_line(capsys)
+    assert obj["valid"] is False
+    assert any("FORMAL_REVIEW_METADATA_INVALID" in error for error in obj["errors"])
+
+
+def test_unmarked_reviewer_task_keeps_legacy_check_compatibility(capsys):
+    task = make_task(assignee="reviewer", body="Historical reviewer task")
+    run = make_run(profile="reviewer", summary="PASS")
+    with stub_hermes(make_show(task=task, runs=[run]), [run]):
+        rc = hpc.main(["check", TASK_ID])
+    assert rc == hpc.EXIT_OK
+    _, obj = parse_stdout_line(capsys)
+    assert obj["valid"] is True
+
+
+def _formal_state(workdir):
+    state = {
+        "schema": hpc.REPOSITORY_STATE_SCHEMA,
+        "workdir": os.path.realpath(workdir),
+        "head": "a" * 40,
+        "changed_paths": [],
+        "staged_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "unstaged_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "untracked": [],
+    }
+    state["aggregate_sha256"] = hpc._sha256_canonical_excluding(state, "aggregate_sha256")
+    return state
+
+
+@pytest.mark.parametrize("verdict", ["PASS", "CHANGES REQUIRED"])
+def test_formal_review_metadata_valid_verdicts_are_accepted(verdict):
+    state = _formal_state(VALID_WD)
+    task = make_task(
+        assignee="reviewer", body=hpc.FORMAL_REVIEW_MARKER,
+        workspace_path=VALID_WD,
+    )
+    metadata = {
+        "implementation_task_id": IMPL_ID,
+        "verdict": verdict,
+        "mutation_performed": False,
+        "repository_state": state,
+        "repository_state_sha256": state["aggregate_sha256"],
+    }
+    assert hpc._formal_review_metadata_errors(
+        task, [IMPL_ID], [make_run(id=2, profile="reviewer", metadata=metadata)]
+    ) == []
+
+
+@pytest.mark.parametrize("field", [
+    "implementation_task_id", "mutation_performed", "repository_state",
+    "repository_state_sha256", "verdict",
+])
+def test_formal_review_metadata_missing_field_is_rejected(field):
+    state = _formal_state(VALID_WD)
+    metadata = {
+        "implementation_task_id": IMPL_ID,
+        "verdict": "PASS",
+        "mutation_performed": False,
+        "repository_state": state,
+        "repository_state_sha256": state["aggregate_sha256"],
+    }
+    metadata.pop(field)
+    task = make_task(assignee="reviewer", body=hpc.FORMAL_REVIEW_MARKER, workspace_path=VALID_WD)
+    errors = hpc._formal_review_metadata_errors(
+        task, [IMPL_ID], [make_run(id=2, profile="reviewer", metadata=metadata)]
+    )
+    assert errors
+    assert "FORMAL_REVIEW_METADATA_INVALID" in " ".join(errors)
+
+
 def test_create_implementation_workdir_outside_allowed_root(capsys):
     patcher, calls = stub_create_aware(create_obj={"id": "t_created"})
     with patcher:
@@ -511,6 +595,7 @@ def test_create_review_success(capsys):
         "--max-retries", "1",
         "--json",
     ]
+    assert argv[5].startswith(hpc.FORMAL_REVIEW_MARKER + "\n")
 
 
 def test_create_review_empty_impl_id(capsys):

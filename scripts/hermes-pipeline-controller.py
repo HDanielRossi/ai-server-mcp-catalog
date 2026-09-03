@@ -65,6 +65,7 @@ REVIEW_ARCHIVE_ENVELOPE_KEYS = frozenset({
 })
 REVIEW_ARCHIVE_FILENAME_RE_TEMPLATE = r"^\d{8}_\d{6}-%s\.md$"
 REVIEW_ARCHIVE_JSON_BLOCK_RE = re.compile(r"```json\r?\n(.*?)\r?\n```", re.DOTALL)
+FORMAL_REVIEW_MARKER = "HERMES_FORMAL_REVIEW_V1"
 
 
 class CliUsageError(Exception):
@@ -247,6 +248,53 @@ def classify_verdict(run):
     if has_pass and not has_cr:
         return "PASS", "summary"
     raise VerdictBlock("ambiguous or unknown summary verdict: %r" % (summary,))
+
+
+def _is_formal_review_task(task):
+    """Identify only reviews created by the formal pipeline contract."""
+    return (
+        isinstance(task, dict)
+        and task.get("assignee") == "reviewer"
+        and isinstance(task.get("body"), str)
+        and FORMAL_REVIEW_MARKER in task["body"]
+    )
+
+
+def _formal_review_metadata_errors(task, parents, runs):
+    """Return fail-closed errors for a marked formal review completion.
+
+    This is deliberately scoped by FORMAL_REVIEW_MARKER so historical and
+    unrelated reviewer tasks retain their existing check compatibility.
+    """
+    errors = []
+    if not isinstance(parents, list) or len(parents) != 1 or not valid_task_id(parents[0]):
+        errors.append("formal review requires exactly one valid implementation parent")
+        return errors
+    try:
+        latest = select_latest_run("formal-review", runs)
+    except ValidationBlock as exc:
+        return [exc.reason]
+    if latest.get("profile") != "reviewer":
+        errors.append("formal review latest run profile is %r, expected 'reviewer'" % latest.get("profile"))
+    if latest.get("status") != "done":
+        errors.append("formal review latest run status is %r, expected 'done'" % latest.get("status"))
+    if latest.get("outcome") != "completed":
+        errors.append("formal review latest run outcome is %r, expected 'completed'" % latest.get("outcome"))
+    metadata = latest.get("metadata")
+    if not isinstance(metadata, dict):
+        errors.append("FORMAL_REVIEW_METADATA_INVALID: metadata must be a JSON object")
+        return errors
+    if metadata.get("implementation_task_id") != parents[0]:
+        errors.append("FORMAL_REVIEW_METADATA_INVALID: implementation_task_id mismatch")
+    if metadata.get("verdict") not in ("PASS", "CHANGES REQUIRED"):
+        errors.append("FORMAL_REVIEW_METADATA_INVALID: verdict must be PASS or CHANGES REQUIRED")
+    if metadata.get("mutation_performed") is not False:
+        errors.append("FORMAL_REVIEW_METADATA_INVALID: mutation_performed must be exactly false")
+    try:
+        _validate_review_metadata_repository_state(metadata, task.get("workspace_path"))
+    except (ReadyToCommitReject, TypeError) as exc:
+        errors.append("FORMAL_REVIEW_METADATA_INVALID: " + str(exc))
+    return errors
 
 
 def select_latest_run(phase, runs):
@@ -640,6 +688,9 @@ def check_task(task_id):
     runs = parse_json_stdout(runs_completed, spec2)
     show = validate_show_top_level(show)
     errors = validate_payloads(task_id, show, runs)
+    task = show.get("task")
+    if not errors and _is_formal_review_task(task):
+        errors.extend(_formal_review_metadata_errors(task, show.get("parents"), show.get("runs")))
     valid = not errors
     emit_result(task_id, show_completed.returncode, runs_completed.returncode, valid, errors)
     return EXIT_OK if valid else EXIT_VALIDATION
@@ -691,6 +742,7 @@ def create_review(args):
         body = "Review %s in workspace %s (implementation task %s)." % (
             feature, str(resolved), impl_id,
         )
+    body = FORMAL_REVIEW_MARKER + "\n" + body
 
     argv = [
         "hermes", "kanban", "create",
@@ -739,6 +791,10 @@ def create_correction(args):
         raise ValidationBlock(phase, "ambiguous verdict, cannot create correction")
     if not all(isinstance(r.get("id"), (int, str)) for r in runs):
         raise ValidationBlock(phase, "ambiguous verdict, cannot create correction")
+    if _is_formal_review_task(task):
+        formal_errors = _formal_review_metadata_errors(task, show.get("parents"), runs)
+        if formal_errors:
+            raise ValidationBlock(phase, "; ".join(formal_errors))
     try:
         selected = max(runs, key=lambda r: r["id"])
     except TypeError:
@@ -847,6 +903,11 @@ def archive_review(args):
         )
 
     latest_run = select_latest_run(phase, show.get("runs"))
+
+    if _is_formal_review_task(task):
+        formal_errors = _formal_review_metadata_errors(task, show.get("parents"), show.get("runs"))
+        if formal_errors:
+            raise ValidationBlock(phase, "; ".join(formal_errors))
 
     if latest_run.get("profile") != "reviewer":
         raise ValidationBlock(

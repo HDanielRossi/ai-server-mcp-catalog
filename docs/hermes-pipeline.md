@@ -1321,6 +1321,10 @@ Completion of A8.1 never implicitly authorizes A8.2 or A8.3.
 
 `pipeline_controller` is the only interface the default profile uses to create, check, wait on, review, correct, archive, or attest readiness for Kanban tasks. It exposes exactly seven tools, unchanged from A6/A7: `check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`. No MCP tool in this repository (`planner_bridge`, `pipeline_bridge`, `review_archive_bridge`, `pipeline_controller`, `review_bridge`, `claude_bridge`) has a name matching `^commit`, `^push`, or `^staging`.
 
+### Formal review completion metadata
+
+Reviews created by `pipeline_controller` carry the `HERMES_FORMAL_REVIEW_V1` marker. The controller's read-only `check` gate machine-validates marked reviewer completions: metadata must contain the parent `implementation_task_id`, verdict exactly `PASS` or `CHANGES REQUIRED`, `mutation_performed: false`, and a valid `hermes.repository-state/v1` plus matching recomputed `repository_state_sha256`. A narrative PASS without this metadata is not a valid formal completion. Historical or unrelated reviewer tasks without the marker retain legacy check compatibility; archive and READY_TO_COMMIT remain strict downstream gates.
+
 ### Prohibited direct use
 
 The default profile must not register or use `pipeline_bridge` directly, and must not register or use `review_archive_bridge` directly. `planner_bridge` remains planning-only: it never creates, checks, waits on, reviews, corrects, archives, or attests readiness for any Kanban task.

@@ -2665,6 +2665,16 @@ run_repo_only() {
   pipeline_controller_ready_to_commit_audit "pipeline controller" "$PIPELINE_CONTROLLER_FILE"
 
   echo
+  echo "11a) formal review completion metadata enforcement:"
+  for s in 'FORMAL_REVIEW_MARKER = "HERMES_FORMAL_REVIEW_V1"' '_formal_review_metadata_errors' 'FORMAL_REVIEW_METADATA_INVALID' 'body = FORMAL_REVIEW_MARKER +'; do
+    if grep_ok "$PIPELINE_CONTROLLER_FILE" "$s"; then
+      check_ok "pipeline controller contains: $s"
+    else
+      check_fail "pipeline controller missing: $s"
+    fi
+  done
+
+  echo
   echo "12) A5.1 /.ai/reviews/ narrow ignore-scope integration invariant:"
   GITIGNORE_FILE="$REPO_DIR/.gitignore"
   if [[ -s "$GITIGNORE_FILE" ]] && grep_line_exact "$GITIGNORE_FILE" "/.ai/reviews/"; then
