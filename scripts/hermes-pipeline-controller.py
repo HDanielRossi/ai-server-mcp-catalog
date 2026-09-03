@@ -798,7 +798,7 @@ def register_bootstrap_implementation(args):
         "hermes", "kanban", "create", "Bootstrap %s in %s" % (args.feature, resolved.name),
         "--body", body, "--workspace", "dir:" + str(resolved),
         "--idempotency-key", key, "--created-by", "pipeline_controller",
-        "--max-retries", "0", "--json",
+        "--max-retries", "1", "--json",
     ])
     task_id = extract_real_id(parse_json_stdout(create, "hermes kanban create"))
     provenance["implementation_task_id"] = task_id

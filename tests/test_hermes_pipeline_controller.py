@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import unittest.mock as mock
 from pathlib import Path
 
@@ -40,6 +41,92 @@ def test_bootstrap_command_missing_required_argument_is_usage_error(capsys):
     rc = hpc.main(["register-bootstrap-implementation", "--workdir", "/opt/ai/projects/x"])
     assert rc == hpc.EXIT_TRANSPORT
     assert "usage error:" in capsys.readouterr().err
+
+
+def test_bootstrap_real_cli_dispatch_reaches_handler_without_creation(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable, MODULE_PATH, "register-bootstrap-implementation",
+            "--workdir", str(tmp_path), "--feature", "bootstrap",
+            "--reason", "WRONG_REASON", "--base-sha", "a" * 40,
+            "--implementation-sha", "b" * 40, "--validation-evidence", "[]",
+        ], capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == hpc.EXIT_VALIDATION
+    assert "unknown command" not in result.stderr
+    assert '"phase":"register-bootstrap-implementation"' in result.stdout
+
+
+def test_bootstrap_registration_uses_legal_retry_value_without_worker(monkeypatch, capsys):
+    state = {
+        "schema": hpc.REPOSITORY_STATE_SCHEMA,
+        "workdir": os.path.realpath(os.path.dirname(MODULE_PATH)),
+        "head": "b" * 40,
+        "changed_paths": [],
+        "staged_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "unstaged_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "untracked": [],
+    }
+    state["aggregate_sha256"] = hpc._sha256_canonical_excluding(state, "aggregate_sha256")
+    calls = []
+
+    def fake_run(argv):
+        calls.append(argv)
+        if argv[1:3] == ["kanban", "create"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"id": "t_bootstrap"}), stderr="")
+        if argv[1:3] == ["kanban", "complete"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+        raise AssertionError("unexpected command: %r" % (argv,))
+
+    monkeypatch.setattr(hpc, "capture_repository_state", lambda _workdir: state)
+    monkeypatch.setattr(hpc, "run_hermes_command", fake_run)
+    rc = hpc.main([
+        "register-bootstrap-implementation", "--workdir", os.path.dirname(MODULE_PATH),
+        "--feature", "bootstrap", "--reason", hpc.BOOTSTRAP_REASON,
+        "--base-sha", "a" * 40, "--implementation-sha", "b" * 40,
+        "--validation-evidence", json.dumps([
+            {"operation": "pytest_full", "exit_code": 0, "status": "PASS"},
+            {"operation": "audit", "exit_code": 0, "status": "PASS"},
+            {"operation": "git_diff_check", "exit_code": 0, "status": "PASS"},
+        ]),
+    ])
+    assert rc == hpc.EXIT_OK
+    create_argv = calls[0]
+    assert create_argv[create_argv.index("--max-retries") + 1] == "1"
+    assert "--assignee" not in create_argv
+    assert "coder-claude" not in create_argv
+    assert [call[1:3] for call in calls] == [["kanban", "create"], ["kanban", "complete"]]
+    output = json.loads(capsys.readouterr().out)
+    assert output["implementation_provenance"] == "operator-bootstrap"
+
+
+def test_bootstrap_registration_create_failure_does_not_complete(monkeypatch, capsys):
+    calls = []
+
+    def fake_run(argv):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 2, stdout="", stderr="create failed")
+
+    monkeypatch.setattr(hpc, "run_hermes_command", fake_run)
+    monkeypatch.setattr(hpc, "capture_repository_state", lambda _workdir: {
+        "schema": hpc.REPOSITORY_STATE_SCHEMA, "workdir": os.path.realpath(os.path.dirname(MODULE_PATH)),
+        "head": "b" * 40, "changed_paths": [], "staged_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "unstaged_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "untracked": [], "aggregate_sha256": "x",
+    })
+    rc = hpc.main([
+        "register-bootstrap-implementation", "--workdir", os.path.dirname(MODULE_PATH),
+        "--feature", "bootstrap", "--reason", hpc.BOOTSTRAP_REASON,
+        "--base-sha", "a" * 40, "--implementation-sha", "b" * 40,
+        "--validation-evidence", json.dumps([
+            {"operation": "pytest_full", "exit_code": 0, "status": "PASS"},
+            {"operation": "audit", "exit_code": 0, "status": "PASS"},
+            {"operation": "git_diff_check", "exit_code": 0, "status": "PASS"},
+        ]),
+    ])
+    assert rc == hpc.EXIT_TRANSPORT
+    assert len(calls) == 1
+    assert "kanban" in capsys.readouterr().err
 
 
 def make_task(**overrides):
