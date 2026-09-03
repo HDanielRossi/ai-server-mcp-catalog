@@ -912,6 +912,16 @@ A3.5.0 therefore does not transport the assembled prompt through argv. `scripts/
 
 The runner changes to the verified workdir, installs `sys.argv = ["hermes", "-p", "planner-codex"]` before importing `hermes_cli.main`, and therefore reuses Hermes' normal early `_apply_profile_override()` behavior: the planner profile's `HERMES_HOME` is selected before profile-sensitive configuration, dotenv, MCP, and other imports occur. It then reads the complete prompt with `sys.stdin.read()` and invokes Hermes' normal `_run_and_exit_oneshot()` path with `clarify,context_engine,memory`.
 
+### Planner preflight and bounded execution
+
+Before `_run_and_exit_oneshot()` can initialize a provider, the runner performs a read-only budget gate over the complete prompt assembled by this wrapper. It reads the active planner profile's configured `model.context_length`, charges a configurable reserved output budget (`HERMES_PLANNER_RESERVED_OUTPUT_TOKENS`, default 4096), and uses the installed Hermes `estimate_tokens_rough()` estimator together with a UTF-8-byte conservative floor and a fixed 128-token request envelope. The invariant is `estimated_input_tokens + reserved_output_tokens <= context_length`.
+
+An over-budget request exits before provider initialization with JSON containing `CONTEXT_BUDGET_EXCEEDED`, the effective limit, input estimate, output reservation, total, remaining budget, and counting method. No explicit context is dropped, truncated, summarized, reordered, or automatically split. If no positive configured context limit is available, the runner returns `CONTEXT_LIMIT_UNAVAILABLE` before provider invocation.
+
+Planner execution is bounded by `HERMES_PLANNER_BRIDGE_TIMEOUT_SECONDS`, default 600 seconds and maximum 899 seconds, using GNU `timeout` process-group handling with a five-second kill grace period. A timeout returns `PLANNER_TIMEOUT` with exit code 124; the MCP adapter also converts its outer 900-second `TimeoutExpired` into the same structured result. Invalid timeout or reservation values fail closed before planner execution. `HERMES_PLANNER_RESERVED_OUTPUT_TOKENS` and `HERMES_PLANNER_BRIDGE_TIMEOUT_SECONDS` do not alter model or provider selection.
+
+For deterministic diagnostics, setting `HERMES_PLANNER_PREFLIGHT_ONLY=1` prints `CONTEXT_BUDGET_OK` and exits without provider invocation when the request fits. This is a read-only diagnostic mode and does not reduce context.
+
 This transport removes the single-argv-size bottleneck without weakening the explicit-context limits: `MAX_CONTEXT_FILES = 12`, `MAX_CONTEXT_FILE_BYTES = 262144`, and `MAX_CONTEXT_TOTAL_BYTES = 524288` remain the accepted-input contract. The wrapper regression suite includes a >100 KiB explicit-context case using the normal repository snapshot so the previously observed `MAX_ARG_STRLEN` failure cannot be hidden by an artificially small workdir.
 
 ### Verification

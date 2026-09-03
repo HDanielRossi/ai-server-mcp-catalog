@@ -120,7 +120,7 @@ def test_embedded_python_runner_is_syntactically_valid_and_applies_profile_first
         source = f.read()
 
     start_marker = "RUNNER_CODE='"
-    end_marker = "\n'\n\nprintf '%s' \"$PROMPT\""
+    end_marker = "\n'\n\nset +e"
 
     start = source.index(start_marker) + len(start_marker)
     end = source.index(end_marker, start)
@@ -359,3 +359,70 @@ def test_context_total_over_512k_is_rejected(fake_bin, context_dir):
     assert result.returncode != 0
     assert not os.path.exists(capture_file)
     assert "exceed total" in (result.stdout + result.stderr)
+
+
+def _run_preflight(prompt, context_files=None, workdir=REPO_ROOT):
+    env = dict(os.environ)
+    env["HERMES_PLANNER_PREFLIGHT_ONLY"] = "1"
+    env.pop("PLANNER_CODEX_PYTHON", None)
+    argv = [WRAPPER_PATH, workdir, prompt]
+    for cf in context_files or []:
+        argv += ["--context-file", cf]
+    return subprocess.run(
+        argv, cwd=workdir, env=env, capture_output=True, text=True, timeout=30
+    )
+
+
+def test_preflight_allows_small_request_without_provider(context_dir):
+    result = _run_preflight("small planner request", workdir=context_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '"result": "CONTEXT_BUDGET_OK"' in result.stdout
+
+
+def test_preflight_rejects_nine_file_shape_before_provider(context_dir):
+    # The byte-conservative gate must reject this clearly oversized request;
+    # no model/network call is made because PREFLIGHT_ONLY exits at the gate.
+    oversized = os.path.join(context_dir, "oversized.txt")
+    _write_file(oversized, b"x" * 70000)
+    relative = os.path.relpath(oversized, REPO_ROOT)
+    result = _run_preflight("budget test", [relative])
+    assert result.returncode == 78, result.stdout + result.stderr
+    assert '"error": "CONTEXT_BUDGET_EXCEEDED"' in result.stdout
+    assert '"reserved_output_tokens": 4096' in result.stdout
+    assert '"effective_context_limit": 64000' in result.stdout
+
+
+def test_invalid_planner_timeout_is_rejected_before_provider(fake_bin):
+    env = dict(os.environ)
+    env["HERMES_PLANNER_BRIDGE_TIMEOUT_SECONDS"] = "0"
+    env["PLANNER_CODEX_PYTHON"] = fake_bin[0] + "/planner-codex"
+    result = subprocess.run(
+        [WRAPPER_PATH, REPO_ROOT, "invalid timeout"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 2
+    assert "HERMES_PLANNER_BRIDGE_TIMEOUT_SECONDS" in result.stderr
+
+
+def test_planner_timeout_is_structured_and_bounded(context_dir, tmp_path):
+    hanging = tmp_path / "hanging-planner"
+    hanging.write_text("#!/usr/bin/env bash\nsleep 30\n", encoding="utf-8")
+    hanging.chmod(hanging.stat().st_mode | stat.S_IEXEC)
+    env = dict(os.environ)
+    env["PLANNER_CODEX_PYTHON"] = str(hanging)
+    env["HERMES_PLANNER_BRIDGE_TIMEOUT_SECONDS"] = "1"
+    result = subprocess.run(
+        [WRAPPER_PATH, context_dir, "bounded timeout"],
+        cwd=context_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 124
+    assert '"error":"PLANNER_TIMEOUT"' in result.stdout
+    assert '"timeout_seconds":1' in result.stdout

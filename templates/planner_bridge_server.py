@@ -91,15 +91,22 @@ def run(workdir: str, prompt: str, context_files: list[str] | None = None) -> st
     for context_file in validated_context_files:
         argv += ["--context-file", context_file]
 
-    result = subprocess.run(
-        argv,
-        cwd=str(path),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=900,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=str(path),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=900,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            "exit_code=124\n"
+            f"workdir={path}\n"
+            'output:\n{"error":"PLANNER_TIMEOUT","timeout_seconds":900}\n'
+        )
 
     return (
         f"exit_code={result.returncode}\n"
