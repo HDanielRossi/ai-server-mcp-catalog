@@ -88,6 +88,7 @@ def test_bootstrap_registration_uses_legal_retry_value_without_worker(monkeypatc
             "changed_paths": [],
         }, "scope_sha256"),
     })
+    monkeypatch.setattr(hpc, "_bootstrap_terminal_replay", lambda _task_id, _provenance: False)
     monkeypatch.setattr(hpc, "run_hermes_command", fake_run)
     rc = hpc.main([
         "register-bootstrap-implementation", "--workdir", os.path.dirname(MODULE_PATH),
@@ -107,6 +108,91 @@ def test_bootstrap_registration_uses_legal_retry_value_without_worker(monkeypatc
     assert [call[1:3] for call in calls] == [["kanban", "create"], ["kanban", "complete"]]
     output = json.loads(capsys.readouterr().out)
     assert output["implementation_provenance"] == "operator-bootstrap"
+
+
+def test_bootstrap_identity_distinguishes_v3_and_v4_implementation():
+    common = (VALID_WD, "operator-bootstrap-provenance", hpc.BOOTSTRAP_REASON)
+    v3 = hpc.bootstrap_stable_key(*common, "a" * 40, "9375b6679c6cbed093e03246a601d9b3b5f295f2")
+    v4 = hpc.bootstrap_stable_key(*common, "a" * 40, "97d4f38b3afe3e91f8d58affdcbe498cc6ee156f")
+    assert v3 != v4
+
+
+def test_bootstrap_identity_repeats_exactly_and_distinguishes_base():
+    args = (VALID_WD, "operator-bootstrap-provenance", hpc.BOOTSTRAP_REASON,
+            "a" * 40, "b" * 40)
+    assert hpc.bootstrap_stable_key(*args) == hpc.bootstrap_stable_key(*args)
+    assert hpc.bootstrap_stable_key(*args) != hpc.bootstrap_stable_key(
+        VALID_WD, "operator-bootstrap-provenance", hpc.BOOTSTRAP_REASON,
+        "c" * 40, "b" * 40,
+    )
+
+
+def test_bootstrap_terminal_replay_accepts_exact_success(monkeypatch):
+    provenance = {"schema": hpc.BOOTSTRAP_PROVENANCE_SCHEMA, "implementation_sha": "b" * 40}
+    run = {"id": 202, "profile": None, "step_key": None, "status": "completed",
+           "outcome": "completed", "summary": "ok", "error": None,
+           "metadata": provenance, "worker_pid": None}
+    task = {"id": "t_bootstrap", "status": "done"}
+    show = {"task": task, "latest_summary": "ok", "parents": [], "children": [],
+            "comments": [], "events": [], "runs": [run]}
+    monkeypatch.setattr(hpc, "_fetch_show_and_runs", lambda _task_id: (show, [run]))
+    assert hpc._bootstrap_terminal_replay("t_bootstrap", provenance) is True
+
+
+def test_bootstrap_terminal_replay_rejects_conflicting_payload(monkeypatch):
+    requested = {"schema": hpc.BOOTSTRAP_PROVENANCE_SCHEMA, "implementation_sha": "b" * 40}
+    stored = dict(requested, implementation_sha="c" * 40)
+    run = {"id": 202, "profile": None, "step_key": None, "status": "completed",
+           "outcome": "completed", "summary": "ok", "error": None,
+           "metadata": stored, "worker_pid": None}
+    show = {"task": {"id": "t_bootstrap", "status": "done"}, "latest_summary": "ok",
+            "parents": [], "children": [], "comments": [], "events": [], "runs": [run]}
+    monkeypatch.setattr(hpc, "_fetch_show_and_runs", lambda _task_id: (show, [run]))
+    with pytest.raises(hpc.TransportError, match="idempotency conflict"):
+        hpc._bootstrap_terminal_replay("t_bootstrap", requested)
+
+
+def test_bootstrap_terminal_replay_skips_completion(monkeypatch, capsys):
+    workdir = os.path.dirname(MODULE_PATH)
+    state = {
+        "schema": hpc.REPOSITORY_STATE_SCHEMA, "workdir": os.path.realpath(workdir),
+        "head": "b" * 40, "changed_paths": [],
+        "staged_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "unstaged_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "untracked": [],
+    }
+    state["aggregate_sha256"] = hpc._sha256_canonical_excluding(state, "aggregate_sha256")
+    scope = {
+        "schema": hpc.COMMITTED_SCOPE_SCHEMA, "workdir": state["workdir"],
+        "base_sha": "a" * 40, "implementation_sha": "b" * 40,
+        "changed_paths": [],
+    }
+    scope["scope_sha256"] = hpc._sha256_canonical_excluding(scope, "scope_sha256")
+    calls = []
+
+    def fake_run(argv):
+        calls.append(argv)
+        if argv[1:3] == ["kanban", "create"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"id": "t_replay"}), stderr="")
+        raise AssertionError("terminal replay attempted an unexpected command: %r" % (argv,))
+
+    monkeypatch.setattr(hpc, "capture_repository_state", lambda _workdir: state)
+    monkeypatch.setattr(hpc, "capture_committed_implementation_scope", lambda _workdir, _base, _impl: scope)
+    monkeypatch.setattr(hpc, "_bootstrap_terminal_replay", lambda _task_id, _provenance: True)
+    monkeypatch.setattr(hpc, "run_hermes_command", fake_run)
+    rc = hpc.main([
+        "register-bootstrap-implementation", "--workdir", workdir,
+        "--feature", "bootstrap", "--reason", hpc.BOOTSTRAP_REASON,
+        "--base-sha", "a" * 40, "--implementation-sha", "b" * 40,
+        "--validation-evidence", json.dumps([
+            {"operation": "pytest_full", "exit_code": 0, "status": "PASS"},
+            {"operation": "audit", "exit_code": 0, "status": "PASS"},
+            {"operation": "git_diff_check", "exit_code": 0, "status": "PASS"},
+        ]),
+    ])
+    assert rc == hpc.EXIT_OK
+    assert len(calls) == 1
+    assert json.loads(capsys.readouterr().out)["task_id"] == "t_replay"
 
 
 def test_bootstrap_registration_create_failure_does_not_complete(monkeypatch, capsys):

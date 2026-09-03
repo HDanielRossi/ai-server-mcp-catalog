@@ -205,6 +205,22 @@ def stable_key(workdir, feature, phase):
     return "pipeline:%s:%s" % (phase, digest)
 
 
+def bootstrap_stable_key(workdir, feature, reason, base_sha, implementation_sha):
+    """Return the identity key for one operator-bootstrap implementation."""
+    identity = {
+        "schema": BOOTSTRAP_PROVENANCE_SCHEMA,
+        "implementation_provenance": "operator-bootstrap",
+        "workdir": os.path.realpath(str(workdir)),
+        "feature": feature.strip(),
+        "reason": reason,
+        "base_sha": base_sha,
+        "implementation_sha": implementation_sha,
+    }
+    raw = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return "pipeline:bootstrap-implementation:%s" % digest
+
+
 def validate_workdir(workdir):
     if not isinstance(workdir, str) or not workdir:
         raise WorkdirValidationError("workdir must be a non-empty string")
@@ -742,6 +758,31 @@ def create_implementation(args):
     return EXIT_OK
 
 
+def _bootstrap_terminal_replay(task_id, provenance):
+    """Accept only an exact replay of a completed bootstrap registration."""
+    show, runs = _fetch_show_and_runs(task_id)
+    _require_show_runs_match("bootstrap replay", show, runs)
+    task = show.get("task")
+    if not isinstance(task, dict):
+        raise TransportError("bootstrap replay task is not a JSON object")
+    if task.get("status") not in ("done", "archived"):
+        return False
+    try:
+        latest = select_latest_run("register-bootstrap-implementation", runs)
+    except ValidationBlock as exc:
+        raise TransportError("bootstrap replay latest run is invalid: %s" % exc.reason)
+    if (
+        latest.get("status") not in ("done", "completed")
+        or latest.get("outcome") != "completed"
+        or latest.get("metadata") != provenance
+    ):
+        raise TransportError(
+            "bootstrap idempotency conflict: terminal task %s does not contain "
+            "the exact requested provenance" % task_id
+        )
+    return True
+
+
 def register_bootstrap_implementation(args):
     """Register operator-authored provenance without impersonating a worker."""
     phase = "register-bootstrap-implementation"
@@ -795,7 +836,9 @@ def register_bootstrap_implementation(args):
         "validation": evidence,
         "coder_worker_run": False,
     }
-    key = stable_key(str(resolved), args.feature, "bootstrap-implementation")
+    key = bootstrap_stable_key(
+        resolved, args.feature, args.reason, args.base_sha, args.implementation_sha
+    )
     body = "Operator bootstrap implementation for %s. Explicit provenance; no coder worker run." % args.feature
     create = run_hermes_command([
         "hermes", "kanban", "create", "Bootstrap %s in %s" % (args.feature, resolved.name),
@@ -805,6 +848,12 @@ def register_bootstrap_implementation(args):
     ])
     task_id = extract_real_id(parse_json_stdout(create, "hermes kanban create"))
     provenance["implementation_task_id"] = task_id
+    if _bootstrap_terminal_replay(task_id, provenance):
+        print(json.dumps({"phase": phase, "task_id": task_id, "workdir": str(resolved),
+                          "implementation_provenance": "operator-bootstrap",
+                          "repository_state_sha256": state["aggregate_sha256"]},
+                         separators=(",", ":")))
+        return EXIT_OK
     complete = run_hermes_command([
         "hermes", "kanban", "complete", task_id,
         "--summary", "operator-bootstrap provenance registered",

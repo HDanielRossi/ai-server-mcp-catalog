@@ -1374,3 +1374,10 @@ changes that cannot yet be validated by the implementation worker. It records
 exact commits, stable repository state, changed paths, and structured PASS
 validation evidence; it never fabricates a `coder-claude` run and never bypasses
 formal review, archive-v2, READY_TO_COMMIT, or separate human approvals.
+
+Bootstrap registration idempotency is scoped to the canonical workdir, feature,
+canonical bootstrap reason, `operator-bootstrap` mode, base commit, and
+implementation commit. The base and implementation commits therefore bind the
+derived committed scope. A terminal task is replayed successfully only when its
+completed bootstrap provenance exactly matches the requested payload; a
+conflicting terminal record fails closed without another completion attempt.
