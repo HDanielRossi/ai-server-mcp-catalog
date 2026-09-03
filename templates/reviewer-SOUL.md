@@ -102,8 +102,15 @@ change.
 The reviewer's sole evidence tool exposes this exact signature:
 
 ```text
-collect(workdir, changed_path=None, test_command=None, content_window=None)
+collect(workdir, changed_path=None, test_command=None, content_window=None,
+        base_sha=None, implementation_sha=None)
 ```
+
+For operator-bootstrap reviews, `collect` also accepts `base_sha` and
+`implementation_sha` together. This read-only scope evidence computes the
+sorted committed base-to-implementation path set from Git refs; compare its
+`committed_scope.changed_paths` exactly with the bootstrap provenance before
+issuing a verdict. Never trust a caller-supplied scope or infer missing paths.
 
 The following rules apply to every use of this protocol, without exception:
 

@@ -34,6 +34,7 @@ MAX_COLLECT_TIMEOUT_SECONDS = 900
 MAX_CONTENT_WINDOW_BYTES = 20_000
 MAX_CAPTURED_OUTPUT_CHARS = 4_000
 REPOSITORY_STATE_SCHEMA = "hermes.repository-state/v1"
+COMMITTED_SCOPE_SCHEMA = "hermes.committed-implementation-scope/v1"
 REPO_STATE_TIMEOUT_SECONDS = 30
 CONFLICT_STATUS_CODES = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})
 
@@ -550,7 +551,7 @@ def _reject_untracked_special_entries(resolved_workdir):
 
 def _capture_repository_state_once(resolved_workdir, canonical_workdir):
     """Capture one repository-state envelope. Read-only: no git object/index/file writes."""
-    head = _run_git_text(["git", "rev-parse", "HEAD"], resolved_workdir).strip()
+    head = _run_git_text(["git", "rev-parse", "--verify", "HEAD^{commit}"], resolved_workdir).strip()
 
     staged_paths = _git_path_list(["git", "diff", "--name-only", "--cached"], resolved_workdir)
     unstaged_paths = _git_path_list(["git", "diff", "--name-only"], resolved_workdir)
@@ -607,7 +608,48 @@ def collect_repository_state(workdir):
     return first
 
 
-def collect(workdir, changed_path=None, test_command=None, content_window=None):
+def collect_committed_implementation_scope(workdir, base_sha, implementation_sha):
+    """Compute the exact committed base-to-implementation path set read-only."""
+    if not isinstance(base_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+        raise ReviewBridgeError("base_sha must be 40 lowercase hex characters")
+    if not isinstance(implementation_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", implementation_sha):
+        raise ReviewBridgeError("implementation_sha must be 40 lowercase hex characters")
+    resolved_workdir = validate_workdir(workdir)
+    _verify_git_repo(resolved_workdir)
+    for label, sha in (("base_sha", base_sha), ("implementation_sha", implementation_sha)):
+        resolved = _run_git_text(
+            ["git", "rev-parse", "--verify", "--quiet", sha + "^{commit}"], resolved_workdir
+        ).strip()
+        if resolved != sha:
+            raise ReviewBridgeError("%s does not resolve to the requested commit" % label)
+    head = _run_git_text(["git", "rev-parse", "HEAD"], resolved_workdir).strip()
+    if head != implementation_sha:
+        raise ReviewBridgeError("implementation_sha does not match repository HEAD")
+    raw = _run_git_capture(
+        ["git", "diff", "--name-only", "--no-renames", "-z", base_sha, implementation_sha, "--"],
+        resolved_workdir,
+    )
+    paths = []
+    for raw_path in raw.split(b"\0"):
+        if not raw_path:
+            continue
+        path = raw_path.decode("utf-8", "surrogateescape")
+        parts = path.replace("\\", "/").split("/")
+        if path.startswith("/") or ".." in parts:
+            raise ReviewBridgeError("committed scope contains unsafe path: %r" % path)
+        paths.append(path)
+    scope = {
+        "schema": COMMITTED_SCOPE_SCHEMA,
+        "workdir": os.path.realpath(str(resolved_workdir)),
+        "base_sha": base_sha,
+        "implementation_sha": implementation_sha,
+        "changed_paths": sorted(set(paths)),
+    }
+    scope["scope_sha256"] = _canonical_json_sha256({k: v for k, v in scope.items() if k != "scope_sha256"})
+    return scope
+
+
+def collect(workdir, changed_path=None, test_command=None, content_window=None, base_sha=None, implementation_sha=None):
     """Collect bounded, fresh, read-only review evidence for a single review session.
 
     All inputs (workdir containment, changed_path containment, test_command
@@ -648,6 +690,9 @@ def collect(workdir, changed_path=None, test_command=None, content_window=None):
     elif content_window is not None:
         raise ReviewBridgeError("content_window requires changed_path to be supplied")
 
+    if (base_sha is None) != (implementation_sha is None):
+        raise ReviewBridgeError("base_sha and implementation_sha must be supplied together")
+
     validated_test_command = None
     if test_command is not None:
         validated_test_command = validate_test_command(test_command)
@@ -669,6 +714,7 @@ def collect(workdir, changed_path=None, test_command=None, content_window=None):
         "test_result": None,
         "repository_state": None,
         "repository_state_sha256": None,
+        "committed_scope": None,
         "status": "ok",
     }
 
@@ -697,6 +743,10 @@ def collect(workdir, changed_path=None, test_command=None, content_window=None):
     repository_state = collect_repository_state(str(resolved_workdir))
     evidence["repository_state"] = repository_state
     evidence["repository_state_sha256"] = repository_state["aggregate_sha256"]
+    if base_sha is not None:
+        evidence["committed_scope"] = collect_committed_implementation_scope(
+            str(resolved_workdir), base_sha, implementation_sha
+        )
 
     return evidence
 
@@ -711,7 +761,7 @@ mcp_server = MCPServer("review-bridge")
 
 
 @mcp_server.tool(name="collect")
-def _tool_collect(workdir, changed_path=None, test_command=None, content_window=None):
+def _tool_collect(workdir, changed_path=None, test_command=None, content_window=None, base_sha=None, implementation_sha=None):
     """Return bounded, fresh, read-only review evidence for workdir.
 
     Read-only: never mutates git state, never touches the network. Evidence
@@ -722,7 +772,7 @@ def _tool_collect(workdir, changed_path=None, test_command=None, content_window=
     supplied it must be one of ALLOWED_TEST_COMMANDS and is executed
     read-only with a bounded timeout.
     """
-    return collect(workdir, changed_path, test_command, content_window)
+    return collect(workdir, changed_path, test_command, content_window, base_sha, implementation_sha)
 
 
 if __name__ == "__main__":

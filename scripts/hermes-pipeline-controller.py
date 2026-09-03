@@ -53,6 +53,7 @@ ARCHIVE_HELPER_PATH = "/usr/local/bin/review-archive-bridge"
 ARCHIVE_HELPER_TIMEOUT = 120
 
 REPOSITORY_STATE_SCHEMA = "hermes.repository-state/v1"
+COMMITTED_SCOPE_SCHEMA = "hermes.committed-implementation-scope/v1"
 REVIEW_ARCHIVE_SCHEMA_V2 = "hermes.review-archive/v2"
 REPO_STATE_TIMEOUT_SECONDS = 30
 KANBAN_READ_TIMEOUT_SECONDS = 30
@@ -770,8 +771,9 @@ def register_bootstrap_implementation(args):
         raise ValidationBlock(phase, "missing mandatory validation operations: %s" % sorted(required_ops - seen))
     try:
         state = capture_repository_state(resolved)
+        scope = capture_committed_implementation_scope(resolved, args.base_sha, args.implementation_sha)
     except (RepositoryStateError, TransportError) as exc:
-        raise ValidationBlock(phase, "cannot capture repository state: %s" % exc)
+        raise ValidationBlock(phase, "cannot capture repository state/scope: %s" % exc)
     if state["changed_paths"]:
         raise ValidationBlock(phase, "bootstrap provenance requires a clean worktree")
     head = state.get("head")
@@ -787,7 +789,8 @@ def register_bootstrap_implementation(args):
         "implementation_sha": args.implementation_sha,
         "repository_state": state,
         "repository_state_sha256": state["aggregate_sha256"],
-        "changed_paths": [],
+        "changed_paths": scope["changed_paths"],
+        "committed_scope": scope,
         "mutation_scope": "operator-authored repository implementation only; no worker run",
         "validation": evidence,
         "coder_worker_run": False,
@@ -1253,7 +1256,7 @@ def _describe_untracked_entry(resolved_workdir, relative_path):
 
 def _capture_repository_state_once(resolved_workdir, canonical_workdir):
     """Capture one repository-state/v1 envelope. Read-only: no git object/index/file writes."""
-    head = _run_git_text(["git", "rev-parse", "HEAD"], resolved_workdir).strip()
+    head = _run_git_text(["git", "rev-parse", "--verify", "HEAD^{commit}"], resolved_workdir).strip()
 
     staged_paths = _git_path_list(["git", "diff", "--name-only", "--cached"], resolved_workdir)
     unstaged_paths = _git_path_list(["git", "diff", "--name-only"], resolved_workdir)
@@ -1293,6 +1296,46 @@ def capture_repository_state(resolved_workdir):
     if first != second:
         raise RepositoryStateError("repository state changed between consecutive captures (unstable state)")
     return first
+
+
+def capture_committed_implementation_scope(resolved_workdir, base_sha, implementation_sha):
+    """Return the deterministic committed base-to-implementation path set."""
+    sha_re = r"[0-9a-f]{40}"
+    if not re.fullmatch(sha_re, base_sha) or not re.fullmatch(sha_re, implementation_sha):
+        raise RepositoryStateError("base-sha and implementation-sha must be 40 lowercase hex characters")
+    _verify_git_repo_worktree(resolved_workdir)
+    for label, sha in (("base", base_sha), ("implementation", implementation_sha)):
+        resolved = _run_git_text(
+            ["git", "rev-parse", "--verify", "--quiet", sha + "^{commit}"], resolved_workdir
+        ).strip()
+        if resolved != sha:
+            raise RepositoryStateError("%s-sha does not resolve to the requested commit" % label)
+    head = _run_git_text(["git", "rev-parse", "HEAD"], resolved_workdir).strip()
+    if head != implementation_sha:
+        raise RepositoryStateError("implementation-sha does not match repository HEAD")
+    raw = _run_git_capture(
+        ["git", "diff", "--name-only", "--no-renames", "-z", base_sha, implementation_sha, "--"],
+        resolved_workdir,
+    )
+    paths = []
+    for raw_path in raw.split(b"\0"):
+        if not raw_path:
+            continue
+        path = raw_path.decode("utf-8", "surrogateescape")
+        parts = path.replace("\\", "/").split("/")
+        if path.startswith("/") or ".." in parts:
+            raise RepositoryStateError("committed scope contains unsafe path: %r" % path)
+        paths.append(path)
+    changed_paths = sorted(set(paths))
+    scope = {
+        "schema": COMMITTED_SCOPE_SCHEMA,
+        "workdir": os.path.realpath(str(resolved_workdir)),
+        "base_sha": base_sha,
+        "implementation_sha": implementation_sha,
+        "changed_paths": changed_paths,
+    }
+    scope["scope_sha256"] = _sha256_canonical_excluding(scope, "scope_sha256")
+    return scope
 
 
 def _run_git_diff_check_gate(resolved_workdir):
@@ -1428,16 +1471,38 @@ def _validate_bootstrap_provenance(run, task, task_id, canonical_workdir):
     exact = {
         "schema", "implementation_provenance", "implementation_task_id", "reason", "workdir",
         "base_sha", "implementation_sha", "repository_state", "repository_state_sha256",
-        "changed_paths", "mutation_scope", "validation", "coder_worker_run",
+        "changed_paths", "committed_scope", "mutation_scope", "validation", "coder_worker_run",
     }
     if set(metadata) != exact:
         raise ReadyToCommitReject("bootstrap_provenance_keys", "bootstrap provenance keys are not exact")
     if metadata["implementation_task_id"] != task_id or metadata["reason"] != BOOTSTRAP_REASON:
         raise ReadyToCommitReject("bootstrap_provenance_identity", "bootstrap provenance identity/reason mismatch")
-    if metadata["workdir"] != canonical_workdir or metadata["changed_paths"] != []:
-        raise ReadyToCommitReject("bootstrap_provenance_scope", "bootstrap workdir or changed paths invalid")
+    if metadata["workdir"] != canonical_workdir:
+        raise ReadyToCommitReject("bootstrap_provenance_scope", "bootstrap workdir is invalid")
     if not re.fullmatch(r"[0-9a-f]{40}", metadata["base_sha"]) or not re.fullmatch(r"[0-9a-f]{40}", metadata["implementation_sha"]):
         raise ReadyToCommitReject("bootstrap_provenance_sha", "bootstrap base/implementation SHA malformed")
+    scope = metadata["committed_scope"]
+    if not isinstance(scope, dict) or scope.get("schema") != COMMITTED_SCOPE_SCHEMA:
+        raise ReadyToCommitReject("bootstrap_committed_scope_invalid", "bootstrap committed scope is invalid")
+    if (
+        scope.get("workdir") != canonical_workdir
+        or scope.get("base_sha") != metadata["base_sha"]
+        or scope.get("implementation_sha") != metadata["implementation_sha"]
+        or scope.get("changed_paths") != metadata["changed_paths"]
+        or scope.get("scope_sha256") != _sha256_canonical_excluding(scope, "scope_sha256")
+        or not isinstance(metadata["changed_paths"], list)
+        or metadata["changed_paths"] != sorted(set(metadata["changed_paths"]))
+        or any(not isinstance(path, str) or not path or path.startswith("/") or ".." in path.replace("\\", "/").split("/") for path in metadata["changed_paths"])
+    ):
+        raise ReadyToCommitReject("bootstrap_committed_scope_mismatch", "bootstrap committed scope is inconsistent")
+    try:
+        computed_scope = capture_committed_implementation_scope(
+            Path(canonical_workdir), metadata["base_sha"], metadata["implementation_sha"]
+        )
+    except (RepositoryStateError, TransportError) as exc:
+        raise ReadyToCommitReject("bootstrap_committed_scope_unavailable", str(exc))
+    if computed_scope != scope:
+        raise ReadyToCommitReject("bootstrap_committed_scope_mismatch", "committed scope does not match repository refs")
     state = metadata["repository_state"]
     if not isinstance(state, dict) or state.get("schema") != REPOSITORY_STATE_SCHEMA:
         raise ReadyToCommitReject("bootstrap_repository_state_invalid", "bootstrap repository_state is invalid")

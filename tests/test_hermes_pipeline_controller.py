@@ -79,6 +79,15 @@ def test_bootstrap_registration_uses_legal_retry_value_without_worker(monkeypatc
         raise AssertionError("unexpected command: %r" % (argv,))
 
     monkeypatch.setattr(hpc, "capture_repository_state", lambda _workdir: state)
+    monkeypatch.setattr(hpc, "capture_committed_implementation_scope", lambda _workdir, _base, _impl: {
+        "schema": hpc.COMMITTED_SCOPE_SCHEMA, "workdir": state["workdir"],
+        "base_sha": "a" * 40, "implementation_sha": "b" * 40,
+        "changed_paths": [], "scope_sha256": hpc._sha256_canonical_excluding({
+            "schema": hpc.COMMITTED_SCOPE_SCHEMA, "workdir": state["workdir"],
+            "base_sha": "a" * 40, "implementation_sha": "b" * 40,
+            "changed_paths": [],
+        }, "scope_sha256"),
+    })
     monkeypatch.setattr(hpc, "run_hermes_command", fake_run)
     rc = hpc.main([
         "register-bootstrap-implementation", "--workdir", os.path.dirname(MODULE_PATH),
@@ -114,6 +123,14 @@ def test_bootstrap_registration_create_failure_does_not_complete(monkeypatch, ca
         "unstaged_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "untracked": [], "aggregate_sha256": "x",
     })
+    monkeypatch.setattr(hpc, "capture_committed_implementation_scope", lambda _workdir, _base, _impl: {
+        "schema": hpc.COMMITTED_SCOPE_SCHEMA, "workdir": os.path.realpath(os.path.dirname(MODULE_PATH)),
+        "base_sha": "a" * 40, "implementation_sha": "b" * 40, "changed_paths": [],
+        "scope_sha256": hpc._sha256_canonical_excluding({
+            "schema": hpc.COMMITTED_SCOPE_SCHEMA, "workdir": os.path.realpath(os.path.dirname(MODULE_PATH)),
+            "base_sha": "a" * 40, "implementation_sha": "b" * 40, "changed_paths": [],
+        }, "scope_sha256"),
+    })
     rc = hpc.main([
         "register-bootstrap-implementation", "--workdir", os.path.dirname(MODULE_PATH),
         "--feature", "bootstrap", "--reason", hpc.BOOTSTRAP_REASON,
@@ -127,6 +144,32 @@ def test_bootstrap_registration_create_failure_does_not_complete(monkeypatch, ca
     assert rc == hpc.EXIT_TRANSPORT
     assert len(calls) == 1
     assert "kanban" in capsys.readouterr().err
+
+
+def test_committed_scope_matches_exact_base_to_head_paths():
+    repo = Path(MODULE_PATH).resolve().parents[1]
+    scope = hpc.capture_committed_implementation_scope(
+        repo, "a50235ebb31eb8b9c0f43b9b6b252fe79a9e2dbf", "9375b6679c6cbed093e03246a601d9b3b5f295f2"
+    )
+    assert scope["changed_paths"] == [
+        "docs/hermes-pipeline.md",
+        "scripts/audit-hermes-pipeline-hardening.sh",
+        "scripts/hermes-pipeline-controller.py",
+        "tests/test_audit_hermes_pipeline_hardening.py",
+        "tests/test_hermes_pipeline_controller.py",
+    ]
+    assert scope["changed_paths"] == sorted(set(scope["changed_paths"]))
+
+
+@pytest.mark.parametrize("base_sha,implementation_sha", [
+    ("x" * 40, "9375b6679c6cbed093e03246a601d9b3b5f295f2"),
+    ("a50235ebb31eb8b9c0f43b9b6b252fe79a9e2dbf", "x" * 40),
+    ("a50235ebb31eb8b9c0f43b9b6b252fe79a9e2dbf", "a50235ebb31eb8b9c0f43b9b6b252fe79a9e2dbf"),
+])
+def test_committed_scope_rejects_invalid_or_non_head_refs(base_sha, implementation_sha):
+    repo = Path(MODULE_PATH).resolve().parents[1]
+    with pytest.raises(hpc.RepositoryStateError):
+        hpc.capture_committed_implementation_scope(repo, base_sha, implementation_sha)
 
 
 def make_task(**overrides):

@@ -798,6 +798,12 @@ Bounds and behavior:
 - Content windows are bounded to at most 200 lines, and each collect covers exactly one file per window.
 - No parallel collects.
 - About 8 successful collects maximum per review.
+- For operator-bootstrap provenance, `changed_paths` records the deterministic
+  committed diff from `base_sha` to `implementation_sha`; it is distinct from
+  `repository_state.changed_paths`, which records current staged, unstaged, and
+  untracked worktree mutations. Reviewers independently verify this scope by
+  supplying both commit SHAs to `collect`, which returns a structured
+  `committed_scope` object. Exact equality with bootstrap provenance is required.
 - If a collect fails, the reviewer may make one deterministic correction and retry; if that also fails, it must stop and block, including the exact error text received.
 - The reviewer must block when the changed files for the workflow item cannot be identified — never guess paths.
 - The two verbatim test-command discipline rules:
@@ -1002,7 +1008,8 @@ The reviewer remains read-only and does not receive the `review_archive_bridge` 
 See `templates/reviewer-SOUL.md` for the full, verbatim-installable text. The protocol governs the reviewer's sole evidence tool:
 
 ```text
-collect(workdir, changed_path=None, test_command=None, content_window=None)
+collect(workdir, changed_path=None, test_command=None, content_window=None,
+        base_sha=None, implementation_sha=None)
 ```
 
 Rules:

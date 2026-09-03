@@ -378,7 +378,7 @@ import sys
 PATH = os.environ["AUDIT_REVIEWER_SOUL_PATH"]
 
 INVARIANTS = [
-    ("collect_exact_signature", "collect(workdir, changed_path=None, test_command=None, content_window=None)"),
+    ("collect_exact_signature", "collect(workdir, changed_path=None, test_command=None, content_window=None,\n        base_sha=None, implementation_sha=None)"),
     ("changed_path_repo_relative", "supplies EXACTLY ONE repo-relative changed_path"),
     ("content_window_requires_changed_path", "content_window may ONLY be used together with a changed_path"),
     ("content_window_path_equals_changed_path", "content_window.path EXACTLY EQUALS changed_path"),

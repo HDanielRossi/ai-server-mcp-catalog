@@ -910,9 +910,76 @@ def test_collect_existing_keys_unchanged_after_repository_state_addition(tmp_pat
     expected_keys = {
         "workdir", "repo_check", "git_status", "changed_path", "diff_name_only",
         "diff", "diff_check", "content_window", "test_result", "repository_state",
-        "repository_state_sha256", "status",
+        "repository_state_sha256", "committed_scope", "status",
     }
     assert set(result.keys()) == expected_keys
     assert result["status"] == "ok"
     assert result["repository_state"]["schema"] == review_bridge_server.REPOSITORY_STATE_SCHEMA
     assert result["repository_state_sha256"] == result["repository_state"]["aggregate_sha256"]
+
+
+def _git_head(repo):
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def test_committed_scope_is_independent_from_clean_worktree(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    base = _git_head(repo)
+    (repo / "b.py").write_text("b\n")
+    (repo / "c.py").write_text("c\n")
+    subprocess.run(["git", "add", "b.py", "c.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "scope"], cwd=repo, check=True, capture_output=True)
+    implementation = _git_head(repo)
+    scope = review_bridge_server.collect_committed_implementation_scope(str(repo), base, implementation)
+    assert scope["changed_paths"] == ["b.py", "c.py"]
+    assert review_bridge_server.collect_repository_state(str(repo))["changed_paths"] == []
+
+
+def test_committed_scope_is_sorted_and_rejects_bad_refs(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    base = _git_head(repo)
+    for name in ("z.py", "a.py", "m.py"):
+        (repo / name).write_text(name + "\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "scope"], cwd=repo, check=True, capture_output=True)
+    implementation = _git_head(repo)
+    scope = review_bridge_server.collect_committed_implementation_scope(str(repo), base, implementation)
+    assert scope["changed_paths"] == ["a.py", "m.py", "z.py"]
+    for bad_base, bad_impl in (("x" * 40, implementation), (base, "x" * 40), (base, base)):
+        with pytest.raises(ReviewBridgeError):
+            review_bridge_server.collect_committed_implementation_scope(str(repo), bad_base, bad_impl)
+
+
+def test_collect_scope_evidence_is_structured_and_exact(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    base = _git_head(repo)
+    (repo / "b.py").write_text("b\n")
+    subprocess.run(["git", "add", "b.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "scope"], cwd=repo, check=True, capture_output=True)
+    implementation = _git_head(repo)
+    evidence = collect(str(repo), base_sha=base, implementation_sha=implementation)
+    assert evidence["committed_scope"]["changed_paths"] == ["b.py"]
+    assert evidence["committed_scope"]["scope_sha256"]
+    assert evidence["repository_state"]["changed_paths"] == []
+
+
+def test_collect_scope_requires_both_shas_and_rejects_escape(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_bridge_server, "ALLOWED_ROOT", tmp_path.resolve())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    head = _git_head(repo)
+    with pytest.raises(ReviewBridgeError):
+        collect(str(repo), base_sha=head)
+    with pytest.raises(ReviewBridgeError):
+        collect(str(repo), base_sha=head, implementation_sha=head, changed_path="../a.py")
