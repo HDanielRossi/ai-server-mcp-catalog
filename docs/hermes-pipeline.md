@@ -154,7 +154,7 @@ Responsibilities:
 - Report git status after tests.
 ```
 
-For reviews of the audit script itself, `review_bridge` allows `./scripts/audit-hermes-pipeline-hardening.sh` as an authorized `test_command`.
+For reviews of the audit script itself, reviewers select the structured `repository_audit` operation; `review_bridge` maps it internally to `./scripts/audit-hermes-pipeline-hardening.sh`.
 
 ## Review archive bridge
 
@@ -774,7 +774,7 @@ The audit is split into explicit, mutually exclusive modes (A3.5.1d):
 
 Defaults:
 
-- `test_command` defaults to `"__skip__"`.
+- `test_operation` defaults to no subprocess execution.
 - `changed_paths` defaults to an empty string (normalizes to an empty list).
 - `include_diff` defaults to `False`.
 - `include_repo_evidence` defaults to `True`.
@@ -785,11 +785,15 @@ Bounds and behavior:
 - Each content-window request covers exactly one file — one file per content window.
 - When no content window is requested, `content_window` is reported as `"not-requested"` and the file content field is reported as `"SKIPPED"`.
 - `include_diff=true` requires at least one changed path, or evidence collection is rejected.
-- The allowed test commands are exactly these three, verbatim:
-  - `__skip__`
-  - `/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q`
-  - `./scripts/audit-hermes-pipeline-hardening.sh`
-- `__skip__` is an EXPLICIT no-test request — no substitution for any other command is ever made.
+- The reviewer-facing operation enum is exactly:
+  - `skip`
+  - `pytest_full`
+  - `repository_audit`
+- The bridge maps these values internally to immutable commands/argv:
+  - `skip` → no subprocess (`__skip__` in legacy evidence)
+  - `pytest_full` → `/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q`
+  - `repository_audit` → `./scripts/audit-hermes-pipeline-hardening.sh`
+- Reviewers select `test_operation`; they never supply or reconstruct command strings.
 
 ### Reviewer policy (`templates/reviewer-SOUL.md`)
 
@@ -808,9 +812,9 @@ Bounds and behavior:
 - The reviewer must block when the changed files for the workflow item cannot be identified — never guess paths.
 - The two verbatim test-command discipline rules:
 
-  "If test_command is __skip__, do not invent or substitute another command"
+  "test_operation accepts only skip, pytest_full, or repository_audit"
 
-  "If tests are required by the acceptance criteria but no valid explicit test command is available, block the task instead of guessing"
+  "reviewers select operations and never compose command strings"
 
 ### Pipeline bridge (`templates/pipeline_bridge_server.py`)
 
@@ -1008,7 +1012,7 @@ The reviewer remains read-only and does not receive the `review_archive_bridge` 
 See `templates/reviewer-SOUL.md` for the full, verbatim-installable text. The protocol governs the reviewer's sole evidence tool:
 
 ```text
-collect(workdir, changed_path=None, test_command=None, content_window=None,
+collect(workdir, changed_path=None, test_operation=None, content_window=None,
         base_sha=None, implementation_sha=None)
 ```
 

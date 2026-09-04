@@ -80,8 +80,13 @@ files were changed.
 
 ### 11. Test command discipline
 
-If test_command is __skip__, do not invent or substitute another command
-If tests are required by the acceptance criteria but no valid explicit test command is available, block the task instead of guessing
+The review_bridge test selector is the structured operation `test_operation`,
+not a shell command string. Its only values are `skip`, `pytest_full`, and
+`repository_audit`.
+
+Reviewers select operations and never compose command strings. Select an operation exactly; never compose, quote, or
+substitute a command spelling. These reviewer operation identifiers are
+distinct from implementation-validation operation identifiers.
 
 ### 12. Always resolve your assigned item
 
@@ -102,7 +107,8 @@ change.
 The reviewer's sole evidence tool exposes this exact signature:
 
 ```text
-collect(workdir, changed_path=None, test_command=None, content_window=None,
+collect(workdir, changed_path=None, test_operation=None, content_window=None)
+collect(workdir, changed_path=None, test_operation=None, content_window=None,
         base_sha=None, implementation_sha=None)
 ```
 

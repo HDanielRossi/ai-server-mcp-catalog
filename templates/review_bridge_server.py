@@ -39,6 +39,7 @@ REPO_STATE_TIMEOUT_SECONDS = 30
 CONFLICT_STATUS_CODES = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})
 
 DEFAULT_TEST_COMMAND = "__skip__"
+DEFAULT_TEST_OPERATION = "skip"
 MAX_CONTENT_WINDOW_LINES = 200
 DEFAULT_CHANGED_PATHS = ""
 DEFAULT_INCLUDE_DIFF = False
@@ -53,6 +54,13 @@ ALLOWED_TEST_COMMANDS = frozenset(
         "./scripts/audit-hermes-pipeline-hardening.sh",
     }
 )
+
+ALLOWED_TEST_OPERATIONS = frozenset({"skip", "pytest_full", "repository_audit"})
+TEST_OPERATION_COMMANDS = {
+    "skip": DEFAULT_TEST_COMMAND,
+    "pytest_full": "/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q",
+    "repository_audit": "./scripts/audit-hermes-pipeline-hardening.sh",
+}
 
 
 class ReviewBridgeError(Exception):
@@ -125,6 +133,22 @@ def validate_test_command(test_command):
     return test_command
 
 
+def validate_test_operation(test_operation):
+    """Validate the structured reviewer operation before any execution."""
+    if test_operation not in ALLOWED_TEST_OPERATIONS:
+        raise ReviewBridgeError(f"test_operation is not supported: {test_operation!r}")
+    return test_operation
+
+
+def test_operation_for_command(test_command):
+    """Map an exact legacy literal to its structured operation."""
+    validate_test_command(test_command)
+    for operation, command in TEST_OPERATION_COMMANDS.items():
+        if command == test_command:
+            return operation
+    raise ReviewBridgeError(f"no operation mapping for test_command: {test_command!r}")
+
+
 def validate_content_window(changed_paths, content_window):
     """Validate a content window request against MAX_CONTENT_WINDOW_LINES and the changed_paths set."""
     if content_window is None:
@@ -164,6 +188,7 @@ def collect_evidence(
     include_repo_evidence=DEFAULT_INCLUDE_REPO_EVIDENCE,
     test_command=DEFAULT_TEST_COMMAND,
     content_window=None,
+    test_operation=None,
 ):
     """Collect bounded, read-only review evidence deterministically from validated inputs."""
     normalized_paths = normalize_changed_paths(changed_paths)
@@ -171,7 +196,12 @@ def collect_evidence(
     if include_diff and not normalized_paths:
         raise ReviewBridgeError("include_diff requires at least one changed path")
 
-    validated_test_command = validate_test_command(test_command)
+    if test_operation is None:
+        validated_test_command = validate_test_command(test_command)
+        validated_test_operation = test_operation_for_command(validated_test_command)
+    else:
+        validated_test_operation = validate_test_operation(test_operation)
+        validated_test_command = TEST_OPERATION_COMMANDS[validated_test_operation]
 
     validated_window = validate_content_window(normalized_paths, content_window)
 
@@ -190,6 +220,7 @@ def collect_evidence(
         "include_diff": bool(include_diff),
         "include_repo_evidence": bool(include_repo_evidence),
         "test_command": validated_test_command,
+        "test_operation": validated_test_operation,
         "content_window": content_window_field,
         "file_content": file_content_field,
         "diff": "requested" if include_diff else "not-requested",
@@ -330,6 +361,18 @@ def _run_test_command(validated_test_command, resolved_workdir, timeout=COLLECT_
 
     argv = shlex.split(validated_test_command)
     record = _run_argv(argv, resolved_workdir, timeout=timeout)
+    record["skipped"] = False
+    return record
+
+
+def _run_test_operation(test_operation, resolved_workdir, timeout=COLLECT_TIMEOUT_SECONDS):
+    """Execute only the immutable argv mapped from a structured operation."""
+    operation = validate_test_operation(test_operation)
+    command = TEST_OPERATION_COMMANDS[operation]
+    if operation == DEFAULT_TEST_OPERATION:
+        return {"operation": operation, "command": command, "skipped": True}
+    record = _run_argv(shlex.split(command), resolved_workdir, timeout=timeout)
+    record["operation"] = operation
     record["skipped"] = False
     return record
 
@@ -651,11 +694,11 @@ def collect_committed_implementation_scope(workdir, base_sha, implementation_sha
     return scope
 
 
-def collect(workdir, changed_path=None, test_command=None, content_window=None, base_sha=None, implementation_sha=None):
+def collect(workdir, changed_path=None, test_command=None, content_window=None, base_sha=None, implementation_sha=None, test_operation=None):
     """Collect bounded, fresh, read-only review evidence for a single review session.
 
-    All inputs (workdir containment, changed_path containment, test_command
-    allowlist membership, content_window shape) are validated up front,
+    All inputs (workdir containment, changed_path containment, structured
+    test_operation membership, content_window shape) are validated up front,
     fail-closed, before any subprocess or filesystem read is attempted.
 
     Evidence gathered (all read-only, argv-list subprocess, shell=False,
@@ -668,9 +711,9 @@ def collect(workdir, changed_path=None, test_command=None, content_window=None, 
         file, capped at MAX_CONTENT_WINDOW_LINES lines (200) and
         MAX_CONTENT_WINDOW_BYTES bytes (20,000) -- never a full-file or
         full-repository dump, and never more than one file per call;
-      - when test_command is supplied: validated against ALLOWED_TEST_COMMANDS
-        and, if valid, executed read-only with a bounded exit code and
-        truncated stdout/stderr captured as evidence;
+      - when test_operation is supplied: validated against
+        ALLOWED_TEST_OPERATIONS and mapped to immutable argv before
+        read-only execution with bounded output;
       - every successful call additionally returns a deterministic
         repository-state fingerprint envelope (see collect_repository_state)
         under "repository_state", with its aggregate digest duplicated at
@@ -696,8 +739,15 @@ def collect(workdir, changed_path=None, test_command=None, content_window=None, 
         raise ReviewBridgeError("base_sha and implementation_sha must be supplied together")
 
     validated_test_command = None
-    if test_command is not None:
+    validated_test_operation = None
+    if test_operation is not None and test_command is not None:
+        raise ReviewBridgeError("test_operation and legacy test_command are mutually exclusive")
+    if test_operation is not None:
+        validated_test_operation = validate_test_operation(test_operation)
+        validated_test_command = TEST_OPERATION_COMMANDS[validated_test_operation]
+    elif test_command is not None:
         validated_test_command = validate_test_command(test_command)
+        validated_test_operation = test_operation_for_command(validated_test_command)
 
     # All inputs are validated; only now do we touch the filesystem/subprocess.
 
@@ -714,6 +764,7 @@ def collect(workdir, changed_path=None, test_command=None, content_window=None, 
         "diff_check": None,
         "content_window": None,
         "test_result": None,
+        "test_operation": validated_test_operation,
         "repository_state": None,
         "repository_state_sha256": None,
         "committed_scope": None,
@@ -739,8 +790,8 @@ def collect(workdir, changed_path=None, test_command=None, content_window=None, 
             "content": _read_content_window(resolved_changed_path, start_line, end_line),
         }
 
-    if validated_test_command is not None:
-        evidence["test_result"] = _run_test_command(validated_test_command, resolved_workdir)
+    if validated_test_operation is not None:
+        evidence["test_result"] = _run_test_operation(validated_test_operation, resolved_workdir)
 
     repository_state = collect_repository_state(str(resolved_workdir))
     evidence["repository_state"] = repository_state
@@ -763,18 +814,20 @@ mcp_server = MCPServer("review-bridge")
 
 
 @mcp_server.tool(name="collect")
-def _tool_collect(workdir, changed_path=None, test_command=None, content_window=None, base_sha=None, implementation_sha=None):
+def _tool_collect(workdir, changed_path=None, test_operation=None, content_window=None, base_sha=None, implementation_sha=None):
     """Return bounded, fresh, read-only review evidence for workdir.
 
     Read-only: never mutates git state, never touches the network. Evidence
     includes git status, and -- when changed_path is supplied -- a scoped
     diff, diff --check, and a bounded content window of that single file
     (at most MAX_CONTENT_WINDOW_LINES lines / MAX_CONTENT_WINDOW_BYTES
-    bytes; never a full-file or full-repository dump). When test_command is
-    supplied it must be one of ALLOWED_TEST_COMMANDS and is executed
-    read-only with a bounded timeout.
+    bytes; never a full-file or full-repository dump). When test_operation is
+    supplied it must be one of ALLOWED_TEST_OPERATIONS and is mapped to an
+    immutable argv list, then executed read-only with a bounded timeout.
     """
-    return collect(workdir, changed_path, test_command, content_window, base_sha, implementation_sha)
+    return collect(workdir, changed_path, content_window=content_window,
+                   base_sha=base_sha, implementation_sha=implementation_sha,
+                   test_operation=test_operation)
 
 
 if __name__ == "__main__":

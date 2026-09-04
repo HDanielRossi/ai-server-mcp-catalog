@@ -55,6 +55,7 @@ ReviewBridgeError = review_bridge_server.ReviewBridgeError
 collect_evidence = review_bridge_server.collect_evidence
 normalize_changed_paths = review_bridge_server.normalize_changed_paths
 validate_test_command = review_bridge_server.validate_test_command
+validate_test_operation = review_bridge_server.validate_test_operation
 validate_content_window = review_bridge_server.validate_content_window
 validate_workdir = review_bridge_server.validate_workdir
 collect = review_bridge_server.collect
@@ -148,6 +149,53 @@ def test_allowlist_accepts_all_three_commands():
 def test_allowlist_rejects_unknown_command():
     with pytest.raises(ReviewBridgeError):
         validate_test_command("rm -rf /")
+
+
+def test_reviewer_operation_enum_is_structured_and_exact():
+    assert review_bridge_server.ALLOWED_TEST_OPERATIONS == {"skip", "pytest_full", "repository_audit"}
+    assert review_bridge_server.TEST_OPERATION_COMMANDS["pytest_full"] == (
+        "/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q"
+    )
+    assert review_bridge_server.TEST_OPERATION_COMMANDS["repository_audit"] == (
+        "./scripts/audit-hermes-pipeline-hardening.sh"
+    )
+    assert validate_test_operation("skip") == "skip"
+    assert validate_test_operation("pytest_full") == "pytest_full"
+    assert validate_test_operation("repository_audit") == "repository_audit"
+
+
+@pytest.mark.parametrize("value", ["pytest", "audit", "run_audit", ".venv/bin/python -m pytest -q", " pytest_full "])
+def test_unsupported_reviewer_operation_is_rejected(value):
+    with pytest.raises(ReviewBridgeError):
+        validate_test_operation(value)
+
+
+def test_structured_operation_maps_to_immutable_argv(monkeypatch):
+    captured = {}
+
+    def fake_run_argv(argv, cwd, timeout=review_bridge_server.COLLECT_TIMEOUT_SECONDS):
+        captured["argv"] = argv
+        captured["cwd"] = cwd
+        captured["timeout"] = timeout
+        return {"command": list(argv), "exit_code": 0, "timed_out": False, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(review_bridge_server, "_run_argv", fake_run_argv)
+    result = review_bridge_server._run_test_operation("pytest_full", Path(REPO_ROOT))
+    assert captured["argv"] == ["/home/hdgr/.hermes/hermes-agent/venv/bin/python3", "-m", "pytest", "-q"]
+    assert result["operation"] == "pytest_full"
+    assert result["skipped"] is False
+
+
+def test_mcp_collect_contract_exposes_operation_not_command():
+    import inspect
+    parameters = inspect.signature(review_bridge_server._tool_collect).parameters
+    assert "test_operation" in parameters
+    assert "test_command" not in parameters
+
+
+def test_structured_collect_rejects_legacy_command_in_new_contract():
+    with pytest.raises(TypeError):
+        review_bridge_server._tool_collect(REPO_ROOT, test_command="pytest")
 
 
 def test_no_window_defaults():
@@ -461,7 +509,7 @@ def test_skip_test_command_is_recorded_as_skipped_and_not_executed(monkeypatch):
     monkeypatch.setattr(review_bridge_server.subprocess, "run", dispatch)
 
     result = collect(REPO_ROOT, test_command="__skip__")
-    assert result["test_result"] == {"command": "__skip__", "skipped": True}
+    assert result["test_result"] == {"operation": "skip", "command": "__skip__", "skipped": True}
 
 
 def test_allowed_test_command_is_executed_as_argv_list(monkeypatch):
@@ -653,7 +701,7 @@ def test_mcp_tool_rejects_workdir_outside_allowed_root(monkeypatch):
 
 # --- reviewer-SOUL.md evidence policy ---------------------------------------
 
-SOUL_PATH = "/opt/ai/projects/ai-server-mcp-catalog/templates/reviewer-SOUL.md"
+SOUL_PATH = os.path.join(REPO_ROOT, "templates", "reviewer-SOUL.md")
 
 
 def test_reviewer_soul_exists():
@@ -718,7 +766,9 @@ def test_reviewer_soul_forbids_implementing_or_mutating():
 def test_reviewer_soul_documents_collect_protocol_signature():
     with open(SOUL_PATH, encoding="utf-8") as f:
         text = f.read()
-    assert "collect(workdir, changed_path=None, test_command=None, content_window=None)" in text
+    assert "collect(workdir, changed_path=None, test_operation=None, content_window=None)" in text
+    assert "pytest_full" in text
+    assert "repository_audit" in text
 
 
 def test_reviewer_soul_documents_collect_protocol_rules():
@@ -910,7 +960,7 @@ def test_collect_existing_keys_unchanged_after_repository_state_addition(tmp_pat
     expected_keys = {
         "workdir", "repo_check", "git_status", "changed_path", "diff_name_only",
         "diff", "diff_check", "content_window", "test_result", "repository_state",
-        "repository_state_sha256", "committed_scope", "status",
+        "repository_state_sha256", "committed_scope", "status", "test_operation",
     }
     assert set(result.keys()) == expected_keys
     assert result["status"] == "ok"

@@ -378,7 +378,8 @@ import sys
 PATH = os.environ["AUDIT_REVIEWER_SOUL_PATH"]
 
 INVARIANTS = [
-    ("collect_exact_signature", "collect(workdir, changed_path=None, test_command=None, content_window=None,\n        base_sha=None, implementation_sha=None)"),
+    ("collect_exact_signature", "collect(workdir, changed_path=None, test_operation=None, content_window=None,\n        base_sha=None, implementation_sha=None)"),
+    ("structured_test_operation", "Reviewers select operations and never compose command strings"),
     ("changed_path_repo_relative", "supplies EXACTLY ONE repo-relative changed_path"),
     ("content_window_requires_changed_path", "content_window may ONLY be used together with a changed_path"),
     ("content_window_path_equals_changed_path", "content_window.path EXACTLY EQUALS changed_path"),
@@ -2364,6 +2365,9 @@ run_repo_only() {
   REVIEW_FILE="$REPO_DIR/templates/review_bridge_server.py"
   REVIEW_STRINGS=(
     'DEFAULT_TEST_COMMAND = "__skip__"'
+    'DEFAULT_TEST_OPERATION = "skip"'
+    'ALLOWED_TEST_OPERATIONS'
+    'TEST_OPERATION_COMMANDS'
     '__skip__'
     'MAX_CONTENT_WINDOW_LINES = 200'
     'DEFAULT_INCLUDE_DIFF = False'
@@ -2389,8 +2393,10 @@ run_repo_only() {
   echo "4) reviewer template (templates/reviewer-SOUL.md):"
   REVIEWER_FILE="$REPO_DIR/templates/reviewer-SOUL.md"
   REVIEWER_STRINGS=(
-    'If test_command is __skip__, do not invent or substitute another command'
-    'If tests are required by the acceptance criteria but no valid explicit test command is available, block the task instead of guessing'
+    'test_operation'
+    'pytest_full'
+    'repository_audit'
+    'Reviewers select operations and never compose command strings'
     '200 lines'
     'exactly one file'
     'No parallel collects'
@@ -2419,9 +2425,6 @@ run_repo_only() {
     'correction:'
     'implementation_task_id'
     'review_task_id'
-    'If test_command is __skip__, do not invent or substitute another command'
-    'If tests are required by the acceptance criteria but no valid explicit test command is available,'
-    'block the task instead of guessing'
     'PipelineBridgeError'
   )
   for s in "${PIPELINE_STRINGS[@]}"; do
