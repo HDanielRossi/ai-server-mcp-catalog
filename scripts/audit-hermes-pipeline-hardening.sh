@@ -2334,11 +2334,14 @@ run_repo_only() {
   require_file_nonempty "templates/reviewer-SOUL.md"
   require_file_nonempty "templates/pipeline_bridge_server.py"
   require_file_nonempty "templates/claude_bridge_server.py"
+  require_file_nonempty "templates/implementation_validation_bridge_server.py"
+  require_file_nonempty "templates/coder-claude-implementation-validation.yaml"
   require_file_nonempty "templates/planner_bridge_server.py"
   require_file_nonempty "scripts/planner-bridge"
   require_file_nonempty "tests/test_review_bridge_template.py"
   require_file_nonempty "tests/test_pipeline_bridge_template.py"
   require_file_nonempty "tests/test_claude_bridge_template.py"
+  require_file_nonempty "tests/test_implementation_validation_bridge.py"
   require_file_nonempty "tests/test_planner_bridge_template.py"
   require_file_nonempty "tests/test_planner_bridge_wrapper.py"
   require_file_nonempty "templates/review_archive_bridge.py"
@@ -2487,6 +2490,32 @@ run_repo_only() {
     else
       check_fail "claude template must not contain: $s"
     fi
+  done
+
+  echo
+  echo "6b) implementation-worker validation bridge:"
+  VALIDATION_FILE="$REPO_DIR/templates/implementation_validation_bridge_server.py"
+  VALIDATION_STRINGS=(
+    'MCPServer("implementation-validation-bridge")'
+    '@mcp_server.tool(name="validate")'
+    'ALLOWED_OPERATIONS'
+    'pytest_full' 'pytest_targeted' 'repository_audit' 'git_diff_check' 'py_compile'
+    'shell=False' 'start_new_session=True' 'os.killpg' 'signal.SIGKILL'
+    'MAX_OUTPUT_CHARS = 16_000'
+    'RESULT_SCHEMA = "hermes.implementation-validation/v1"'
+    'env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"}'
+    'must be under tests/' 'py_compile.compile'
+  )
+  for s in "${VALIDATION_STRINGS[@]}"; do
+    if grep_ok "$VALIDATION_FILE" "$s"; then check_ok "implementation validation bridge contains: $s"; else check_fail "implementation validation bridge missing: $s"; fi
+  done
+  if grep -qF -- 'shell=True' "$VALIDATION_FILE" 2>/dev/null; then check_fail "implementation validation bridge contains shell=True"; else check_ok "implementation validation bridge contains no shell=True"; fi
+  PROFILE_FILE="$REPO_DIR/templates/coder-claude-implementation-validation.yaml"
+  for s in 'implementation_validation_bridge' '/usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python' '/usr/local/lib/implementation-validation-bridge-mcp/server.py'; do
+    if grep_ok "$PROFILE_FILE" "$s"; then check_ok "coder profile fragment contains: $s"; else check_fail "coder profile fragment missing: $s"; fi
+  done
+  for s in 'review_bridge' 'pipeline_controller' 'archive_review' 'ready_to_commit'; do
+    if grep -qF -- "$s" "$PROFILE_FILE" 2>/dev/null; then check_fail "coder profile fragment exposes forbidden authority: $s"; else check_ok "coder profile fragment omits: $s"; fi
   done
 
   echo

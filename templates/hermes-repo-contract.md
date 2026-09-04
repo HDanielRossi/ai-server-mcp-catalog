@@ -129,6 +129,20 @@ The human operator gives explicit commit authorization only after READY_TO_COMMI
 
 Push requires a separate explicit human authorization. Commit authorization never implies push authorization.
 
+## Implementation-worker validation boundary
+
+The separate `implementation-validation-bridge` is the only additional
+capability intended for `coder-claude` self-validation. It is not formal review:
+it has no verdict, review metadata, archive, READY_TO_COMMIT, Kanban, or Git
+mutation authority. Its single structured `validate` operation permits only
+`pytest_full`, `pytest_targeted` for existing repo-relative paths under
+`tests/`, `repository_audit`, `git_diff_check`, and `py_compile` for existing
+repo-relative Python files. It uses fixed argv, `shell=False`, a fixed
+environment, repository confinement with symlink-escape rejection, bounded
+timeouts/output, and process-group cleanup. No caller-supplied command, cwd,
+environment, service, package, SQL, or deployment action is accepted. The
+formal reviewer remains independent and continues to use only `review_bridge`.
+
 ## A6 `pipeline_controller` MCP adapter
 
 When the pipeline is driven through the `pipeline-controller` MCP server (`templates/pipeline_controller_server.py`), the same READY_TO_COMMIT and archival rules above apply unchanged: the MCP server is a thin façade over `scripts/hermes-pipeline-controller.py` and never reimplements or second-guesses controller policy.

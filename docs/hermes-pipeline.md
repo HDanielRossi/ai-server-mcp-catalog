@@ -93,6 +93,16 @@ Responsibilities:
 - Do not use direct Hermes/Qwen editing for implementation.
 ```
 
+For narrow headless self-validation, coder-claude may additionally receive the
+separate `implementation-validation-bridge` MCP server. Its fixed operation
+enum is `pytest_full`, `pytest_targeted` (existing repo-relative `tests/` paths
+only), `repository_audit`, `git_diff_check`, and `py_compile` (existing
+repo-relative Python paths only). It accepts no arbitrary command, executable,
+cwd, or environment and cannot mutate Git, Kanban, runtime, services, or
+deployment. The independent reviewer still uses `review_bridge`; implementation
+validation never supplies a formal verdict and never replaces formal review,
+archive-v2, or READY_TO_COMMIT.
+
 ### claude_bridge
 
 Controlled Claude Code execution bridge.

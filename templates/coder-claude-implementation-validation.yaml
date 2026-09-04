@@ -1,0 +1,9 @@
+# Operator-applied fragment for coder-claude only.  This is not a reviewer or
+# pipeline-controller configuration and exposes no lifecycle authority.
+mcp_servers:
+  implementation_validation_bridge:
+    command: /usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python
+    args:
+      - /usr/local/lib/implementation-validation-bridge-mcp/server.py
+    timeout: 370
+    connect_timeout: 30

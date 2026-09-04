@@ -237,16 +237,19 @@ def test_committed_scope_matches_exact_base_to_head_paths():
     implementation = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
                                     capture_output=True, text=True).stdout.strip()
     scope = hpc.capture_committed_implementation_scope(
-        repo, "a50235ebb31eb8b9c0f43b9b6b252fe79a9e2dbf", implementation
+        repo, "c830b530ff32947e804c58b7bcc1fa5f762a5eec", implementation
     )
     assert scope["changed_paths"] == [
         "docs/hermes-pipeline.md",
         "scripts/audit-hermes-pipeline-hardening.sh",
-        "scripts/hermes-pipeline-controller.py",
+        "templates/coder-claude-implementation-validation.yaml",
+        "templates/hermes-repo-contract.md",
+        "templates/implementation_validation_bridge_server.py",
         "templates/review_bridge_server.py",
         "templates/reviewer-SOUL.md",
         "tests/test_audit_hermes_pipeline_hardening.py",
         "tests/test_hermes_pipeline_controller.py",
+        "tests/test_implementation_validation_bridge.py",
         "tests/test_review_bridge_template.py",
     ]
     assert scope["changed_paths"] == sorted(set(scope["changed_paths"]))
