@@ -1395,3 +1395,45 @@ implementation commit. The base and implementation commits therefore bind the
 derived committed scope. A terminal task is replayed successfully only when its
 completed bootstrap provenance exactly matches the requested payload; a
 conflicting terminal record fails closed without another completion attempt.
+
+## S0.1b shadow routing (observe-only prototype)
+
+`create-implementation` and `create-correction` accept optional, observe-only
+inputs that feed a pure deterministic rule, `shadow_route()`, embedded in
+`scripts/hermes-pipeline-controller.py` (self-contained, because the
+controller is installed as the single file `/usr/local/bin/hermes-pipeline-controller`):
+
+- `--shadow-declared-path PATH` (repeatable; repository-relative)
+- `--shadow-component NAME` (repeatable)
+- `--shadow-mandatory-block true|false`
+- `--shadow-mandatory-block-reason CODE` (`[A-Z][A-Z0-9_]{2,63}`)
+
+The actual assignee is read from the already-built `hermes kanban create`
+argv (passed to the hook as an immutable tuple). Rule order:
+
+1. `mandatory_block` is `true` → `CLAUDE_REQUIRED`.
+2. Otherwise, at most 8 distinct canonical paths, at most 2 components, and
+   every component in {`repository-source`, `tests`, `documentation`} →
+   `QWEN_CANDIDATE`.
+3. Otherwise → `UNKNOWN`. A missing or malformed required feature (assignee,
+   mandatory block, paths, components) is always `UNKNOWN`; nothing is guessed.
+
+Paths are canonicalized (`./`, duplicate and trailing slashes removed,
+duplicates collapsed). Absolute (`/`, `~`, drive letter), `..`, backslash,
+control-character, empty, and repository-root paths make the scope invalid.
+
+When at least one `--shadow-*` input is supplied, the hook writes exactly one
+`system-one.shadow-route/v1` JSON line to stderr: `decision`,
+`actual_assignee`, typed `reasons`, a feature-presence map, path/component
+counts, `workdir` as basename plus a 12-character SHA-256 prefix, and
+`"body": "REDACTED"`. It never includes the task body, the feature name, raw
+paths, or the full workdir. Without `--shadow-*` inputs nothing is written.
+Any hook failure is swallowed. In every case the Kanban argv, stdout, and
+exit code are unchanged, and nothing is written to Kanban, a database, or
+files. The decision is never acted on.
+
+Installation implications: the MCP adapter
+(`templates/pipeline_controller_server.py`) does not yet forward `--shadow-*`
+inputs, so a deployed controller emits nothing until a caller supplies them.
+Changing this source breaks the `--runtime` audit's source/runtime SHA-256
+parity until the operator separately installs the controller.

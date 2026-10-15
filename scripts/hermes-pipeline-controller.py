@@ -70,6 +70,23 @@ FORMAL_REVIEW_MARKER = "HERMES_FORMAL_REVIEW_V1"
 BOOTSTRAP_PROVENANCE_SCHEMA = "hermes.implementation-provenance/operator-bootstrap/v1"
 BOOTSTRAP_REASON = "IMPLEMENTATION_BOOTSTRAP_PROVENANCE_GAP"
 
+# S0.1b shadow routing (observe-only). See shadow_route() and _shadow_route_hook().
+SHADOW_ROUTE_SCHEMA = "system-one.shadow-route/v1"
+SHADOW_DECISION_CLAUDE_REQUIRED = "CLAUDE_REQUIRED"
+SHADOW_DECISION_QWEN_CANDIDATE = "QWEN_CANDIDATE"
+SHADOW_DECISION_UNKNOWN = "UNKNOWN"
+SHADOW_MAX_PATHS = 8
+SHADOW_MAX_COMPONENTS = 2
+SHADOW_ELIGIBLE_COMPONENTS = frozenset({"repository-source", "tests", "documentation"})
+SHADOW_WORKDIR_HASH_PREFIX_CHARS = 12
+SHADOW_REASON_CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{2,63}")
+SHADOW_COMPONENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
+SHADOW_ASSIGNEE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+SHADOW_ARG_DESTS = (
+    "shadow_declared_path", "shadow_component",
+    "shadow_mandatory_block", "shadow_mandatory_block_reason",
+)
+
 
 class CliUsageError(Exception):
     """A CLI usage problem, mapped to exit code 3."""
@@ -126,6 +143,15 @@ class Exit3ArgumentParser(argparse.ArgumentParser):
         raise CliUsageError(message)
 
 
+def _add_shadow_route_arguments(subparser):
+    # Optional, observe-only inputs. Plain strings only, so argparse never
+    # rejects a value; all validation happens inside the pure shadow_route().
+    subparser.add_argument("--shadow-declared-path", action="append", default=None)
+    subparser.add_argument("--shadow-component", action="append", default=None)
+    subparser.add_argument("--shadow-mandatory-block", default=None)
+    subparser.add_argument("--shadow-mandatory-block-reason", default=None)
+
+
 def build_parser():
     parser = Exit3ArgumentParser(prog="hermes-pipeline-controller.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -139,6 +165,7 @@ def build_parser():
     create_impl.add_argument("--workdir", required=True)
     create_impl.add_argument("--feature", required=True)
     create_impl.add_argument("--body", default=None)
+    _add_shadow_route_arguments(create_impl)
 
     bootstrap = subparsers.add_parser(
         "register-bootstrap-implementation", prog="register-bootstrap-implementation",
@@ -171,6 +198,7 @@ def build_parser():
     create_correction.add_argument("--review_task_id", required=True)
     create_correction.add_argument("--review_summary", default=None)
     create_correction.add_argument("--correction_instructions", default=None)
+    _add_shadow_route_arguments(create_correction)
 
     wait_p = subparsers.add_parser(
         "wait", prog="wait",
@@ -727,6 +755,192 @@ def check_task(task_id):
     return EXIT_OK if valid else EXIT_VALIDATION
 
 
+def _shadow_canonical_path(raw):
+    """Return (canonical_relative_path, None) or (None, reason_code). Pure."""
+    if not isinstance(raw, str):
+        return None, "PATH_NOT_STRING"
+    if raw == "":
+        return None, "PATH_EMPTY"
+    if "\\" in raw or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+        return None, "PATH_NONCANONICAL"
+    if raw.startswith("/") or raw.startswith("~") or re.match(r"[A-Za-z]:", raw):
+        return None, "PATH_ABSOLUTE"
+    segments = raw.split("/")
+    if ".." in segments:
+        return None, "PATH_PARENT_TRAVERSAL"
+    kept = [seg for seg in segments if seg not in ("", ".")]
+    if not kept:
+        return None, "PATH_REPOSITORY_ROOT"
+    return "/".join(kept), None
+
+
+def shadow_route(features):
+    """Pure, deterministic S0.1b shadow routing decision.
+
+    `features` may contain: declared_paths (list of str), components (list
+    of str), mandatory_block (bool), mandatory_block_reason (str),
+    actual_assignee (str), workdir (str). No I/O, no state, no LLM. A missing
+    or malformed required feature yields UNKNOWN; nothing is guessed. The
+    returned record never contains a task body, raw paths, or a full workdir.
+    """
+    reasons = []
+    presence = {
+        name: features.get(name) is not None
+        for name in ("declared_paths", "components", "mandatory_block",
+                     "mandatory_block_reason", "actual_assignee")
+    }
+
+    assignee = features.get("actual_assignee")
+    assignee_ok = isinstance(assignee, str) and SHADOW_ASSIGNEE_RE.fullmatch(assignee) is not None
+    if assignee is None:
+        reasons.append({"type": "missing_feature", "code": "ACTUAL_ASSIGNEE_MISSING"})
+    elif not assignee_ok:
+        reasons.append({"type": "invalid_feature", "code": "ACTUAL_ASSIGNEE_INVALID"})
+
+    block = features.get("mandatory_block")
+    block_reason = features.get("mandatory_block_reason")
+    block_ok = isinstance(block, bool)
+    block_reason_ok = (
+        isinstance(block_reason, str) and SHADOW_REASON_CODE_RE.fullmatch(block_reason) is not None
+    )
+    if block is None:
+        reasons.append({"type": "missing_feature", "code": "MANDATORY_BLOCK_MISSING"})
+    elif not block_ok:
+        reasons.append({"type": "invalid_feature", "code": "MANDATORY_BLOCK_INVALID"})
+    if block_reason is not None and not block_reason_ok:
+        reasons.append({"type": "invalid_feature", "code": "MANDATORY_BLOCK_REASON_INVALID"})
+
+    raw_paths = features.get("declared_paths")
+    canonical_paths = None
+    if raw_paths is None or (isinstance(raw_paths, (list, tuple)) and not raw_paths):
+        reasons.append({"type": "missing_feature", "code": "DECLARED_PATHS_MISSING"})
+    elif not isinstance(raw_paths, (list, tuple)):
+        reasons.append({"type": "invalid_feature", "code": "DECLARED_PATHS_INVALID"})
+    else:
+        collected = set()
+        valid = True
+        for index, raw in enumerate(raw_paths):
+            canonical, error = _shadow_canonical_path(raw)
+            if error:
+                reasons.append({"type": "invalid_feature", "code": error, "index": index})
+                valid = False
+            else:
+                collected.add(canonical)
+        if valid:
+            canonical_paths = sorted(collected)
+
+    raw_components = features.get("components")
+    components = None
+    if raw_components is None or (isinstance(raw_components, (list, tuple)) and not raw_components):
+        reasons.append({"type": "missing_feature", "code": "COMPONENTS_MISSING"})
+    elif not isinstance(raw_components, (list, tuple)):
+        reasons.append({"type": "invalid_feature", "code": "COMPONENTS_INVALID"})
+    else:
+        valid = True
+        for index, raw in enumerate(raw_components):
+            if not isinstance(raw, str) or SHADOW_COMPONENT_RE.fullmatch(raw) is None:
+                reasons.append({"type": "invalid_feature", "code": "COMPONENT_INVALID", "index": index})
+                valid = False
+        if valid:
+            components = sorted(set(raw_components))
+
+    if canonical_paths is not None and len(canonical_paths) > SHADOW_MAX_PATHS:
+        reasons.append({"type": "ineligible", "code": "PATH_COUNT_EXCEEDED"})
+    if components is not None:
+        if len(components) > SHADOW_MAX_COMPONENTS:
+            reasons.append({"type": "ineligible", "code": "COMPONENT_COUNT_EXCEEDED"})
+        if not set(components) <= SHADOW_ELIGIBLE_COMPONENTS:
+            reasons.append({"type": "ineligible", "code": "COMPONENT_NOT_ELIGIBLE"})
+
+    # Rule order: mandatory block, then the narrow Qwen-candidate scope, else UNKNOWN.
+    if not assignee_ok or not block_ok:
+        decision = SHADOW_DECISION_UNKNOWN
+    elif block is True:
+        rule = {"type": "rule", "code": "MANDATORY_BLOCK"}
+        if block_reason_ok:
+            rule["value"] = block_reason
+        reasons.insert(0, rule)
+        decision = SHADOW_DECISION_CLAUDE_REQUIRED
+    elif block_reason is not None:
+        reasons.append({"type": "invalid_feature", "code": "MANDATORY_BLOCK_REASON_WITHOUT_BLOCK"})
+        decision = SHADOW_DECISION_UNKNOWN
+    elif (
+        canonical_paths is not None and components is not None
+        and len(canonical_paths) <= SHADOW_MAX_PATHS
+        and len(components) <= SHADOW_MAX_COMPONENTS
+        and set(components) <= SHADOW_ELIGIBLE_COMPONENTS
+    ):
+        reasons.insert(0, {"type": "rule", "code": "NARROW_ELIGIBLE_SCOPE"})
+        decision = SHADOW_DECISION_QWEN_CANDIDATE
+    else:
+        decision = SHADOW_DECISION_UNKNOWN
+
+    workdir = features.get("workdir")
+    workdir_record = None
+    if isinstance(workdir, str) and workdir:
+        workdir_record = {
+            "basename": workdir.rstrip("/").rsplit("/", 1)[-1],
+            "sha256_prefix": hashlib.sha256(workdir.encode("utf-8")).hexdigest()[
+                :SHADOW_WORKDIR_HASH_PREFIX_CHARS
+            ],
+        }
+
+    return {
+        "schema": SHADOW_ROUTE_SCHEMA,
+        "decision": decision,
+        "actual_assignee": assignee if assignee_ok else None,
+        "reasons": reasons,
+        "features": presence,
+        "scope": {
+            "path_count": len(canonical_paths) if canonical_paths is not None else None,
+            "component_count": len(components) if components is not None else None,
+        },
+        "workdir": workdir_record,
+        "body": "REDACTED",
+    }
+
+
+def _shadow_actual_assignee(argv):
+    """Read (never modify) the single --assignee value from an immutable argv."""
+    if argv.count("--assignee") != 1:
+        return None
+    index = argv.index("--assignee")
+    return argv[index + 1] if index + 1 < len(argv) else None
+
+
+def _shadow_mandatory_block_value(raw):
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    return raw  # None stays missing; anything else is rejected by shadow_route()
+
+
+def _shadow_route_hook(args, argv, resolved):
+    """Observe-only S0.1b hook: at most one JSON line to stderr.
+
+    Runs only when a --shadow-* input was supplied. Receives argv as a tuple
+    so it cannot alter the real command. Every failure is swallowed; the
+    caller's argv, stdout, exit code, and execution are unaffected.
+    """
+    try:
+        if all(getattr(args, dest, None) is None for dest in SHADOW_ARG_DESTS):
+            return
+        record = shadow_route({
+            "declared_paths": args.shadow_declared_path,
+            "components": args.shadow_component,
+            "mandatory_block": _shadow_mandatory_block_value(args.shadow_mandatory_block),
+            "mandatory_block_reason": args.shadow_mandatory_block_reason,
+            "actual_assignee": _shadow_actual_assignee(argv),
+            "workdir": str(resolved),
+        })
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def create_implementation(args):
     phase = "implementation"
     resolved = validate_phase_inputs(phase, args.workdir, args.feature)
@@ -751,6 +965,7 @@ def create_implementation(args):
         "--max-retries", "3",
         "--json",
     ]
+    _shadow_route_hook(args, tuple(argv), resolved)
     completed = run_hermes_command(argv)
     payload = parse_json_stdout(completed, "hermes kanban create")
     task_id = extract_real_id(payload)
@@ -975,6 +1190,7 @@ def create_correction(args):
         "--max-retries", "3",
         "--json",
     ]
+    _shadow_route_hook(args, tuple(argv), resolved)
     completed = run_hermes_command(argv)
     payload = parse_json_stdout(completed, "hermes kanban create")
     task_id = extract_real_id(payload)
