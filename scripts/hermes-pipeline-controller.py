@@ -82,6 +82,9 @@ SHADOW_WORKDIR_HASH_PREFIX_CHARS = 12
 SHADOW_REASON_CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{2,63}")
 SHADOW_COMPONENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
 SHADOW_ASSIGNEE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+SHADOW_MAX_INDEXED_REASONS = 4  # per list feature; the rest become one typed truncation reason
+SHADOW_MAX_LINE_BYTES = 2048  # emitted line incl. newline; well under the adapter's 4000-char stderr cap
+SHADOW_FLAG_PREFIX = "--shadow-"
 SHADOW_ARG_DESTS = (
     "shadow_declared_path", "shadow_component",
     "shadow_mandatory_block", "shadow_mandatory_block_reason",
@@ -142,10 +145,20 @@ class Exit3ArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         raise CliUsageError(message)
 
+    def _get_option_tuples(self, option_string):
+        # Prefix abbreviation stays available for pre-existing options, but the
+        # S0.1b --shadow-* flags are only ever matched by their exact spelling.
+        return [
+            option_tuple for option_tuple in super()._get_option_tuples(option_string)
+            if not any(s.startswith(SHADOW_FLAG_PREFIX) for s in option_tuple[0].option_strings)
+        ]
+
 
 def _add_shadow_route_arguments(subparser):
-    # Optional, observe-only inputs. Plain strings only, so argparse never
-    # rejects a value; all validation happens inside the pure shadow_route().
+    # Optional, observe-only inputs. Plain strings only, so well-formed values
+    # are never rejected; all validation happens inside the pure shadow_route().
+    # Malformed shadow argv (a flag with no value, a dash-leading value not in
+    # `--flag=value` form, an abbreviated flag) is an ordinary usage error.
     subparser.add_argument("--shadow-declared-path", action="append", default=None)
     subparser.add_argument("--shadow-component", action="append", default=None)
     subparser.add_argument("--shadow-mandatory-block", default=None)
@@ -774,6 +787,48 @@ def _shadow_canonical_path(raw):
     return "/".join(kept), None
 
 
+def _shadow_extend_indexed_reasons(reasons, indexed, truncated_code):
+    """Keep the first SHADOW_MAX_INDEXED_REASONS per-index reasons, count the rest."""
+    reasons.extend(indexed[:SHADOW_MAX_INDEXED_REASONS])
+    omitted = len(indexed) - SHADOW_MAX_INDEXED_REASONS
+    if omitted > 0:
+        reasons.append({"type": "truncated", "code": truncated_code, "omitted": omitted})
+
+
+def _shadow_dumps(record):
+    return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+
+
+def shadow_route_line(record):
+    """Serialize a shadow_route() record as one bounded JSON line, or None.
+
+    The line (newline included) never exceeds SHADOW_MAX_LINE_BYTES, so it
+    cannot crowd a later transport error out of the adapter's bounded stderr.
+    If needed, trailing reasons are dropped (the leading decision rule is
+    kept) and replaced by one RECORD_REASONS_TRUNCATED reason, then the
+    workdir basename is omitted. Deterministic; the input is not modified.
+    """
+    line = _shadow_dumps(record)
+    if len(line) <= SHADOW_MAX_LINE_BYTES:
+        return line
+    record = dict(record)
+    reasons = record["reasons"]
+    floor = 1 if reasons and reasons[0].get("type") == "rule" else 0
+    for keep in range(len(reasons) - 1, floor - 1, -1):
+        record["reasons"] = reasons[:keep] + [{
+            "type": "truncated", "code": "RECORD_REASONS_TRUNCATED", "omitted": len(reasons) - keep,
+        }]
+        line = _shadow_dumps(record)
+        if len(line) <= SHADOW_MAX_LINE_BYTES:
+            return line
+    if record.get("workdir") is not None:
+        record["workdir"] = dict(record["workdir"], basename=None)
+        line = _shadow_dumps(record)
+        if len(line) <= SHADOW_MAX_LINE_BYTES:
+            return line
+    return None
+
+
 def shadow_route(features):
     """Pure, deterministic S0.1b shadow routing decision.
 
@@ -818,15 +873,15 @@ def shadow_route(features):
         reasons.append({"type": "invalid_feature", "code": "DECLARED_PATHS_INVALID"})
     else:
         collected = set()
-        valid = True
+        invalid = []
         for index, raw in enumerate(raw_paths):
             canonical, error = _shadow_canonical_path(raw)
             if error:
-                reasons.append({"type": "invalid_feature", "code": error, "index": index})
-                valid = False
+                invalid.append({"type": "invalid_feature", "code": error, "index": index})
             else:
                 collected.add(canonical)
-        if valid:
+        _shadow_extend_indexed_reasons(reasons, invalid, "PATH_REASONS_TRUNCATED")
+        if not invalid:
             canonical_paths = sorted(collected)
 
     raw_components = features.get("components")
@@ -836,12 +891,13 @@ def shadow_route(features):
     elif not isinstance(raw_components, (list, tuple)):
         reasons.append({"type": "invalid_feature", "code": "COMPONENTS_INVALID"})
     else:
-        valid = True
-        for index, raw in enumerate(raw_components):
-            if not isinstance(raw, str) or SHADOW_COMPONENT_RE.fullmatch(raw) is None:
-                reasons.append({"type": "invalid_feature", "code": "COMPONENT_INVALID", "index": index})
-                valid = False
-        if valid:
+        invalid = [
+            {"type": "invalid_feature", "code": "COMPONENT_INVALID", "index": index}
+            for index, raw in enumerate(raw_components)
+            if not isinstance(raw, str) or SHADOW_COMPONENT_RE.fullmatch(raw) is None
+        ]
+        _shadow_extend_indexed_reasons(reasons, invalid, "COMPONENT_REASONS_TRUNCATED")
+        if not invalid:
             components = sorted(set(raw_components))
 
     if canonical_paths is not None and len(canonical_paths) > SHADOW_MAX_PATHS:
@@ -853,14 +909,16 @@ def shadow_route(features):
             reasons.append({"type": "ineligible", "code": "COMPONENT_NOT_ELIGIBLE"})
 
     # Rule order: mandatory block, then the narrow Qwen-candidate scope, else UNKNOWN.
-    if not assignee_ok or not block_ok:
-        decision = SHADOW_DECISION_UNKNOWN
-    elif block is True:
+    # An explicit mandatory block wins even when other features (including the
+    # actual assignee) are missing or invalid; their reasons are retained.
+    if block is True:
         rule = {"type": "rule", "code": "MANDATORY_BLOCK"}
         if block_reason_ok:
             rule["value"] = block_reason
         reasons.insert(0, rule)
         decision = SHADOW_DECISION_CLAUDE_REQUIRED
+    elif not assignee_ok or not block_ok:
+        decision = SHADOW_DECISION_UNKNOWN
     elif block_reason is not None:
         reasons.append({"type": "invalid_feature", "code": "MANDATORY_BLOCK_REASON_WITHOUT_BLOCK"})
         decision = SHADOW_DECISION_UNKNOWN
@@ -875,6 +933,9 @@ def shadow_route(features):
     else:
         decision = SHADOW_DECISION_UNKNOWN
 
+    # Pseudonymous workdir ID, not irreversible redaction: the basename is in
+    # clear, and anyone who knows or guesses the full path can recompute the
+    # unsalted hash prefix to confirm it.
     workdir = features.get("workdir")
     workdir_record = None
     if isinstance(workdir, str) and workdir:
@@ -934,8 +995,10 @@ def _shadow_route_hook(args, argv, resolved):
             "actual_assignee": _shadow_actual_assignee(argv),
             "workdir": str(resolved),
         })
-        line = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-        sys.stderr.write(line + "\n")
+        line = shadow_route_line(record)
+        if line is None:
+            return
+        sys.stderr.write(line)
         sys.stderr.flush()
     except Exception:
         pass

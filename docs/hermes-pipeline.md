@@ -1411,7 +1411,9 @@ controller is installed as the single file `/usr/local/bin/hermes-pipeline-contr
 The actual assignee is read from the already-built `hermes kanban create`
 argv (passed to the hook as an immutable tuple). Rule order:
 
-1. `mandatory_block` is `true` → `CLAUDE_REQUIRED`.
+1. `mandatory_block` is `true` → `CLAUDE_REQUIRED`, even when the actual
+   assignee or a scope feature is missing or invalid (those reasons are
+   still reported).
 2. Otherwise, at most 8 distinct canonical paths, at most 2 components, and
    every component in {`repository-source`, `tests`, `documentation`} →
    `QWEN_CANDIDATE`.
@@ -1428,9 +1430,42 @@ When at least one `--shadow-*` input is supplied, the hook writes exactly one
 counts, `workdir` as basename plus a 12-character SHA-256 prefix, and
 `"body": "REDACTED"`. It never includes the task body, the feature name, raw
 paths, or the full workdir. Without `--shadow-*` inputs nothing is written.
-Any hook failure is swallowed. In every case the Kanban argv, stdout, and
-exit code are unchanged, and nothing is written to Kanban, a database, or
-files. The decision is never acted on.
+Any hook failure is swallowed. The decision is never acted on, and nothing is
+written to Kanban, a database, or files.
+
+The `workdir` record is a pseudonymous identifier, not irreversible
+redaction: the basename is in clear, and the unsalted hash prefix lets anyone
+who knows or guesses the full path confirm it. Treat shadow lines as
+operator-internal.
+
+The record is bounded. Each list feature reports at most 4 per-index invalid
+reasons, followed by one `{"type": "truncated", "code":
+"PATH_REASONS_TRUNCATED"|"COMPONENT_REASONS_TRUNCATED", "omitted": N}`
+reason. The emitted line (newline included) is at most 2048 bytes, so it
+cannot push a later `transport error:` line out of the MCP adapter's
+4000-character stderr capture. If the line would be longer, trailing reasons
+are replaced by one `RECORD_REASONS_TRUNCATED` reason (the leading decision
+rule is kept), then `workdir.basename` is set to `null`; if it still does not
+fit, nothing is written.
+
+Observe-only guarantee and malformed shadow argv: for **well-formed** shadow
+argv, the Kanban argv, stdout, exit code, and execution are identical to the
+same invocation without `--shadow-*` flags. The shadow flags are parsed by the
+same argparse parser as every other option, so malformed shadow argv is an
+ordinary parser usage error (`usage error: ...` on stderr, exit 3, no Kanban
+command run), exactly as for any other malformed option:
+
+- a shadow flag with no value (`--shadow-component` at the end of argv, or
+  followed by another option);
+- an option-like, dash-leading value in separate-argument form
+  (`--shadow-declared-path -x`); pass it as `--shadow-declared-path=-x`
+  instead;
+- an abbreviated shadow flag (`--shadow-comp`, `--shadow`). Unlike the
+  pre-existing options, whose prefix abbreviations keep working unchanged,
+  `--shadow-*` flags are matched only by their exact spelling.
+
+Well-formed values are never rejected by the parser; any string value is
+accepted and validated only inside `shadow_route()`.
 
 Installation implications: the MCP adapter
 (`templates/pipeline_controller_server.py`) does not yet forward `--shadow-*`
