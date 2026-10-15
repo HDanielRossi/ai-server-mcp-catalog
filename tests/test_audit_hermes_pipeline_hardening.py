@@ -32,8 +32,14 @@ PIPELINE_BRIDGE_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "pipeline_b
 # never modify, so any drift in either file (this task's or a future one's)
 # fails loudly instead of silently invalidating the A7.1 SHA-256 parity
 # checks' assumptions.
+# S0.1b re-pin: templates/pipeline_controller_server.py was intentionally
+# changed to add the opt-in shadow_* pass-through on create_implementation
+# and create_correction. The previous A6 lock was
+# 681834f1180145d5ced38e8e34f202a3c25f326a43d99344423c5a9970327eb9; this
+# value pins the post-S0.1b adapter bytes. Any further drift must again be
+# a reviewed change that re-pins this hash with its own justification.
 FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
-    "681834f1180145d5ced38e8e34f202a3c25f326a43d99344423c5a9970327eb9"
+    "cdd600669f1eca9e249e822260bcfd178b589758483e771c659e48ddcb3815a4"
 )
 # S0.1b re-pin: scripts/hermes-pipeline-controller.py was intentionally
 # changed by the reviewed S0.1b shadow routing instrumentation (9299fe4,

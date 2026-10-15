@@ -93,6 +93,62 @@ def _validate_wait_timeout(value):
     return timeout
 
 
+def _validate_optional_str_list(value, name):
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise PipelineControllerAdapterError(f"{name} must be a list of strings, got {value!r}")
+    for item in value:
+        if not isinstance(item, str):
+            raise PipelineControllerAdapterError(f"{name} must be a list of strings, got item {item!r}")
+    return list(value)
+
+
+def _validate_optional_str(value, name):
+    if value is not None and not isinstance(value, str):
+        raise PipelineControllerAdapterError(f"{name} must be a string, got {value!r}")
+    return value
+
+
+def _validate_optional_bool(value, name):
+    if value is not None and not isinstance(value, bool):
+        raise PipelineControllerAdapterError(f"{name} must be a boolean, got {value!r}")
+    return value
+
+
+def _shadow_argv(
+    shadow_declared_paths,
+    shadow_components,
+    shadow_mandatory_block,
+    shadow_mandatory_block_reason,
+):
+    """Build the opt-in S0.1b --shadow-* argv, or [] when nothing was supplied.
+
+    Pure pass-through of caller-supplied typed values: nothing is inferred
+    from feature, body, review_summary, or correction_instructions, and an
+    omitted input produces no flag, so the controller reports it as missing
+    (UNKNOWN). Every value uses the single-element ``--flag=value`` form so
+    dash-leading values cannot be misparsed as options. Value semantics
+    (canonical paths, allowed components, reason-code format) are validated
+    only by the controller's shadow_route().
+    """
+    paths = _validate_optional_str_list(shadow_declared_paths, "shadow_declared_paths")
+    components = _validate_optional_str_list(shadow_components, "shadow_components")
+    mandatory_block = _validate_optional_bool(shadow_mandatory_block, "shadow_mandatory_block")
+    reason = _validate_optional_str(shadow_mandatory_block_reason, "shadow_mandatory_block_reason")
+
+    argv_tail = []
+    for path in paths or ():
+        argv_tail.append("--shadow-declared-path=" + path)
+    for component in components or ():
+        argv_tail.append("--shadow-component=" + component)
+    if mandatory_block is not None:
+        argv_tail.append("--shadow-mandatory-block=" + ("true" if mandatory_block else "false"))
+    if reason is not None:
+        argv_tail.append("--shadow-mandatory-block-reason=" + reason)
+    return argv_tail
+
+
 def _bound_text(text, limit):
     if not text:
         return ""
@@ -185,11 +241,29 @@ def _tool_check_task(task_id: str):
 
 
 @mcp_server.tool(name="create_implementation")
-def _tool_create_implementation(workdir: str, feature: str, body: str | None = None):
-    """Create an implementation task (`create-implementation`)."""
+def _tool_create_implementation(
+    workdir: str,
+    feature: str,
+    body: str | None = None,
+    shadow_declared_paths: list[str] | None = None,
+    shadow_components: list[str] | None = None,
+    shadow_mandatory_block: bool | None = None,
+    shadow_mandatory_block_reason: str | None = None,
+):
+    """Create an implementation task (`create-implementation`).
+
+    The optional shadow_* inputs are forwarded verbatim as observe-only
+    S0.1b --shadow-* flags; omitted inputs are not forwarded.
+    """
     argv_tail = ["--workdir", workdir, "--feature", feature]
     if body is not None:
         argv_tail += ["--body", body]
+    argv_tail += _shadow_argv(
+        shadow_declared_paths,
+        shadow_components,
+        shadow_mandatory_block,
+        shadow_mandatory_block_reason,
+    )
     return _invoke_controller("create-implementation", argv_tail, DEFAULT_CREATE_TIMEOUT_SECONDS)
 
 
@@ -219,8 +293,16 @@ def _tool_create_correction(
     review_task_id: str,
     review_summary: str | None = None,
     correction_instructions: str | None = None,
+    shadow_declared_paths: list[str] | None = None,
+    shadow_components: list[str] | None = None,
+    shadow_mandatory_block: bool | None = None,
+    shadow_mandatory_block_reason: str | None = None,
 ):
-    """Create a correction task (`create-correction`)."""
+    """Create a correction task (`create-correction`).
+
+    The optional shadow_* inputs are forwarded verbatim as observe-only
+    S0.1b --shadow-* flags; omitted inputs are not forwarded.
+    """
     argv_tail = [
         "--workdir", workdir,
         "--feature", feature,
@@ -231,6 +313,12 @@ def _tool_create_correction(
         argv_tail += ["--review_summary", review_summary]
     if correction_instructions is not None:
         argv_tail += ["--correction_instructions", correction_instructions]
+    argv_tail += _shadow_argv(
+        shadow_declared_paths,
+        shadow_components,
+        shadow_mandatory_block,
+        shadow_mandatory_block_reason,
+    )
     return _invoke_controller("create-correction", argv_tail, DEFAULT_CREATE_TIMEOUT_SECONDS)
 
 

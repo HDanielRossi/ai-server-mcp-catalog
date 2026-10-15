@@ -18,7 +18,10 @@ import subprocess
 
 import pytest
 
-TEMPLATE_PATH = "/opt/ai/projects/ai-server-mcp-catalog/templates/pipeline_controller_server.py"
+TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "templates", "pipeline_controller_server.py",
+)
 
 
 def _load_module_with_subprocess_spy():
@@ -251,6 +254,254 @@ def test_create_correction_argv_with_optional_fields(monkeypatch):
         "--review_summary", "CHANGES REQUIRED: fix x",
         "--correction_instructions", "fix x specifically",
     ]
+
+
+# --- S0.1b: opt-in --shadow-* pass-through ------------------------------------
+
+
+def _capture_argv(monkeypatch):
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeCompleted(0, "{}", "")
+
+    monkeypatch.setattr(pipeline_controller_server.subprocess, "run", fake_run)
+    return captured
+
+
+SHADOW_PARAMS = (
+    "shadow_declared_paths",
+    "shadow_components",
+    "shadow_mandatory_block",
+    "shadow_mandatory_block_reason",
+)
+
+
+@pytest.mark.parametrize("fn_name", ["_tool_create_implementation", "_tool_create_correction"])
+def test_shadow_params_are_optional_and_default_to_none(fn_name):
+    params = inspect.signature(getattr(pipeline_controller_server, fn_name)).parameters
+    for name in SHADOW_PARAMS:
+        assert params[name].default is None
+
+
+def test_shadow_params_only_on_implementation_and_correction():
+    for fn in (
+        pipeline_controller_server._tool_check_task,
+        pipeline_controller_server._tool_create_review,
+        pipeline_controller_server._tool_wait_task,
+        pipeline_controller_server._tool_archive_review,
+        pipeline_controller_server._tool_ready_to_commit,
+    ):
+        assert not set(inspect.signature(fn).parameters) & set(SHADOW_PARAMS)
+
+
+def test_shadow_params_exposed_as_typed_mcp_tool_arguments():
+    tools = {tool.name: tool for tool in _run(pipeline_controller_server.mcp_server.list_tools())}
+    for name in ("create_implementation", "create_correction"):
+        properties = tools[name].input_schema["properties"]
+        for param in SHADOW_PARAMS:
+            assert param in properties
+        assert set(SHADOW_PARAMS).isdisjoint(tools[name].input_schema.get("required", []))
+    for name in ("check_task", "create_review", "wait_task", "archive_review", "ready_to_commit"):
+        assert set(SHADOW_PARAMS).isdisjoint(tools[name].input_schema["properties"])
+
+
+def test_create_implementation_without_shadow_inputs_has_no_shadow_flags(monkeypatch):
+    captured = _capture_argv(monkeypatch)
+    pipeline_controller_server._tool_create_implementation(
+        "/opt/ai/projects/demo", "feature-x", body="touch src/app.py and tests/test_app.py"
+    )
+    assert captured["argv"] == [
+        CONTROLLER_PATH, "create-implementation",
+        "--workdir", "/opt/ai/projects/demo",
+        "--feature", "feature-x",
+        "--body", "touch src/app.py and tests/test_app.py",
+    ]
+    assert not any(arg.startswith("--shadow") for arg in captured["argv"])
+
+
+def test_create_correction_without_shadow_inputs_has_no_shadow_flags(monkeypatch):
+    captured = _capture_argv(monkeypatch)
+    pipeline_controller_server._tool_create_correction(
+        "/opt/ai/projects/demo", "feature-x", "t_impl1", "t_review1",
+        review_summary="CHANGES REQUIRED: mandatory block, fix docs/x.md",
+        correction_instructions="edit tests/test_x.py",
+    )
+    assert captured["argv"] == [
+        CONTROLLER_PATH, "create-correction",
+        "--workdir", "/opt/ai/projects/demo",
+        "--feature", "feature-x",
+        "--implementation_task_id", "t_impl1",
+        "--review_task_id", "t_review1",
+        "--review_summary", "CHANGES REQUIRED: mandatory block, fix docs/x.md",
+        "--correction_instructions", "edit tests/test_x.py",
+    ]
+    assert not any(arg.startswith("--shadow") for arg in captured["argv"])
+
+
+def test_create_implementation_forwards_explicit_shadow_inputs(monkeypatch):
+    captured = _capture_argv(monkeypatch)
+    pipeline_controller_server._tool_create_implementation(
+        "/opt/ai/projects/demo", "feature-x", body="do the thing",
+        shadow_declared_paths=["src/app.py", "tests/test_app.py"],
+        shadow_components=["repository-source", "tests"],
+        shadow_mandatory_block=False,
+    )
+    assert captured["argv"] == [
+        CONTROLLER_PATH, "create-implementation",
+        "--workdir", "/opt/ai/projects/demo",
+        "--feature", "feature-x",
+        "--body", "do the thing",
+        "--shadow-declared-path=src/app.py",
+        "--shadow-declared-path=tests/test_app.py",
+        "--shadow-component=repository-source",
+        "--shadow-component=tests",
+        "--shadow-mandatory-block=false",
+    ]
+    assert captured["kwargs"]["shell"] is False
+
+
+def test_create_correction_forwards_explicit_shadow_inputs(monkeypatch):
+    captured = _capture_argv(monkeypatch)
+    pipeline_controller_server._tool_create_correction(
+        "/opt/ai/projects/demo", "feature-x", "t_impl1", "t_review1",
+        review_summary="CHANGES REQUIRED: fix x",
+        shadow_declared_paths=["docs/guide.md"],
+        shadow_components=["documentation"],
+        shadow_mandatory_block=True,
+        shadow_mandatory_block_reason="CROSS_REPOSITORY",
+    )
+    assert captured["argv"] == [
+        CONTROLLER_PATH, "create-correction",
+        "--workdir", "/opt/ai/projects/demo",
+        "--feature", "feature-x",
+        "--implementation_task_id", "t_impl1",
+        "--review_task_id", "t_review1",
+        "--review_summary", "CHANGES REQUIRED: fix x",
+        "--shadow-declared-path=docs/guide.md",
+        "--shadow-component=documentation",
+        "--shadow-mandatory-block=true",
+        "--shadow-mandatory-block-reason=CROSS_REPOSITORY",
+    ]
+    assert captured["kwargs"]["shell"] is False
+
+
+@pytest.mark.parametrize("fn_name,positional", [
+    ("_tool_create_implementation", ("/opt/ai/projects/demo", "feature-x")),
+    ("_tool_create_correction", ("/opt/ai/projects/demo", "feature-x", "t_impl1", "t_review1")),
+])
+def test_partial_shadow_inputs_forward_only_supplied_fields(monkeypatch, fn_name, positional):
+    captured = _capture_argv(monkeypatch)
+    getattr(pipeline_controller_server, fn_name)(*positional, shadow_mandatory_block=False)
+    shadow = [arg for arg in captured["argv"] if arg.startswith("--shadow")]
+    assert shadow == ["--shadow-mandatory-block=false"]
+
+
+def test_empty_shadow_lists_forward_nothing(monkeypatch):
+    captured = _capture_argv(monkeypatch)
+    pipeline_controller_server._tool_create_implementation(
+        "/opt/ai/projects/demo", "feature-x", shadow_declared_paths=[], shadow_components=[],
+    )
+    assert not any(arg.startswith("--shadow") for arg in captured["argv"])
+
+
+def test_shadow_values_are_single_argv_elements_without_interpolation(monkeypatch):
+    captured = _capture_argv(monkeypatch)
+    hostile = ["-x", "a b; rm -rf / $(id) `id` > out", "--workdir=/etc", ""]
+    pipeline_controller_server._tool_create_implementation(
+        "/opt/ai/projects/demo", "feature-x",
+        shadow_declared_paths=hostile,
+        shadow_components=["--tests"],
+        shadow_mandatory_block_reason="-R $HOME",
+    )
+    assert captured["argv"][-6:] == [
+        "--shadow-declared-path=-x",
+        "--shadow-declared-path=a b; rm -rf / $(id) `id` > out",
+        "--shadow-declared-path=--workdir=/etc",
+        "--shadow-declared-path=",
+        "--shadow-component=--tests",
+        "--shadow-mandatory-block-reason=-R $HOME",
+    ]
+    assert captured["argv"][:6] == [
+        CONTROLLER_PATH, "create-implementation",
+        "--workdir", "/opt/ai/projects/demo",
+        "--feature", "feature-x",
+    ]
+    assert captured["kwargs"]["shell"] is False
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"shadow_declared_paths": "src/app.py"},
+    {"shadow_declared_paths": ["src/app.py", 3]},
+    {"shadow_components": "tests"},
+    {"shadow_components": [None]},
+    {"shadow_mandatory_block": "false"},
+    {"shadow_mandatory_block": 0},
+    {"shadow_mandatory_block_reason": 5},
+])
+@pytest.mark.parametrize("fn_name,positional", [
+    ("_tool_create_implementation", ("/opt/ai/projects/demo", "feature-x")),
+    ("_tool_create_correction", ("/opt/ai/projects/demo", "feature-x", "t_impl1", "t_review1")),
+])
+def test_mistyped_shadow_inputs_rejected_before_subprocess(monkeypatch, fn_name, positional, kwargs):
+    calls = []
+    monkeypatch.setattr(pipeline_controller_server.subprocess, "run", lambda *a, **k: calls.append(a))
+    with pytest.raises(PipelineControllerAdapterError):
+        getattr(pipeline_controller_server, fn_name)(*positional, **kwargs)
+    assert calls == []
+
+
+def _load_controller_module():
+    path = os.path.join(os.path.dirname(TEMPLATE_PATH), "..", "scripts", "hermes-pipeline-controller.py")
+    spec = importlib.util.spec_from_file_location("hpc_adapter_shadow", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_adapter_shadow_argv_parses_as_typed_controller_inputs(monkeypatch):
+    """Cross-check against the real controller parser (no Kanban, no I/O):
+    adapter-built argv, including dash-leading values and a literal false,
+    parses into exactly the caller-supplied typed shadow inputs."""
+    hpc = _load_controller_module()
+    captured = _capture_argv(monkeypatch)
+    pipeline_controller_server._tool_create_correction(
+        "/w", "f", "t1", "t2",
+        shadow_declared_paths=["-x", "src/app.py"],
+        shadow_components=["tests"],
+        shadow_mandatory_block=False,
+        shadow_mandatory_block_reason="--X",
+    )
+    args = hpc.build_parser().parse_args(captured["argv"][1:])
+    assert args.shadow_declared_path == ["-x", "src/app.py"]
+    assert args.shadow_component == ["tests"]
+    assert args.shadow_mandatory_block == "false"
+    assert hpc._shadow_mandatory_block_value(args.shadow_mandatory_block) is False
+    assert args.shadow_mandatory_block_reason == "--X"
+
+
+def test_omitted_shadow_inputs_stay_missing_and_route_unknown(monkeypatch):
+    hpc = _load_controller_module()
+    captured = _capture_argv(monkeypatch)
+    pipeline_controller_server._tool_create_implementation(
+        "/w", "f", body="edit src/app.py and tests/test_app.py (tests, repository-source)",
+        shadow_mandatory_block=False,
+    )
+    args = hpc.build_parser().parse_args(captured["argv"][1:])
+    assert args.shadow_declared_path is None
+    assert args.shadow_component is None
+    record = hpc.shadow_route({
+        "declared_paths": args.shadow_declared_path,
+        "components": args.shadow_component,
+        "mandatory_block": hpc._shadow_mandatory_block_value(args.shadow_mandatory_block),
+        "mandatory_block_reason": args.shadow_mandatory_block_reason,
+        "actual_assignee": "coder-claude",
+        "workdir": "/w",
+    })
+    assert record["decision"] == "UNKNOWN"
+    assert record["scope"] == {"path_count": None, "component_count": None}
 
 
 def test_wait_task_argv_defaults(monkeypatch):

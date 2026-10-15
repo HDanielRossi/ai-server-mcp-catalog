@@ -1189,9 +1189,9 @@ The MCP server is named `pipeline-controller` and exposes exactly these seven to
 | MCP tool | Controller subcommand | Role |
 | --- | --- | --- |
 | `check_task` | `check` | Read-only structural validation of one Kanban task. |
-| `create_implementation` | `create-implementation` | Create an implementation task. |
+| `create_implementation` | `create-implementation` | Create an implementation task. Optional typed `shadow_*` arguments are forwarded (see "S0.1b shadow routing"). |
 | `create_review` | `create-review` | Create a review task. |
-| `create_correction` | `create-correction` | Create a correction task. |
+| `create_correction` | `create-correction` | Create a correction task. Optional typed `shadow_*` arguments are forwarded (see "S0.1b shadow routing"). |
 | `wait_task` | `wait` | Poll one Kanban task until terminal or timeout. |
 | `archive_review` | `archive-review` | Deterministically archive a completed reviewer task. |
 | `ready_to_commit` | `ready-to-commit` | Read-only technical attestation that a workdir is ready to commit. |
@@ -1467,8 +1467,42 @@ command run), exactly as for any other malformed option:
 Well-formed values are never rejected by the parser; any string value is
 accepted and validated only inside `shadow_route()`.
 
-Installation implications: the MCP adapter
-(`templates/pipeline_controller_server.py`) does not yet forward `--shadow-*`
-inputs, so a deployed controller emits nothing until a caller supplies them.
-Changing this source breaks the `--runtime` audit's source/runtime SHA-256
-parity until the operator separately installs the controller.
+### MCP adapter pass-through (opt-in)
+
+The MCP adapter (`templates/pipeline_controller_server.py`) forwards shadow
+inputs only on `create_implementation` and `create_correction`, through four
+optional typed arguments:
+
+| MCP argument | Type | Forwarded as |
+| --- | --- | --- |
+| `shadow_declared_paths` | list of strings | one `--shadow-declared-path=PATH` per item |
+| `shadow_components` | list of strings | one `--shadow-component=NAME` per item |
+| `shadow_mandatory_block` | boolean | `--shadow-mandatory-block=true` or `--shadow-mandatory-block=false` |
+| `shadow_mandatory_block_reason` | string | `--shadow-mandatory-block-reason=CODE` |
+
+- The adapter is a pass-through. It never infers paths, components, or a
+  mandatory block from `feature`, `body`, `review_summary`, or
+  `correction_instructions`. Callers must supply the typed scope themselves.
+- If all four arguments are omitted (or the lists are empty), the controller
+  argv is exactly what it was before this pass-through existed. No `--shadow-*`
+  flag is sent, and the controller writes no shadow record.
+- An omitted argument sends no flag, so the controller sees that feature as
+  missing. A missing required feature (paths, components, mandatory block)
+  makes the decision `UNKNOWN`, unless `shadow_mandatory_block` is `true`.
+  Supplying only some arguments produces a record, usually an `UNKNOWN` one.
+- `false` is sent as the literal string `false`, never dropped.
+- Each value is sent as one `--flag=value` argv element through the existing
+  `shell=False` subprocess list. There is no shell interpolation, and
+  dash-leading values such as `-x` are not misparsed as options.
+- The adapter checks only argument types (a list of strings, a boolean, a
+  string). A wrong type is an adapter error, and the controller is not
+  invoked. Value semantics (canonical paths, allowed components,
+  reason-code format) are still checked only by the controller's
+  `shadow_route()`.
+- The actual assignee and all other task-creation behavior are unchanged. The
+  adapter adds no database, Kanban write, or control plane.
+
+Installation implications: a deployed adapter and controller emit shadow
+records only when a caller passes shadow arguments. Changing either source
+file breaks the `--runtime` audit's source/runtime SHA-256 parity until the
+operator separately installs the changed file.
