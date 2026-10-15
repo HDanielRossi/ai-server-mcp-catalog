@@ -30,6 +30,7 @@ import math
 import subprocess
 
 from mcp.server import MCPServer
+from pydantic import StrictBool, StrictStr
 
 # Fixed, trusted controller location for later runtime installation. Never
 # probed, statted, or otherwise inspected at import time: repository tests
@@ -233,6 +234,15 @@ def _invoke_controller(subcommand, argv_tail, timeout):
 
 mcp_server = MCPServer("pipeline-controller")
 
+# The shadow_* tool arguments use Pydantic strict scalars so the SDK's
+# argument validation rejects wrong-typed JSON values (e.g. "false", "no", or
+# 0 for shadow_mandatory_block; 3 for a path) instead of coercing them before
+# the adapter's own type checks run. Strictness does not change the generated
+# JSON schema: these remain optional boolean/string/array-of-string params.
+ShadowStrList = list[StrictStr] | None
+ShadowBool = StrictBool | None
+ShadowStr = StrictStr | None
+
 
 @mcp_server.tool(name="check_task")
 def _tool_check_task(task_id: str):
@@ -245,10 +255,10 @@ def _tool_create_implementation(
     workdir: str,
     feature: str,
     body: str | None = None,
-    shadow_declared_paths: list[str] | None = None,
-    shadow_components: list[str] | None = None,
-    shadow_mandatory_block: bool | None = None,
-    shadow_mandatory_block_reason: str | None = None,
+    shadow_declared_paths: ShadowStrList = None,
+    shadow_components: ShadowStrList = None,
+    shadow_mandatory_block: ShadowBool = None,
+    shadow_mandatory_block_reason: ShadowStr = None,
 ):
     """Create an implementation task (`create-implementation`).
 
@@ -293,10 +303,10 @@ def _tool_create_correction(
     review_task_id: str,
     review_summary: str | None = None,
     correction_instructions: str | None = None,
-    shadow_declared_paths: list[str] | None = None,
-    shadow_components: list[str] | None = None,
-    shadow_mandatory_block: bool | None = None,
-    shadow_mandatory_block_reason: str | None = None,
+    shadow_declared_paths: ShadowStrList = None,
+    shadow_components: ShadowStrList = None,
+    shadow_mandatory_block: ShadowBool = None,
+    shadow_mandatory_block_reason: ShadowStr = None,
 ):
     """Create a correction task (`create-correction`).
 

@@ -38,8 +38,13 @@ PIPELINE_BRIDGE_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "pipeline_b
 # 681834f1180145d5ced38e8e34f202a3c25f326a43d99344423c5a9970327eb9; this
 # value pins the post-S0.1b adapter bytes. Any further drift must again be
 # a reviewed change that re-pins this hash with its own justification.
+# S0.1b strict-validation re-pin: the shadow_* parameters were retyped to
+# Pydantic strict scalars (StrictBool, StrictStr) so MCP argument validation
+# rejects wrong-typed values instead of coercing them; the generated JSON
+# schema is unchanged. The previous post-S0.1b lock was
+# cdd600669f1eca9e249e822260bcfd178b589758483e771c659e48ddcb3815a4.
 FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
-    "cdd600669f1eca9e249e822260bcfd178b589758483e771c659e48ddcb3815a4"
+    "ab9abf6bf0e7b95630dc978e6b42a457bcd364dc50e2fbdc23185b7bf46da37a"
 )
 # S0.1b re-pin: scripts/hermes-pipeline-controller.py was intentionally
 # changed by the reviewed S0.1b shadow routing instrumentation (9299fe4,

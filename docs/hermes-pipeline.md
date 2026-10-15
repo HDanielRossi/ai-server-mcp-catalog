@@ -1495,10 +1495,23 @@ optional typed arguments:
   `shell=False` subprocess list. There is no shell interpolation, and
   dash-leading values such as `-x` are not misparsed as options.
 - The adapter checks only argument types (a list of strings, a boolean, a
-  string). A wrong type is an adapter error, and the controller is not
-  invoked. Value semantics (canonical paths, allowed components,
-  reason-code format) are still checked only by the controller's
-  `shadow_route()`.
+  string). The MCP tool arguments are declared with Pydantic strict scalars
+  (`StrictBool`, `StrictStr`). Before validation, the MCP SDK pre-parses a
+  string argument as JSON text when the parameter is not plain `str` and the
+  parsed result is a structured non-scalar value, such as an array or `null`:
+  `shadow_declared_paths: "[\"src/app.py\"]"` is normalized to a typed array
+  and forwarded as a path, and `shadow_mandatory_block: "null"` is normalized
+  to `None` and omitted. Pydantic strict validation then rejects wrong
+  normalized types before the tool runs, instead of coercing them. Scalar
+  strings are not coerced: `shadow_mandatory_block` given `"false"` or `"no"`
+  stays a string and is rejected, as are `0` and `1`; path, component, and
+  reason items given numbers or booleans are not converted to strings.
+  The generated MCP input schema is unchanged: all four
+  arguments stay optional, typed `boolean`, `string`, or `array` of `string`.
+  Direct Python calls are still type-checked by the adapter, which raises an
+  adapter error. Either way the controller is not invoked. Value semantics
+  (canonical paths, allowed components, reason-code format) are still checked
+  only by the controller's `shadow_route()`.
 - The actual assignee and all other task-creation behavior are unchanged. The
   adapter adds no database, Kanban write, or control plane.
 

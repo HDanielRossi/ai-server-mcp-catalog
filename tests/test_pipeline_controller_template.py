@@ -453,6 +453,155 @@ def test_mistyped_shadow_inputs_rejected_before_subprocess(monkeypatch, fn_name,
     assert calls == []
 
 
+# --- S0.1b: strict MCP-level validation of shadow_* arguments ----------------
+#
+# These go through mcp_server.call_tool, i.e. the SDK's own Pydantic argument
+# validation, which would otherwise coerce e.g. "false"/"no"/0 to False before
+# the adapter's direct-call type checks ever see the value.
+
+SHADOW_TOOL_REQUIRED_ARGS = {
+    "create_implementation": {"workdir": "/opt/ai/projects/demo", "feature": "feature-x"},
+    "create_correction": {
+        "workdir": "/opt/ai/projects/demo",
+        "feature": "feature-x",
+        "implementation_task_id": "t_impl1",
+        "review_task_id": "t_review1",
+    },
+}
+
+
+def _spy_shadow_argv(monkeypatch):
+    """Record the exact values the tool function hands to _shadow_argv."""
+    seen = []
+    original = pipeline_controller_server._shadow_argv
+
+    def spy(*args):
+        seen.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(pipeline_controller_server, "_shadow_argv", spy)
+    return seen
+
+
+def _call_tool(name, arguments):
+    return _run(pipeline_controller_server.mcp_server.call_tool(name, arguments))
+
+
+@pytest.mark.parametrize("shadow_args", [
+    {"shadow_mandatory_block": "false"},
+    {"shadow_mandatory_block": "no"},
+    {"shadow_mandatory_block": "true"},
+    {"shadow_mandatory_block": 0},
+    {"shadow_mandatory_block": 1},
+    {"shadow_declared_paths": [3]},
+    {"shadow_declared_paths": ["src/app.py", 3]},
+    {"shadow_declared_paths": "src/app.py"},
+    {"shadow_components": [1.5]},
+    {"shadow_components": [True]},
+    {"shadow_mandatory_block_reason": 5},
+    {"shadow_mandatory_block_reason": False},
+])
+@pytest.mark.parametrize("tool_name", sorted(SHADOW_TOOL_REQUIRED_ARGS))
+def test_call_tool_rejects_wrong_typed_shadow_json_without_subprocess(monkeypatch, tool_name, shadow_args):
+    calls = []
+    monkeypatch.setattr(pipeline_controller_server.subprocess, "run", lambda *a, **k: calls.append(a))
+    adapter_calls = _spy_shadow_argv(monkeypatch)
+    arguments = dict(SHADOW_TOOL_REQUIRED_ARGS[tool_name], **shadow_args)
+    with pytest.raises(Exception) as excinfo:
+        _call_tool(tool_name, arguments)
+    assert next(iter(shadow_args)) in str(excinfo.value)
+    # Rejected by the SDK's strict argument validation: the tool function
+    # never ran, so neither the adapter nor the controller was reached.
+    assert adapter_calls == []
+    assert calls == []
+
+
+@pytest.mark.parametrize("value,flag", [
+    (True, "--shadow-mandatory-block=true"),
+    (False, "--shadow-mandatory-block=false"),
+])
+@pytest.mark.parametrize("tool_name", sorted(SHADOW_TOOL_REQUIRED_ARGS))
+def test_call_tool_passes_json_booleans_through_unchanged(monkeypatch, tool_name, value, flag):
+    captured = _capture_argv(monkeypatch)
+    adapter_calls = _spy_shadow_argv(monkeypatch)
+    arguments = dict(SHADOW_TOOL_REQUIRED_ARGS[tool_name], shadow_mandatory_block=value)
+    _call_tool(tool_name, arguments)
+    assert len(adapter_calls) == 1
+    assert adapter_calls[0][2] is value
+    assert [arg for arg in captured["argv"] if arg.startswith("--shadow")] == [flag]
+
+
+@pytest.mark.parametrize("tool_name", sorted(SHADOW_TOOL_REQUIRED_ARGS))
+def test_call_tool_passes_strings_and_nulls_through_unchanged(monkeypatch, tool_name):
+    captured = _capture_argv(monkeypatch)
+    adapter_calls = _spy_shadow_argv(monkeypatch)
+    arguments = dict(
+        SHADOW_TOOL_REQUIRED_ARGS[tool_name],
+        shadow_declared_paths=["src/app.py", "-x"],
+        shadow_components=["tests"],
+        shadow_mandatory_block=None,
+        shadow_mandatory_block_reason="CROSS_REPOSITORY",
+    )
+    _call_tool(tool_name, arguments)
+    assert adapter_calls == [(["src/app.py", "-x"], ["tests"], None, "CROSS_REPOSITORY")]
+    assert [arg for arg in captured["argv"] if arg.startswith("--shadow")] == [
+        "--shadow-declared-path=src/app.py",
+        "--shadow-declared-path=-x",
+        "--shadow-component=tests",
+        "--shadow-mandatory-block-reason=CROSS_REPOSITORY",
+    ]
+
+
+@pytest.mark.parametrize("tool_name", sorted(SHADOW_TOOL_REQUIRED_ARGS))
+def test_call_tool_sdk_pre_parses_json_text_for_structured_values(monkeypatch, tool_name):
+    # The SDK json.loads() string arguments for non-`str` params and keeps the
+    # result only when it is not a JSON scalar (string/number/boolean). So JSON
+    # text for an array or null is normalized before strict validation, while
+    # "false"/"no" stay raw strings and are rejected (see the test above).
+    captured = _capture_argv(monkeypatch)
+    adapter_calls = _spy_shadow_argv(monkeypatch)
+    arguments = dict(
+        SHADOW_TOOL_REQUIRED_ARGS[tool_name],
+        shadow_declared_paths='["src/app.py", "-x"]',
+        shadow_mandatory_block="null",
+    )
+    _call_tool(tool_name, arguments)
+    assert adapter_calls == [(["src/app.py", "-x"], None, None, None)]
+    assert [arg for arg in captured["argv"] if arg.startswith("--shadow")] == [
+        "--shadow-declared-path=src/app.py",
+        "--shadow-declared-path=-x",
+    ]
+
+
+def _schema_variants(prop):
+    return prop.get("anyOf", [prop])
+
+
+@pytest.mark.parametrize("tool_name", sorted(SHADOW_TOOL_REQUIRED_ARGS))
+def test_strict_shadow_params_keep_optional_json_schema_types(tool_name):
+    tools = {tool.name: tool for tool in _run(pipeline_controller_server.mcp_server.list_tools())}
+    schema = tools[tool_name].input_schema
+    properties = schema["properties"]
+    assert set(SHADOW_PARAMS).isdisjoint(schema.get("required", []))
+
+    expected = {
+        "shadow_declared_paths": "array",
+        "shadow_components": "array",
+        "shadow_mandatory_block": "boolean",
+        "shadow_mandatory_block_reason": "string",
+    }
+    for param, json_type in expected.items():
+        variants = _schema_variants(properties[param])
+        assert {v.get("type") for v in variants} == {json_type, "null"}, (param, properties[param])
+        assert properties[param].get("default") is None
+        if json_type == "array":
+            (array_variant,) = [v for v in variants if v.get("type") == "array"]
+            assert array_variant["items"] == {"type": "string"}
+    # Strictness is a validation-time constraint only; it must not leak
+    # non-standard keywords into the published schema.
+    assert "strict" not in json.dumps({p: properties[p] for p in SHADOW_PARAMS})
+
+
 def _load_controller_module():
     path = os.path.join(os.path.dirname(TEMPLATE_PATH), "..", "scripts", "hermes-pipeline-controller.py")
     spec = importlib.util.spec_from_file_location("hpc_adapter_shadow", path)
