@@ -35,8 +35,14 @@ PIPELINE_BRIDGE_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "pipeline_b
 FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
     "681834f1180145d5ced38e8e34f202a3c25f326a43d99344423c5a9970327eb9"
 )
+# S0.1b re-pin: scripts/hermes-pipeline-controller.py was intentionally
+# changed by the reviewed S0.1b shadow routing instrumentation (9299fe4,
+# fc45e00). The previous A6 lock was
+# 4138ba1f5395f9e545610798fa4fa028c000d5d538da0fcc49e2bbe9033bed75; this
+# value pins the reviewed post-S0.1b bytes. Any further drift must again be
+# a reviewed change that re-pins this hash with its own justification.
 FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256 = (
-    "4138ba1f5395f9e545610798fa4fa028c000d5d538da0fcc49e2bbe9033bed75"
+    "9fca0af52adc050340e7142e3288f77831718ce8671cc6e9412c5aff609fff37"
 )
 
 REPO_ONLY_FILES = [
