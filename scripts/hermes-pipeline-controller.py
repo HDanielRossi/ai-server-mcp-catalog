@@ -1094,8 +1094,33 @@ def _validate_qwen_canary_validation_metadata(run, task_id, canonical_workdir, c
     metadata = run.get("metadata")
     if not isinstance(metadata, dict):
         raise ReadyToCommitReject("qwen_canary_validation_metadata_missing", "Qwen completion metadata must be an object")
-    if set(metadata) != {"schema", "implementation_task_id", "validation"}:
-        raise ReadyToCommitReject("qwen_canary_validation_metadata_keys", "Qwen completion metadata keys are not exact")
+    required_keys = {"schema", "implementation_task_id", "validation"}
+    permitted_platform_keys = {"changed_files", "worker_session_id"}
+    metadata_keys = set(metadata)
+    if not required_keys <= metadata_keys or not metadata_keys <= required_keys | permitted_platform_keys:
+        raise ReadyToCommitReject(
+            "qwen_canary_validation_metadata_keys",
+            "Qwen completion metadata has missing or unrecognized keys",
+        )
+    if "changed_files" in metadata:
+        reported_paths = metadata["changed_files"]
+        if (
+            not isinstance(reported_paths, list)
+            or any(not isinstance(path, str) for path in reported_paths)
+            or len(reported_paths) != len(set(reported_paths))
+            or set(reported_paths) != set(changed_paths)
+        ):
+            raise ReadyToCommitReject(
+                "qwen_canary_validation_changed_files_invalid",
+                "Qwen completion changed_files does not exactly match the reviewed diff",
+            )
+    if "worker_session_id" in metadata and (
+        not isinstance(metadata["worker_session_id"], str) or not metadata["worker_session_id"]
+    ):
+        raise ReadyToCommitReject(
+            "qwen_canary_validation_worker_session_invalid",
+            "Qwen completion worker_session_id is invalid",
+        )
     if metadata.get("schema") != QWEN_CANARY_COMPLETION_SCHEMA:
         raise ReadyToCommitReject("qwen_canary_validation_metadata_schema", "Qwen completion metadata schema is invalid")
     if metadata.get("implementation_task_id") != task_id:

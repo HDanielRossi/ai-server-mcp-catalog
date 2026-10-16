@@ -30,7 +30,9 @@ authorized System One canary task.
    `{\"schema\": \"hermes.qwen-canary-completion/v1\", \"implementation_task_id\":
    <assigned task id>, \"validation\": <returned envelope>}`. Its exact
    `validation` value is the returned `hermes.qwen-canary-validation/v1`
-   envelope. Pass it as the native object value of the `metadata` tool
+   envelope. Do not add fields yourself. Hermes may attach `changed_files` and
+   `worker_session_id` as standard handoff fields; the controller validates
+   them separately. Pass it as the native object value of the `metadata` tool
    argument, never as serialized JSON text. If `kanban_complete` rejects the
    metadata, block immediately; do not probe, retry with substitute metadata,
    or complete without the required envelope. Report that envelope,
