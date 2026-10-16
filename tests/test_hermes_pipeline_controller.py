@@ -2393,6 +2393,23 @@ def test_qwen_canary_requires_one_valid_controller_authored_scope_block(tmp_path
         hpc._validate_implementation_task(task, RTC_IMPL_ID, str(workdir))
 
 
+def test_create_qwen_canary_rejects_a_caller_supplied_scope_marker(capsys):
+    patcher, calls = stub_create_aware(create_obj={"id": "t_created"})
+    with patcher:
+        rc = hpc.main([
+            "create-implementation", "--workdir", VALID_WD, "--feature", "narrow-helper",
+            "--body", "Implement a helper. " + hpc.QWEN_CANARY_SCOPE_MARKER,
+            "--shadow-declared-path", "app.py",
+            "--shadow-component", "repository-source",
+            "--shadow-mandatory-block", "false",
+            "--system-one-qwen-canary", "true",
+    ])
+    assert rc == hpc.EXIT_VALIDATION
+    _, obj = parse_single_json_line(capsys, ["phase", "blocked", "reason", "task_id"])
+    assert "reserved controller scope marker" in obj["reason"]
+    assert len(create_calls(calls)) == 0
+
+
 def test_qwen_canary_run_rejects_unassigned_or_mismatched_task():
     run = make_impl_run_for(profile=hpc.SYSTEM_ONE_QWEN_PROFILE)
     with pytest.raises(hpc.ReadyToCommitReject, match="requires a task explicitly assigned"):

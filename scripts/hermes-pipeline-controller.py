@@ -1190,6 +1190,14 @@ def create_implementation(args):
             "do not authorize changes outside it." % (feature, str(resolved))
         )
     if assignee == SYSTEM_ONE_QWEN_PROFILE:
+        # The marker is a controller-owned delimiter, parsed fail-closed by
+        # ready-to-commit.  A caller-supplied copy would create an ambiguous
+        # task body (and must never be silently stripped or accepted).
+        if QWEN_CANARY_SCOPE_MARKER in body:
+            raise ValidationBlock(
+                phase,
+                "Qwen canary body may not contain the reserved controller scope marker",
+            )
         body += "\n\n" + _qwen_canary_scope_body(args)
 
     argv = [
