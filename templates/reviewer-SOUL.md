@@ -81,7 +81,7 @@ files were changed.
 ### 11. Test command discipline
 
 The review_bridge test selector is the structured operation `test_operation`,
-not a shell command string. Its only values are `skip`, `pytest_full`, and
+not a shell command string. Its only values are `skip`, `pytest_full`, `pytest_targeted`, and
 `repository_audit`.
 
 Reviewers select operations and never compose command strings. Select an operation exactly; never compose, quote, or

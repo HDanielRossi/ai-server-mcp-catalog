@@ -55,10 +55,11 @@ ALLOWED_TEST_COMMANDS = frozenset(
     }
 )
 
-ALLOWED_TEST_OPERATIONS = frozenset({"skip", "pytest_full", "repository_audit"})
+ALLOWED_TEST_OPERATIONS = frozenset({"skip", "pytest_full", "pytest_targeted", "repository_audit"})
 TEST_OPERATION_COMMANDS = {
     "skip": DEFAULT_TEST_COMMAND,
     "pytest_full": "/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q",
+    "pytest_targeted": "/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q tests",
     "repository_audit": "./scripts/audit-hermes-pipeline-hardening.sh",
 }
 

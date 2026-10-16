@@ -152,15 +152,19 @@ def test_allowlist_rejects_unknown_command():
 
 
 def test_reviewer_operation_enum_is_structured_and_exact():
-    assert review_bridge_server.ALLOWED_TEST_OPERATIONS == {"skip", "pytest_full", "repository_audit"}
+    assert review_bridge_server.ALLOWED_TEST_OPERATIONS == {"skip", "pytest_full", "pytest_targeted", "repository_audit"}
     assert review_bridge_server.TEST_OPERATION_COMMANDS["pytest_full"] == (
         "/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q"
+    )
+    assert review_bridge_server.TEST_OPERATION_COMMANDS["pytest_targeted"] == (
+        "/home/hdgr/.hermes/hermes-agent/venv/bin/python3 -m pytest -q tests"
     )
     assert review_bridge_server.TEST_OPERATION_COMMANDS["repository_audit"] == (
         "./scripts/audit-hermes-pipeline-hardening.sh"
     )
     assert validate_test_operation("skip") == "skip"
     assert validate_test_operation("pytest_full") == "pytest_full"
+    assert validate_test_operation("pytest_targeted") == "pytest_targeted"
     assert validate_test_operation("repository_audit") == "repository_audit"
 
 
