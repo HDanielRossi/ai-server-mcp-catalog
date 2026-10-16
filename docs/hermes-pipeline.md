@@ -1578,7 +1578,10 @@ if text.count(block) != 1:
     raise SystemExit("refusing unexpected coder-claude bridge layout")
 stage.write_text(text.replace(block, ""), encoding="utf-8")
 PY
-cat templates/coder-qwen-implementation-validation.yaml >> "$QWEN_STAGE"
+grep -q '^  implementation_validation_bridge:$' "$QWEN_STAGE" || {
+  echo "missing reviewed implementation-validation bridge" >&2
+  exit 1
+}
 install -d -m 0700 "$QWEN_PROFILE"
 install -m 0600 "$QWEN_STAGE" "$QWEN_PROFILE/config.yaml"
 install -m 0600 templates/coder-qwen-SOUL.md "$QWEN_PROFILE/SOUL.md"
