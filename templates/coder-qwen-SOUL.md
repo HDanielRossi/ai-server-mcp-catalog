@@ -16,8 +16,8 @@ authorized System One canary task.
 
 ## Required workflow
 
-1. Inspect the declared files and current Git state.
-2. Make the smallest change that satisfies the task.
+1. Inspect declared files only with `mcp__qwen_canary_write_bridge__read_file`.
+2. Make the smallest change only with `mcp__qwen_canary_write_bridge__replace_exact`.
 3. Run only the dedicated validation bridge operations:
    `mcp__implementation_validation_bridge__validate` with `pytest_full`,
    `pytest_targeted`, `py_compile`, or `git_diff_check` as applicable.

@@ -72,6 +72,8 @@ REPO_ONLY_FILES = [
     os.path.join("templates", "coder-claude-implementation-validation.yaml"),
     os.path.join("templates", "coder-qwen-implementation-validation.yaml"),
     os.path.join("templates", "coder-qwen-SOUL.md"),
+    os.path.join("templates", "qwen_canary_write_bridge_server.py"),
+    os.path.join("tests", "test_qwen_canary_write_bridge.py"),
     os.path.join("templates", "planner_bridge_server.py"),
     os.path.join("scripts", "planner-bridge"),
     os.path.join("tests", "test_review_bridge_template.py"),
@@ -159,6 +161,12 @@ def _build_runtime_fixture(tmp_path, compliant=True):
     # currently-compliant repo template rather than a stale hand-written stub.
     shutil.copy(CLAUDE_BRIDGE_TEMPLATE_PATH, claude_dir / "server.py")
     shutil.copy(IMPLEMENTATION_VALIDATION_TEMPLATE_PATH, validation_dir / "server.py")
+    qwen_write_dir = root / "usr" / "local" / "lib" / "qwen-canary-write-bridge-mcp"
+    qwen_write_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(
+        os.path.join(REPO_ROOT, "templates", "qwen_canary_write_bridge_server.py"),
+        qwen_write_dir / "server.py",
+    )
     # A7.1: the real Hermes config shape nests MCP registrations under a
     # top-level "mcp_servers:" mapping; pipeline_controller must be an
     # immediate child of that mapping, never a column-0 top-level key.
@@ -225,7 +233,11 @@ def _build_runtime_fixture(tmp_path, compliant=True):
         "  implementation_validation_bridge:\n"
         "    command: /usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python\n"
         "    args:\n"
-        "      - /usr/local/lib/implementation-validation-bridge-mcp/server.py\n",
+        "      - /usr/local/lib/implementation-validation-bridge-mcp/server.py\n"
+        "  qwen_canary_write_bridge:\n"
+        "    command: /usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python\n"
+        "    args:\n"
+        "      - /usr/local/lib/qwen-canary-write-bridge-mcp/server.py\n",
         encoding="utf-8",
     )
     shutil.copy(

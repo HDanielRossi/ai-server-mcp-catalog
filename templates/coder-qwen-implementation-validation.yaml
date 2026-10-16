@@ -7,3 +7,9 @@ mcp_servers:
       - /usr/local/lib/implementation-validation-bridge-mcp/server.py
     timeout: 370
     connect_timeout: 30
+  qwen_canary_write_bridge:
+    command: /usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python
+    args:
+      - /usr/local/lib/qwen-canary-write-bridge-mcp/server.py
+    timeout: 120
+    connect_timeout: 30

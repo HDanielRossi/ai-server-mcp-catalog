@@ -165,6 +165,7 @@ runtime_path() {
       review_bridge_server)   echo "$root/usr/local/lib/review-bridge-mcp/server.py" ;;
       claude_bridge_server)   echo "$root/usr/local/lib/claude-bridge-mcp/server.py" ;;
       implementation_validation_bridge_server) echo "$root/usr/local/lib/implementation-validation-bridge-mcp/server.py" ;;
+      qwen_canary_write_bridge_server) echo "$root/usr/local/lib/qwen-canary-write-bridge-mcp/server.py" ;;
       implementation_validation_bridge_venv_dir) echo "$root/usr/local/lib/implementation-validation-bridge-mcp/.venv" ;;
       hermes_config)          echo "$root/home/.hermes/config.yaml" ;;
       hermes_soul)            echo "$root/home/.hermes/SOUL.md" ;;
@@ -186,6 +187,7 @@ runtime_path() {
       review_bridge_server)   echo "/usr/local/lib/review-bridge-mcp/server.py" ;;
       claude_bridge_server)   echo "/usr/local/lib/claude-bridge-mcp/server.py" ;;
       implementation_validation_bridge_server) echo "/usr/local/lib/implementation-validation-bridge-mcp/server.py" ;;
+      qwen_canary_write_bridge_server) echo "/usr/local/lib/qwen-canary-write-bridge-mcp/server.py" ;;
       implementation_validation_bridge_venv_dir) echo "/usr/local/lib/implementation-validation-bridge-mcp/.venv" ;;
       hermes_config)          echo "$HOME/.hermes/config.yaml" ;;
       hermes_soul)            echo "$HOME/.hermes/SOUL.md" ;;
@@ -2377,6 +2379,8 @@ run_repo_only() {
   require_file_nonempty "templates/coder-claude-implementation-validation.yaml"
   require_file_nonempty "templates/coder-qwen-implementation-validation.yaml"
   require_file_nonempty "templates/coder-qwen-SOUL.md"
+  require_file_nonempty "templates/qwen_canary_write_bridge_server.py"
+  require_file_nonempty "tests/test_qwen_canary_write_bridge.py"
   require_file_nonempty "templates/planner_bridge_server.py"
   require_file_nonempty "scripts/planner-bridge"
   require_file_nonempty "tests/test_review_bridge_template.py"
@@ -2563,7 +2567,7 @@ run_repo_only() {
     done
   done
   QWEN_SOUL_FILE="$REPO_DIR/templates/coder-qwen-SOUL.md"
-  for s in 'HERMES_SYSTEM_ONE_QWEN_CANARY_V1' 'implementation_validation_bridge' 'Do not commit, push' 'formal reviewer remains authoritative'; do
+  for s in 'HERMES_SYSTEM_ONE_QWEN_CANARY_V1' 'implementation_validation_bridge' 'qwen_canary_write_bridge' 'Do not commit, push' 'formal reviewer remains authoritative'; do
     if grep_ok "$QWEN_SOUL_FILE" "$s"; then check_ok "coder-qwen SOUL contains: $s"; else check_fail "coder-qwen SOUL missing: $s"; fi
   done
 
@@ -3055,8 +3059,10 @@ PY
       'default: qwen3.8:27b' \
       'implementation_validation_bridge:' \
       '/usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python' \
-      '/usr/local/lib/implementation-validation-bridge-mcp/server.py'; then
-    check_fail "coder-qwen profile does not pin the approved model and dedicated implementation-validation bridge"
+      '/usr/local/lib/implementation-validation-bridge-mcp/server.py' \
+      'qwen_canary_write_bridge:' \
+      '/usr/local/lib/qwen-canary-write-bridge-mcp/server.py'; then
+    check_fail "coder-qwen profile does not pin the approved model and dedicated canary bridges"
   elif ! qwen_profile_toolsets_ok "$coder_qwen_config"; then
     check_fail "coder-qwen profile toolsets are not the isolated coder-claude allowlist"
   elif grep -qF -- 'pipeline_controller' "$coder_qwen_config" \
@@ -3066,6 +3072,16 @@ PY
     check_fail "coder-qwen profile config exposes forbidden control or review authority"
   else
     check_ok "coder-qwen profile pins the approved model and dedicated implementation-validation bridge without forbidden authority"
+  fi
+  local qwen_write_template qwen_write_runtime
+  qwen_write_template="$REPO_DIR/templates/qwen_canary_write_bridge_server.py"
+  qwen_write_runtime="$(runtime_path qwen_canary_write_bridge_server)"
+  if [[ ! -s "$qwen_write_template" || ! -s "$qwen_write_runtime" ]]; then
+    check_fail "qwen canary write bridge source or runtime file missing:source=$qwen_write_template;runtime=$qwen_write_runtime"
+  elif [[ "$(sha256_of "$qwen_write_template")" != "$(sha256_of "$qwen_write_runtime")" ]]; then
+    check_fail "qwen canary write bridge SHA-256 mismatch"
+  else
+    check_ok "qwen canary write bridge source/runtime SHA-256 parity holds"
   fi
   if [[ ! -s "$qwen_template" || ! -s "$coder_qwen_soul" ]]; then
     check_fail "coder-qwen SOUL source or runtime file missing:source=$qwen_template;runtime=$coder_qwen_soul"
