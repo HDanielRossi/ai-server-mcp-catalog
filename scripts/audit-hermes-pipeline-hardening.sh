@@ -42,6 +42,8 @@ Environment:
                         (/usr/local/lib/pipeline-bridge-mcp/server.py,
                         /usr/local/lib/review-bridge-mcp/server.py,
                         /usr/local/lib/claude-bridge-mcp/server.py,
+                        /usr/local/lib/implementation-validation-bridge-mcp/server.py,
+                        /usr/local/lib/implementation-validation-bridge-mcp/.venv/,
                         $HOME/.hermes/...). Intended for hermetic test
                         fixtures. When set, the layout under the override
                         root mirrors:
@@ -160,6 +162,8 @@ runtime_path() {
       pipeline_bridge_server) echo "$root/usr/local/lib/pipeline-bridge-mcp/server.py" ;;
       review_bridge_server)   echo "$root/usr/local/lib/review-bridge-mcp/server.py" ;;
       claude_bridge_server)   echo "$root/usr/local/lib/claude-bridge-mcp/server.py" ;;
+      implementation_validation_bridge_server) echo "$root/usr/local/lib/implementation-validation-bridge-mcp/server.py" ;;
+      implementation_validation_bridge_venv_dir) echo "$root/usr/local/lib/implementation-validation-bridge-mcp/.venv" ;;
       hermes_config)          echo "$root/home/.hermes/config.yaml" ;;
       hermes_soul)            echo "$root/home/.hermes/SOUL.md" ;;
       reviewer_config)        echo "$root/home/.hermes/profiles/reviewer/config.yaml" ;;
@@ -177,6 +181,8 @@ runtime_path() {
       pipeline_bridge_server) echo "/usr/local/lib/pipeline-bridge-mcp/server.py" ;;
       review_bridge_server)   echo "/usr/local/lib/review-bridge-mcp/server.py" ;;
       claude_bridge_server)   echo "/usr/local/lib/claude-bridge-mcp/server.py" ;;
+      implementation_validation_bridge_server) echo "/usr/local/lib/implementation-validation-bridge-mcp/server.py" ;;
+      implementation_validation_bridge_venv_dir) echo "/usr/local/lib/implementation-validation-bridge-mcp/.venv" ;;
       hermes_config)          echo "$HOME/.hermes/config.yaml" ;;
       hermes_soul)            echo "$HOME/.hermes/SOUL.md" ;;
       reviewer_config)        echo "$HOME/.hermes/profiles/reviewer/config.yaml" ;;
@@ -2957,6 +2963,50 @@ PY
     check_fail "installed claude_bridge ($claude_server): runtime_claude_bridge_missing"
   else
     claude_static_contract_audit "installed claude_bridge" "$claude_server"
+  fi
+
+  echo
+  echo "17b) coder-claude implementation-validation bridge runtime contract:"
+  local validation_template validation_server validation_source_sha validation_runtime_sha
+  validation_template="$REPO_DIR/templates/implementation_validation_bridge_server.py"
+  validation_server="$(runtime_path implementation_validation_bridge_server)"
+  if [[ ! -s "$validation_template" ]]; then
+    check_fail "implementation-validation bridge source template missing or empty at $validation_template"
+  elif [[ ! -s "$validation_server" ]]; then
+    check_fail "implementation-validation bridge runtime missing or empty at $validation_server"
+  else
+    validation_source_sha="$(sha256_of "$validation_template")"
+    validation_runtime_sha="$(sha256_of "$validation_server")"
+    if [[ "$validation_source_sha" == "$validation_runtime_sha" ]]; then
+      check_ok "implementation-validation bridge source/runtime SHA-256 parity holds"
+    else
+      check_fail "implementation-validation bridge SHA-256 mismatch:source=$validation_source_sha;runtime=$validation_runtime_sha"
+    fi
+  fi
+
+  local validation_venv
+  validation_venv="$(runtime_path implementation_validation_bridge_venv_dir)"
+  if [[ ! -d "$validation_venv" ]]; then
+    check_fail "implementation-validation bridge virtualenv missing or invalid at $validation_venv:not_a_directory"
+  elif [[ ! -s "$validation_venv/pyvenv.cfg" ]]; then
+    check_fail "implementation-validation bridge virtualenv missing or invalid at $validation_venv:no_pyvenv_cfg"
+  elif [[ ! -x "$validation_venv/bin/python3" && ! -x "$validation_venv/bin/python" ]]; then
+    check_fail "implementation-validation bridge virtualenv missing or invalid at $validation_venv:no_venv_python_executable"
+  else
+    check_ok "implementation-validation bridge virtualenv present and structurally valid at $validation_venv"
+  fi
+
+  local coder_claude_config
+  coder_claude_config="$(runtime_path coder_claude_config)"
+  if [[ ! -s "$coder_claude_config" ]]; then
+    check_fail "coder-claude profile config missing or empty at $coder_claude_config"
+  elif grep_ok "$coder_claude_config" \
+      'implementation_validation_bridge:' \
+      '/usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python' \
+      '/usr/local/lib/implementation-validation-bridge-mcp/server.py'; then
+    check_ok "coder-claude profile exposes the dedicated implementation-validation bridge"
+  else
+    check_fail "coder-claude profile does not expose the dedicated implementation-validation bridge"
   fi
 
   echo

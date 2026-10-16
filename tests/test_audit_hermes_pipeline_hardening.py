@@ -27,6 +27,9 @@ REVIEWER_SOUL_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "reviewer-SOU
 PIPELINE_CONTROLLER_MCP_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "pipeline_controller_server.py")
 HERMES_PIPELINE_CONTROLLER_PATH = os.path.join(REPO_ROOT, "scripts", "hermes-pipeline-controller.py")
 PIPELINE_BRIDGE_TEMPLATE_PATH = os.path.join(REPO_ROOT, "templates", "pipeline_bridge_server.py")
+IMPLEMENTATION_VALIDATION_TEMPLATE_PATH = os.path.join(
+    REPO_ROOT, "templates", "implementation_validation_bridge_server.py"
+)
 
 # A7.1: locks the CURRENT SHA-256 of the two frozen A6 files this task must
 # never modify, so any drift in either file (this task's or a future one's)
@@ -50,10 +53,13 @@ FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
 # changed by the reviewed S0.1b shadow routing instrumentation (9299fe4,
 # fc45e00). The previous A6 lock was
 # 4138ba1f5395f9e545610798fa4fa028c000d5d538da0fcc49e2bbe9033bed75; this
-# value pins the reviewed post-S0.1b bytes. Any further drift must again be
-# a reviewed change that re-pins this hash with its own justification.
+# value pins the reviewed post-S0.1b bytes.  The later reviewed A8
+# administrative-closure compatibility change (0f10c93) extended the accepted
+# terminal run statuses and therefore re-pins this value. Any further drift
+# must again be a reviewed change that re-pins this hash with its own
+# justification.
 FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256 = (
-    "9fca0af52adc050340e7142e3288f77831718ce8671cc6e9412c5aff609fff37"
+    "3eb2727c370eca8c8c5122e1c1934b1500f94719df8dbf022e4e15852b90409a"
 )
 
 REPO_ONLY_FILES = [
@@ -125,9 +131,10 @@ def _build_runtime_fixture(tmp_path, compliant=True):
     pipeline_dir = root / "usr" / "local" / "lib" / "pipeline-bridge-mcp"
     review_dir = root / "usr" / "local" / "lib" / "review-bridge-mcp"
     claude_dir = root / "usr" / "local" / "lib" / "claude-bridge-mcp"
+    validation_dir = root / "usr" / "local" / "lib" / "implementation-validation-bridge-mcp"
     hermes_dir = root / "home" / ".hermes"
     reviewer_dir = hermes_dir / "profiles" / "reviewer"
-    for d in (pipeline_dir, review_dir, claude_dir, reviewer_dir):
+    for d in (pipeline_dir, review_dir, claude_dir, validation_dir, reviewer_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     if not compliant:
@@ -148,6 +155,7 @@ def _build_runtime_fixture(tmp_path, compliant=True):
     # audit (REQUIRED_CLAUDE_FLAGS / _tool_run task_id) sees the real,
     # currently-compliant repo template rather than a stale hand-written stub.
     shutil.copy(CLAUDE_BRIDGE_TEMPLATE_PATH, claude_dir / "server.py")
+    shutil.copy(IMPLEMENTATION_VALIDATION_TEMPLATE_PATH, validation_dir / "server.py")
     # A7.1: the real Hermes config shape nests MCP registrations under a
     # top-level "mcp_servers:" mapping; pipeline_controller must be an
     # immediate child of that mapping, never a column-0 top-level key.
@@ -176,7 +184,6 @@ def _build_runtime_fixture(tmp_path, compliant=True):
     # default-only pipeline_controller MCP.
     for profile_name, mcp_entry in (
         ("coder", "claude_bridge"),
-        ("coder-claude", "claude_bridge"),
         ("planner-codex", "planner_bridge"),
         ("sysadmin", "review_bridge"),
     ):
@@ -186,6 +193,29 @@ def _build_runtime_fixture(tmp_path, compliant=True):
             f"{mcp_entry}:\n  enabled: true\n",
             encoding="utf-8",
         )
+
+    coder_claude_dir = hermes_dir / "profiles" / "coder-claude"
+    coder_claude_dir.mkdir(parents=True, exist_ok=True)
+    (coder_claude_dir / "config.yaml").write_text(
+        "mcp_servers:\n"
+        "  claude_bridge:\n"
+        "    enabled: true\n"
+        "  implementation_validation_bridge:\n"
+        "    command: /usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python\n"
+        "    args:\n"
+        "      - /usr/local/lib/implementation-validation-bridge-mcp/server.py\n",
+        encoding="utf-8",
+    )
+
+    validation_venv_dir = validation_dir / ".venv"
+    validation_venv_bin_dir = validation_venv_dir / "bin"
+    validation_venv_bin_dir.mkdir(parents=True, exist_ok=True)
+    (validation_venv_dir / "pyvenv.cfg").write_text(
+        "home = /usr/bin\nversion = 3.11.0\n", encoding="utf-8"
+    )
+    validation_venv_python3 = validation_venv_bin_dir / "python3"
+    validation_venv_python3.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    validation_venv_python3.chmod(0o755)
 
     # A7.1: dedicated pipeline-controller-mcp runtime layout + trusted
     # controller binary, both verbatim copies (not hand-written) so the
@@ -2053,16 +2083,26 @@ def test_a7_registration_forbidden_profile_fails(tmp_path, profile_name):
     profile_cfg = _a7_profile_config(runtime_root, profile_name)
 
     original = profile_cfg.read_text(encoding="utf-8")
-    profile_cfg.write_text(
-        original.rstrip()
-        + "\n"
-        + "mcp_servers:\n"
-        + "  harmless_other_mcp:\n"
-        + "    enabled: true\n"
-        + "  pipeline_controller:\n"
-        + "    enabled: true\n",
-        encoding="utf-8",
-    )
+    # coder-claude has a real mcp_servers mapping for its dedicated,
+    # sandboxed validation bridge.  Add the deliberately forbidden entry to
+    # that existing mapping rather than writing a duplicate YAML root key;
+    # duplicate keys are interpreted inconsistently by YAML parsers.
+    if "mcp_servers:\n" in original:
+        injection = (
+            "  harmless_other_mcp:\n"
+            "    enabled: true\n"
+            "  pipeline_controller:\n"
+            "    enabled: true\n"
+        )
+    else:
+        injection = (
+            "mcp_servers:\n"
+            "  harmless_other_mcp:\n"
+            "    enabled: true\n"
+            "  pipeline_controller:\n"
+            "    enabled: true\n"
+        )
+    profile_cfg.write_text(original.rstrip() + "\n" + injection, encoding="utf-8")
 
     result = _run(
         ["--runtime"],
