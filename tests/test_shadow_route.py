@@ -382,6 +382,21 @@ def test_explicit_false_qwen_canary_keeps_claude_for_eligible_scope(workdir, mon
     assert json.loads(out)["idempotency_key"] == hpc.stable_key(workdir, "widgets", "implementation")
 
 
+def test_explicit_qwen_canary_keeps_its_idempotency_lane_when_ineligible(workdir, monkeypatch, capsys):
+    _rc, candidate_calls, candidate_out, _err = run_controller(monkeypatch, capsys, impl_argv(
+        workdir, "--system-one-qwen-canary=true", *SHADOW_FLAGS,
+    ))
+    _rc, fallback_calls, fallback_out, _err = run_controller(monkeypatch, capsys, impl_argv(
+        workdir, "--system-one-qwen-canary=true", "--shadow-mandatory-block=true",
+    ))
+
+    assert candidate_calls[0][candidate_calls[0].index("--assignee") + 1] == hpc.SYSTEM_ONE_QWEN_PROFILE
+    assert fallback_calls[0][fallback_calls[0].index("--assignee") + 1] == hpc.DEFAULT_IMPLEMENTATION_PROFILE
+    expected = hpc.stable_key(workdir, "widgets", "implementation:qwen-canary")
+    assert json.loads(candidate_out)["idempotency_key"] == expected
+    assert json.loads(fallback_out)["idempotency_key"] == expected
+
+
 @pytest.mark.parametrize("extra", [
     ["--system-one-qwen-canary=true"],
     ["--system-one-qwen-canary=true", "--shadow-mandatory-block=true"],
@@ -395,7 +410,9 @@ def test_qwen_canary_fails_closed_to_claude_without_eligible_scope(workdir, monk
     assert rc == hpc.EXIT_OK
     create = calls[0]
     assert create[create.index("--assignee") + 1] == hpc.DEFAULT_IMPLEMENTATION_PROFILE
-    assert json.loads(out)["idempotency_key"] == hpc.stable_key(workdir, "widgets", "implementation")
+    assert json.loads(out)["idempotency_key"] == hpc.stable_key(
+        workdir, "widgets", "implementation:qwen-canary",
+    )
 
 
 def test_qwen_canary_shadow_rule_exception_fails_closed_to_claude(workdir, monkeypatch, capsys):
@@ -406,7 +423,9 @@ def test_qwen_canary_shadow_rule_exception_fails_closed_to_claude(workdir, monke
     assert rc == hpc.EXIT_OK
     create = calls[0]
     assert create[create.index("--assignee") + 1] == hpc.DEFAULT_IMPLEMENTATION_PROFILE
-    assert json.loads(out)["idempotency_key"] == hpc.stable_key(workdir, "widgets", "implementation")
+    assert json.loads(out)["idempotency_key"] == hpc.stable_key(
+        workdir, "widgets", "implementation:qwen-canary",
+    )
 
 
 @pytest.mark.parametrize("raw", ["TRUE", "yes", "1", ""])

@@ -232,25 +232,40 @@ def test_bootstrap_registration_create_failure_does_not_complete(monkeypatch, ca
     assert "kanban" in capsys.readouterr().err
 
 
-def test_committed_scope_matches_exact_base_to_head_paths():
-    repo = Path(MODULE_PATH).resolve().parents[1]
+def test_committed_scope_matches_exact_base_to_head_paths(tmp_path):
+    repo = tmp_path / "scope-repository"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+    (repo / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_app.py").write_text("def test_initial():\n    assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Hermes Test", "-c", "user.email=hermes@example.invalid",
+         "commit", "-m", "base"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+    (repo / "app.py").write_text("value = 2\n", encoding="utf-8")
+    (repo / "tests" / "test_app.py").write_text(
+        "def test_updated():\n    assert True\n", encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Hermes Test", "-c", "user.email=hermes@example.invalid",
+         "commit", "-m", "implementation"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
     implementation = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
                                     capture_output=True, text=True).stdout.strip()
     scope = hpc.capture_committed_implementation_scope(
-        repo, "c830b530ff32947e804c58b7bcc1fa5f762a5eec", implementation
+        repo, base, implementation
     )
     assert scope["changed_paths"] == [
-        "docs/hermes-pipeline.md",
-        "scripts/audit-hermes-pipeline-hardening.sh",
-        "templates/coder-claude-implementation-validation.yaml",
-        "templates/hermes-repo-contract.md",
-        "templates/implementation_validation_bridge_server.py",
-        "templates/review_bridge_server.py",
-        "templates/reviewer-SOUL.md",
-        "tests/test_audit_hermes_pipeline_hardening.py",
-        "tests/test_hermes_pipeline_controller.py",
-        "tests/test_implementation_validation_bridge.py",
-        "tests/test_review_bridge_template.py",
+        "app.py",
+        "tests/test_app.py",
     ]
     assert scope["changed_paths"] == sorted(set(scope["changed_paths"]))
 

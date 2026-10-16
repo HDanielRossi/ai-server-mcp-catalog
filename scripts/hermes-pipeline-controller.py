@@ -1119,10 +1119,15 @@ def create_implementation(args):
     feature = args.feature
 
     assignee = _select_implementation_assignee(args, resolved)
-    # Keep the historic Claude key byte-for-byte stable.  A real Qwen canary
-    # gets a distinct idempotency identity so toggling the canary can never
-    # replay a task created by the other worker lane.
-    key_phase = "implementation:qwen-canary" if assignee == SYSTEM_ONE_QWEN_PROFILE else "implementation"
+    # Keep the historic Claude key byte-for-byte stable.  An explicit Qwen
+    # canary request owns a separate idempotency lane even when a retry's
+    # eligibility resolves to Claude.  Otherwise changing eligibility between
+    # retries would silently create a second task for the same request.
+    key_phase = (
+        "implementation:qwen-canary"
+        if args.system_one_qwen_canary is True
+        else "implementation"
+    )
     key = stable_key(str(resolved), feature, key_phase)
     body = args.body.strip() if args.body else ""
     if not body:

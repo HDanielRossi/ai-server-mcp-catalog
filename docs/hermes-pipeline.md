@@ -1537,9 +1537,11 @@ as `--system-one-qwen-canary=true|false`.
   and components into a `HERMES_SYSTEM_ONE_QWEN_CANARY_V1` body section. The
   ready-to-commit gate rejects a Qwen task that lacks that scope marker or
   whose latest worker profile differs from its task assignee.
-- A selected Qwen canary uses a separate idempotency identity. Toggling the
-  canary can therefore never replay a task created by the other worker lane;
-  the historical Claude idempotency key is unchanged.
+- An explicit Qwen-canary request uses a separate idempotency identity, even
+  when a retry's eligibility resolves to Claude. This prevents eligibility
+  drift between retries from silently creating two tasks for the same request.
+  A request without the explicit canary flag retains the historical Claude
+  idempotency key.
 - Corrections never enter the Qwen lane. They remain assigned to
   `coder-claude`.
 - `coder-qwen` must use the dedicated implementation-validation bridge and
@@ -1603,6 +1605,26 @@ The runtime audit must pass before the explicit canary flag is used. This
 profile is created once, never overwritten by this procedure; a later update
 requires an explicit reviewed rollout. The source change alone does not alter
 an installed worker or route a task to Qwen.
+
+### S0.3 promotion gate
+
+Do not broaden the Qwen lane after one successful canary. Promotion from the
+fixed two-file pilot requires an explicit human decision after **three
+consecutive** successful Qwen canaries on distinct low-risk changes. For each
+canary, retain the implementation and formal-review task IDs and demonstrate:
+
+- the runtime audit and source/runtime parity passed before dispatch;
+- declared scope and reviewed changed paths matched exactly, with no authority
+  or sandbox-boundary violation;
+- targeted and full tests passed in the formal review; and
+- every correction, commit, push, and merge followed the existing separate
+  human-approval boundary.
+
+Any scope escape, unauthorized mutation, failed formal review, or runtime
+parity failure resets the consecutive-success count to zero and keeps the
+fixed pilot scope. Even after the threshold, promotion may only authorize a
+new reviewed scope; it never grants Qwen direct lifecycle, commit, or push
+authority.
 
 Installation implications: a deployed adapter and controller emit shadow
 records only when a caller passes shadow arguments. Changing either source
