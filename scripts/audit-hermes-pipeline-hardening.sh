@@ -2567,7 +2567,7 @@ run_repo_only() {
     done
   done
   QWEN_SOUL_FILE="$REPO_DIR/templates/coder-qwen-SOUL.md"
-  for s in 'HERMES_SYSTEM_ONE_QWEN_CANARY_V1' 'implementation_validation_bridge' 'qwen_canary_write_bridge' 'Do not commit, push' 'formal reviewer remains authoritative'; do
+  for s in 'HERMES_SYSTEM_ONE_QWEN_CANARY_V1' 'mcp__implementation_validation_bridge__validate' 'qwen_canary_write_bridge' 'Do not commit, push' 'formal reviewer remains authoritative' 'Validation policy: strictly one at a time; serial order is `git_diff_check`, then `py_compile` for every changed Python path, then `pytest_targeted` for the declared test path, then `pytest_full`.' 'parallel validation-bridge calls' 'Stop at the first failed or blocked'; do
     if grep_ok "$QWEN_SOUL_FILE" "$s"; then check_ok "coder-qwen SOUL contains: $s"; else check_fail "coder-qwen SOUL missing: $s"; fi
   done
 

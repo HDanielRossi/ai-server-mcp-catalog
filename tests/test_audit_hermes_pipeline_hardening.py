@@ -2217,6 +2217,21 @@ def test_runtime_qwen_soul_must_match_reviewed_source(tmp_path):
     assert "coder-qwen SOUL SHA-256 mismatch" in result.stdout
 
 
+def test_repo_qwen_soul_requires_serial_validation_policy(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    qwen_soul = fixture / "templates" / "coder-qwen-SOUL.md"
+    _mutate_file(
+        qwen_soul,
+        "Validation policy: strictly one at a time; serial order is `git_diff_check`, then `py_compile` for every changed Python path, then `pytest_targeted` for the declared test path, then `pytest_full`.\n",
+        "",
+    )
+
+    result = _run(["--repo-only"], cwd=str(fixture))
+
+    assert result.returncode == 1
+    assert "coder-qwen SOUL missing: Validation policy: strictly one at a time" in result.stdout
+
+
 def test_a7_unrelated_mcp_children_remain_accepted(tmp_path):
     fixture = _build_repo_fixture(tmp_path)
     runtime_root = _build_runtime_fixture(tmp_path, compliant=True)

@@ -18,10 +18,12 @@ authorized System One canary task.
 
 1. Inspect declared files only with `mcp__qwen_canary_write_bridge__read_file`.
 2. Make the smallest change only with `mcp__qwen_canary_write_bridge__replace_exact`.
-3. Run only the dedicated validation bridge operations:
-   `mcp__implementation_validation_bridge__validate` with `pytest_full`,
-   `pytest_targeted`, `py_compile`, or `git_diff_check` as applicable.
-4. Report the exact structured validation result, modified-file list,
+3. Validation policy: strictly one at a time; serial order is `git_diff_check`, then `py_compile` for every changed Python path, then `pytest_targeted` for the declared test path, then `pytest_full`.
+   Invoke only `mcp__implementation_validation_bridge__validate`; never issue
+   parallel validation-bridge calls. Stop at the first failed or blocked
+   operation and report its exact result.
+4. Report the exact structured validation result for every completed
+   operation, modified-file list,
    `git status --short`, and scoped diff evidence.
 5. Never mark a task complete if the validation bridge cannot verify the
    required evidence.

@@ -1547,6 +1547,10 @@ as `--system-one-qwen-canary=true|false`.
 - `coder-qwen` must use the dedicated implementation-validation bridge and
   cannot commit or push. The formal reviewer and human commit/push boundaries
   are unchanged.
+- Qwen validation calls are serial, never parallel: first `git_diff_check`,
+  then `py_compile` for each changed Python path, then `pytest_targeted` for
+  the declared test path, and finally `pytest_full`. A failure or block ends
+  validation immediately and is reported as evidence.
 
 The runtime profile is intentionally separate. Before enabling a live canary,
 an operator must use this exact sequence after the approved controller/adapter
