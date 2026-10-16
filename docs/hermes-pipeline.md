@@ -1677,9 +1677,11 @@ CI, dependency, Git, profile, and secret paths remains rejected before a write.
 
 The first S0.4 task must be one pure helper change with direct tests and a
 small matching `README.md` usage update. It must declare the exact three paths
-and the three components `repository-source`, `tests`, and `documentation`.
-The bridge performs only an exact one-occurrence replacement; it has no shell,
-Git, subprocess, patch, commit, push, or task-lifecycle capability.
+and the two classifier components `repository-source` and `tests`. The README
+is enforced as an exact declared write path, but is not a third classifier
+component: the shadow-route safety ceiling remains two components. The bridge
+performs only an exact one-occurrence replacement; it has no shell, Git,
+subprocess, patch, commit, push, or task-lifecycle capability.
 
 Before dispatch, runtime audit and source/runtime SHA-256 parity must pass.
 The ready-to-commit controller still compares every reviewed changed path with
