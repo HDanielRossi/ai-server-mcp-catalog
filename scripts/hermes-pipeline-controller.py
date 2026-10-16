@@ -81,6 +81,7 @@ SHADOW_DECISION_UNKNOWN = "UNKNOWN"
 SHADOW_MAX_PATHS = 8
 SHADOW_MAX_COMPONENTS = 2
 SHADOW_ELIGIBLE_COMPONENTS = frozenset({"repository-source", "tests", "documentation"})
+SHADOW_FORBIDDEN_PATH_PREFIXES = (".git/", ".github/")
 SHADOW_WORKDIR_HASH_PREFIX_CHARS = 12
 SHADOW_REASON_CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{2,63}")
 SHADOW_COMPONENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
@@ -88,6 +89,10 @@ SHADOW_ASSIGNEE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 SHADOW_MAX_INDEXED_REASONS = 4  # per list feature; the rest become one typed truncation reason
 SHADOW_MAX_LINE_BYTES = 2048  # emitted line incl. newline; well under the adapter's 4000-char stderr cap
 SHADOW_FLAG_PREFIX = "--shadow-"
+SYSTEM_ONE_QWEN_CANARY_FLAG = "--system-one-qwen-canary"
+DEFAULT_IMPLEMENTATION_PROFILE = "coder-claude"
+SYSTEM_ONE_QWEN_PROFILE = "coder-qwen"
+QWEN_CANARY_SCOPE_MARKER = "HERMES_SYSTEM_ONE_QWEN_CANARY_V1"
 SHADOW_ARG_DESTS = (
     "shadow_declared_path", "shadow_component",
     "shadow_mandatory_block", "shadow_mandatory_block_reason",
@@ -153,7 +158,10 @@ class Exit3ArgumentParser(argparse.ArgumentParser):
         # S0.1b --shadow-* flags are only ever matched by their exact spelling.
         return [
             option_tuple for option_tuple in super()._get_option_tuples(option_string)
-            if not any(s.startswith(SHADOW_FLAG_PREFIX) for s in option_tuple[0].option_strings)
+            if not any(
+                s.startswith(SHADOW_FLAG_PREFIX) or s == SYSTEM_ONE_QWEN_CANARY_FLAG
+                for s in option_tuple[0].option_strings
+            )
         ]
 
 
@@ -166,6 +174,14 @@ def _add_shadow_route_arguments(subparser):
     subparser.add_argument("--shadow-component", action="append", default=None)
     subparser.add_argument("--shadow-mandatory-block", default=None)
     subparser.add_argument("--shadow-mandatory-block-reason", default=None)
+
+
+def _type_exact_bool(raw):
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected exact literal true or false")
 
 
 def build_parser():
@@ -182,6 +198,8 @@ def build_parser():
     create_impl.add_argument("--feature", required=True)
     create_impl.add_argument("--body", default=None)
     _add_shadow_route_arguments(create_impl)
+    # S0.2 is opt-in and fail-closed: omitted means Claude remains the worker.
+    create_impl.add_argument(SYSTEM_ONE_QWEN_CANARY_FLAG, type=_type_exact_bool, default=False)
 
     bootstrap = subparsers.add_parser(
         "register-bootstrap-implementation", prog="register-bootstrap-implementation",
@@ -884,6 +902,8 @@ def shadow_route(features):
             canonical, error = _shadow_canonical_path(raw)
             if error:
                 invalid.append({"type": "invalid_feature", "code": error, "index": index})
+            elif canonical == ".git" or canonical == ".github" or canonical.startswith(SHADOW_FORBIDDEN_PATH_PREFIXES):
+                invalid.append({"type": "invalid_feature", "code": "PATH_SENSITIVE", "index": index})
             else:
                 collected.add(canonical)
         _shadow_extend_indexed_reasons(reasons, invalid, "PATH_REASONS_TRUNCATED")
@@ -983,6 +1003,89 @@ def _shadow_mandatory_block_value(raw):
     return raw  # None stays missing; anything else is rejected by shadow_route()
 
 
+def _select_implementation_assignee(args, resolved):
+    """Return the sole implementation worker for this invocation.
+
+    The S0.2 Qwen lane is deliberately narrower than the S0.1b observation
+    hook: it requires a separate explicit opt-in *and* the same deterministic
+    shadow rule to classify the declared scope as QWEN_CANDIDATE.  Every
+    malformed, omitted, blocked, or ineligible input fails back to Claude.
+    """
+    if args.system_one_qwen_canary is not True:
+        return DEFAULT_IMPLEMENTATION_PROFILE
+    try:
+        record = shadow_route({
+            "declared_paths": args.shadow_declared_path,
+            "components": args.shadow_component,
+            "mandatory_block": _shadow_mandatory_block_value(args.shadow_mandatory_block),
+            "mandatory_block_reason": args.shadow_mandatory_block_reason,
+            "actual_assignee": SYSTEM_ONE_QWEN_PROFILE,
+            "workdir": str(resolved),
+        })
+    except Exception:
+        return DEFAULT_IMPLEMENTATION_PROFILE
+    if record.get("decision") == SHADOW_DECISION_QWEN_CANDIDATE:
+        return SYSTEM_ONE_QWEN_PROFILE
+    return DEFAULT_IMPLEMENTATION_PROFILE
+
+
+def _qwen_canary_scope_body(args):
+    """Render already-eligible, repository-relative scope for the Qwen worker."""
+    paths = sorted({_shadow_canonical_path(path)[0] for path in (args.shadow_declared_path or ())})
+    components = sorted(set(args.shadow_component or ()))
+    return "\n".join([
+        QWEN_CANARY_SCOPE_MARKER,
+        "Declared paths:",
+        *["- " + path for path in paths],
+        "Declared components:",
+        *["- " + component for component in components],
+    ])
+
+
+def _qwen_canary_declared_paths(body):
+    """Parse the single controller-authored Qwen scope block, fail-closed."""
+    if not isinstance(body, str) or body.count(QWEN_CANARY_SCOPE_MARKER) != 1:
+        raise ReadyToCommitReject("qwen_canary_scope_marker_missing", "Qwen implementation task is missing exactly one declared-scope marker")
+    suffix = body.split(QWEN_CANARY_SCOPE_MARKER, 1)[1]
+    if not suffix.startswith("\nDeclared paths:\n"):
+        raise ReadyToCommitReject("qwen_canary_scope_malformed", "Qwen declared scope has no exact paths header")
+    lines = suffix.splitlines()[1:]
+    if not lines or lines[0] != "Declared paths:":
+        raise ReadyToCommitReject("qwen_canary_scope_malformed", "Qwen declared scope has no exact paths header")
+    try:
+        components_index = lines.index("Declared components:")
+    except ValueError:
+        raise ReadyToCommitReject("qwen_canary_scope_malformed", "Qwen declared scope has no exact components header")
+    path_lines = lines[1:components_index]
+    component_lines = lines[components_index + 1:]
+    if not path_lines or not component_lines or any(not line.startswith("- ") for line in path_lines + component_lines):
+        raise ReadyToCommitReject("qwen_canary_scope_malformed", "Qwen declared scope entries are malformed")
+    paths = [line[2:] for line in path_lines]
+    components = [line[2:] for line in component_lines]
+    record = shadow_route({
+        "declared_paths": paths,
+        "components": components,
+        "mandatory_block": False,
+        "mandatory_block_reason": None,
+        "actual_assignee": SYSTEM_ONE_QWEN_PROFILE,
+    })
+    if record.get("decision") != SHADOW_DECISION_QWEN_CANDIDATE:
+        raise ReadyToCommitReject("qwen_canary_scope_invalid", "Qwen declared scope is no longer an eligible narrow scope")
+    return frozenset(paths)
+
+
+def _validate_qwen_canary_changed_paths(task, changed_paths):
+    """Require every reviewed Qwen canary change to remain in declared scope."""
+    declared_paths = _qwen_canary_declared_paths(task.get("body"))
+    if not isinstance(changed_paths, list) or not changed_paths:
+        raise ReadyToCommitReject("qwen_canary_changed_paths_missing", "Qwen canary must have a non-empty reviewed changed-path list")
+    if not set(changed_paths) <= declared_paths:
+        raise ReadyToCommitReject(
+            "qwen_canary_changed_paths_out_of_scope",
+            "Qwen canary changed paths are outside its declared scope",
+        )
+
+
 def _shadow_route_hook(args, argv, resolved):
     """Observe-only S0.1b hook: at most one JSON line to stderr.
 
@@ -1015,19 +1118,26 @@ def create_implementation(args):
     resolved = validate_phase_inputs(phase, args.workdir, args.feature)
     feature = args.feature
 
-    key = stable_key(str(resolved), feature, "implementation")
+    assignee = _select_implementation_assignee(args, resolved)
+    # Keep the historic Claude key byte-for-byte stable.  A real Qwen canary
+    # gets a distinct idempotency identity so toggling the canary can never
+    # replay a task created by the other worker lane.
+    key_phase = "implementation:qwen-canary" if assignee == SYSTEM_ONE_QWEN_PROFILE else "implementation"
+    key = stable_key(str(resolved), feature, key_phase)
     body = args.body.strip() if args.body else ""
     if not body:
         body = (
             "Implement %s in workspace %s, staying within the scope of this workdir; "
             "do not authorize changes outside it." % (feature, str(resolved))
         )
+    if assignee == SYSTEM_ONE_QWEN_PROFILE:
+        body += "\n\n" + _qwen_canary_scope_body(args)
 
     argv = [
         "hermes", "kanban", "create",
         "Implement %s in %s" % (feature, resolved.name),
         "--body", body,
-        "--assignee", "coder-claude",
+        "--assignee", assignee,
         "--workspace", "dir:" + str(resolved),
         "--idempotency-key", key,
         "--created-by", "pipeline_bridge",
@@ -1749,11 +1859,13 @@ def _validate_implementation_task(task, task_id, canonical_workdir):
             "implementation task workspace %r does not match requested workdir %r"
             % (workspace_path, canonical_workdir),
         )
-    if task.get("assignee") not in ("coder-claude", None):
+    if task.get("assignee") not in (DEFAULT_IMPLEMENTATION_PROFILE, SYSTEM_ONE_QWEN_PROFILE, None):
         raise ReadyToCommitReject(
             "implementation_assignee_mismatch",
-            "implementation task.assignee is %r, expected 'coder-claude' or null" % (task.get("assignee"),),
+            "implementation task.assignee is %r, expected a permitted implementation profile or null" % (task.get("assignee"),),
         )
+    if task.get("assignee") == SYSTEM_ONE_QWEN_PROFILE:
+        _qwen_canary_declared_paths(task.get("body"))
     if task.get("status") != "done":
         raise ReadyToCommitReject(
             "implementation_status_mismatch",
@@ -1768,8 +1880,18 @@ def _validate_implementation_task(task, task_id, canonical_workdir):
     return completed_at
 
 
-def _validate_implementation_latest_run(run):
-    if run.get("profile") == "coder-claude":
+def _validate_implementation_latest_run(run, expected_assignee=None):
+    if run.get("profile") in (DEFAULT_IMPLEMENTATION_PROFILE, SYSTEM_ONE_QWEN_PROFILE):
+        if run.get("profile") == SYSTEM_ONE_QWEN_PROFILE and expected_assignee != SYSTEM_ONE_QWEN_PROFILE:
+            raise ReadyToCommitReject(
+                "qwen_canary_task_identity_invalid",
+                "a Qwen implementation run requires a task explicitly assigned to coder-qwen",
+            )
+        if expected_assignee is not None and run.get("profile") != expected_assignee:
+            raise ReadyToCommitReject(
+                "implementation_task_run_profile_mismatch",
+                "implementation task assignee and latest run profile differ",
+            )
         if run.get("outcome") != "completed":
             raise ReadyToCommitReject(
                 "implementation_run_outcome_mismatch",
@@ -1790,10 +1912,10 @@ def _validate_implementation_latest_run(run):
         if metadata.get("coder_worker_run") is not False:
             raise ReadyToCommitReject("bootstrap_coder_run_invalid", "bootstrap provenance must state no coder worker run")
         return "operator-bootstrap"
-    if run.get("profile") != "coder-claude":
+    if run.get("profile") not in (DEFAULT_IMPLEMENTATION_PROFILE, SYSTEM_ONE_QWEN_PROFILE):
         raise ReadyToCommitReject(
             "implementation_run_profile_mismatch",
-            "implementation latest run profile is %r, expected 'coder-claude'" % (run.get("profile"),),
+            "implementation latest run profile is %r, expected a permitted implementation profile" % (run.get("profile"),),
         )
     raise AssertionError("unreachable")
 
@@ -2140,7 +2262,9 @@ def ready_to_commit(args):
     impl_task = impl_show.get("task")
     _validate_implementation_task(impl_task, implementation_task_id, canonical_workdir)
     impl_latest = _select_latest_run_reject("implementation_run_selection_invalid", impl_show.get("runs"))
-    implementation_provenance = _validate_implementation_latest_run(impl_latest)
+    implementation_provenance = _validate_implementation_latest_run(
+        impl_latest, impl_task.get("assignee"),
+    )
     bootstrap_state = None
     if implementation_provenance == "operator-bootstrap":
         bootstrap_state = _validate_bootstrap_provenance(
@@ -2191,6 +2315,8 @@ def ready_to_commit(args):
             "repository_state_mismatch_archive",
             "current repository_state does not match the archived review artifact repository_state",
         )
+    if impl_task.get("assignee") == SYSTEM_ONE_QWEN_PROFILE:
+        _validate_qwen_canary_changed_paths(impl_task, current_state.get("changed_paths"))
     if bootstrap_state is not None and current_state != bootstrap_state:
         raise ReadyToCommitReject(
             "bootstrap_repository_state_mismatch",

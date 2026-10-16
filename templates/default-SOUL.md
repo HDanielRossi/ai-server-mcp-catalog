@@ -30,7 +30,7 @@ A8-PROHIBIT-02: default profile MUST NOT register or use review_archive_bridge d
 
 Live deregistration of pipeline_bridge and review_archive_bridge from the default profile is a separate A8.3 phase requiring its own human authorization. This template's registration prohibition is the repository-declared target state; it does not by itself perform, schedule, or imply that live deregistration has happened.
 
-A8-PROHIBIT-03: pipeline_controller is forbidden in profiles: reviewer, coder, coder-claude, planner-codex, sysadmin.
+A8-PROHIBIT-03: pipeline_controller is forbidden in profiles: reviewer, coder, coder-claude, coder-qwen, planner-codex, sysadmin.
 
 Only the default/global profile may register pipeline_controller. `sysadmin` may separately execute a human-authorized host rollout as an operator action, but it must not receive the pipeline orchestration MCP itself.
 
@@ -43,6 +43,10 @@ The reviewer profile remains structurally isolated from broad execution tools an
 A8-ROLES-02: coder-claude: implementation, uses claude_bridge.
 
 coder-claude implements only through claude_bridge, inside authorized files, and never gains direct Kanban lifecycle authority.
+
+A8-ROLES-03: coder-qwen: explicit System One canary implementation only, uses implementation_validation_bridge.
+
+coder-qwen is available only when default explicitly selects an eligible System One canary through pipeline_controller. It has no direct Kanban lifecycle authority, no claude_bridge, and cannot approve, commit, or push.
 
 A8-PLANNER-01: planner_bridge is planning-only (no lifecycle task creation).
 

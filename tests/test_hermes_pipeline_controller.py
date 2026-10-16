@@ -995,6 +995,7 @@ def test_create_correction_twoParents_in_argv(capsys):
     assert len(parent_indices) == 2
     assert argv[parent_indices[0] + 1] == IMPL_ID
     assert argv[parent_indices[1] + 1] == REVIEW_ID
+    assert argv[argv.index("--assignee") + 1] == hpc.DEFAULT_IMPLEMENTATION_PROFILE
     captured, obj = parse_single_json_line(
         capsys, ["phase", "task_id", "idempotency_key", "workdir", "feature", "parents"]
     )
@@ -2321,6 +2322,50 @@ def make_impl_show_for(workdir, runs=None, task_overrides=None):
     if runs is None:
         runs = [make_impl_run_for()]
     return make_show(task=task, parents=[], runs=runs)
+
+
+def test_ready_to_commit_accepts_the_dedicated_qwen_canary_profile(tmp_path):
+    workdir = tmp_path / "qwen-canary"
+    workdir.mkdir()
+    task = make_impl_task_for(
+        workdir, assignee=hpc.SYSTEM_ONE_QWEN_PROFILE,
+        body=(hpc.QWEN_CANARY_SCOPE_MARKER + "\nDeclared paths:\n- app.py"
+              "\nDeclared components:\n- repository-source"),
+    )
+    run = make_impl_run_for(profile=hpc.SYSTEM_ONE_QWEN_PROFILE)
+    assert hpc._validate_implementation_task(task, RTC_IMPL_ID, str(workdir)) == 1000
+    assert hpc._validate_implementation_latest_run(run, hpc.SYSTEM_ONE_QWEN_PROFILE) == "coder-worker"
+
+
+def test_qwen_canary_requires_one_valid_controller_authored_scope_block(tmp_path):
+    workdir = tmp_path / "qwen-scope"
+    workdir.mkdir()
+    task = make_impl_task_for(workdir, assignee=hpc.SYSTEM_ONE_QWEN_PROFILE, body="ordinary task body")
+    with pytest.raises(hpc.ReadyToCommitReject, match="missing exactly one"):
+        hpc._validate_implementation_task(task, RTC_IMPL_ID, str(workdir))
+
+
+def test_qwen_canary_run_rejects_unassigned_or_mismatched_task():
+    run = make_impl_run_for(profile=hpc.SYSTEM_ONE_QWEN_PROFILE)
+    with pytest.raises(hpc.ReadyToCommitReject, match="requires a task explicitly assigned"):
+        hpc._validate_implementation_latest_run(run, None)
+    with pytest.raises(hpc.ReadyToCommitReject, match="requires a task explicitly assigned"):
+        hpc._validate_implementation_latest_run(run, hpc.DEFAULT_IMPLEMENTATION_PROFILE)
+
+
+def test_qwen_canary_changed_paths_must_be_nonempty_and_declared(tmp_path):
+    workdir = tmp_path / "qwen-changed-paths"
+    workdir.mkdir()
+    task = make_impl_task_for(
+        workdir, assignee=hpc.SYSTEM_ONE_QWEN_PROFILE,
+        body=(hpc.QWEN_CANARY_SCOPE_MARKER + "\nDeclared paths:\n- app.py"
+              "\nDeclared components:\n- repository-source"),
+    )
+    hpc._validate_qwen_canary_changed_paths(task, ["app.py"])
+    with pytest.raises(hpc.ReadyToCommitReject, match="non-empty reviewed"):
+        hpc._validate_qwen_canary_changed_paths(task, [])
+    with pytest.raises(hpc.ReadyToCommitReject, match="outside its declared scope"):
+        hpc._validate_qwen_canary_changed_paths(task, [".github/workflows/deploy.yml"])
 
 
 def make_review_task_for(workdir, **overrides):

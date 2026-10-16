@@ -140,6 +140,8 @@ def test_non_boolean_mandatory_block_is_unknown(value):
     ("", "PATH_EMPTY"),
     ("./", "PATH_REPOSITORY_ROOT"),
     (7, "PATH_NOT_STRING"),
+    (".git/config", "PATH_SENSITIVE"),
+    (".github/workflows/deploy.yml", "PATH_SENSITIVE"),
 ])
 def test_noncanonical_scope_is_unknown(bad_path, code):
     record = hpc.shadow_route(eligible(declared_paths=["src/app.py", bad_path]))
@@ -349,6 +351,71 @@ def test_hook_partial_input_is_unknown(workdir, monkeypatch, capsys):
     record = json.loads(err)
     assert record["decision"] == "UNKNOWN"
     assert record["features"]["mandatory_block"] is False
+
+
+def test_explicit_qwen_canary_uses_qwen_only_for_eligible_scope(workdir, monkeypatch, capsys):
+    rc, calls, out, err = run_controller(monkeypatch, capsys, impl_argv(
+        workdir, "--system-one-qwen-canary=true", *SHADOW_FLAGS,
+    ))
+    assert rc == hpc.EXIT_OK
+    create = calls[0]
+    assert create[create.index("--assignee") + 1] == hpc.SYSTEM_ONE_QWEN_PROFILE
+    body = create[create.index("--body") + 1]
+    assert hpc.QWEN_CANARY_SCOPE_MARKER in body
+    assert "- src/app.py" in body
+    assert "- tests/test_app.py" in body
+    record = json.loads(err)
+    assert record["decision"] == "QWEN_CANDIDATE"
+    assert record["actual_assignee"] == hpc.SYSTEM_ONE_QWEN_PROFILE
+    assert json.loads(out)["idempotency_key"] == hpc.stable_key(
+        workdir, "widgets", "implementation:qwen-canary",
+    )
+
+
+def test_explicit_false_qwen_canary_keeps_claude_for_eligible_scope(workdir, monkeypatch, capsys):
+    rc, calls, out, _err = run_controller(monkeypatch, capsys, impl_argv(
+        workdir, "--system-one-qwen-canary=false", *SHADOW_FLAGS,
+    ))
+    assert rc == hpc.EXIT_OK
+    create = calls[0]
+    assert create[create.index("--assignee") + 1] == hpc.DEFAULT_IMPLEMENTATION_PROFILE
+    assert json.loads(out)["idempotency_key"] == hpc.stable_key(workdir, "widgets", "implementation")
+
+
+@pytest.mark.parametrize("extra", [
+    ["--system-one-qwen-canary=true"],
+    ["--system-one-qwen-canary=true", "--shadow-mandatory-block=true"],
+    ["--system-one-qwen-canary=true", *SHADOW_FLAGS, "--shadow-component=deployment"],
+    ["--system-one-qwen-canary=true", *SHADOW_FLAGS,
+     *["--shadow-declared-path=src/extra%d.py" % n for n in range(7)]],
+    ["--system-one-qwen-canary=true", *SHADOW_FLAGS, "--shadow-mandatory-block=yes"],
+])
+def test_qwen_canary_fails_closed_to_claude_without_eligible_scope(workdir, monkeypatch, capsys, extra):
+    rc, calls, out, _err = run_controller(monkeypatch, capsys, impl_argv(workdir, *extra))
+    assert rc == hpc.EXIT_OK
+    create = calls[0]
+    assert create[create.index("--assignee") + 1] == hpc.DEFAULT_IMPLEMENTATION_PROFILE
+    assert json.loads(out)["idempotency_key"] == hpc.stable_key(workdir, "widgets", "implementation")
+
+
+def test_qwen_canary_shadow_rule_exception_fails_closed_to_claude(workdir, monkeypatch, capsys):
+    monkeypatch.setattr(hpc, "shadow_route", broken_rule)
+    rc, calls, out, _err = run_controller(monkeypatch, capsys, impl_argv(
+        workdir, "--system-one-qwen-canary=true", *SHADOW_FLAGS,
+    ))
+    assert rc == hpc.EXIT_OK
+    create = calls[0]
+    assert create[create.index("--assignee") + 1] == hpc.DEFAULT_IMPLEMENTATION_PROFILE
+    assert json.loads(out)["idempotency_key"] == hpc.stable_key(workdir, "widgets", "implementation")
+
+
+@pytest.mark.parametrize("raw", ["TRUE", "yes", "1", ""])
+def test_qwen_canary_requires_exact_boolean_literal(raw):
+    with pytest.raises(hpc.CliUsageError):
+        hpc.build_parser().parse_args([
+            "create-implementation", "--workdir", "/w", "--feature", "f",
+            "--system-one-qwen-canary=" + raw,
+        ])
 
 
 def broken_rule(_features):

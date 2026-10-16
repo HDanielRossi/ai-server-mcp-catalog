@@ -1522,6 +1522,85 @@ optional typed arguments:
 - The actual assignee and all other task-creation behavior are unchanged. The
   adapter adds no database, Kanban write, or control plane.
 
+## S0.2 Qwen execution canary
+
+S0.2 keeps the S0.1b rule as the eligibility authority but permits one
+deliberate, reversible execution lane. `create-implementation` alone accepts
+the optional strict boolean `system_one_qwen_canary`. The adapter forwards it
+as `--system-one-qwen-canary=true|false`.
+
+- Omitted or `false` always assigns `coder-claude`.
+- `true` assigns `coder-qwen` only when the same declared scope resolves to
+  `QWEN_CANDIDATE`; missing, malformed, blocked, or ineligible inputs fail
+  closed to `coder-claude`.
+- For a selected Qwen task, the controller copies the eligible declared paths
+  and components into a `HERMES_SYSTEM_ONE_QWEN_CANARY_V1` body section. The
+  ready-to-commit gate rejects a Qwen task that lacks that scope marker or
+  whose latest worker profile differs from its task assignee.
+- A selected Qwen canary uses a separate idempotency identity. Toggling the
+  canary can therefore never replay a task created by the other worker lane;
+  the historical Claude idempotency key is unchanged.
+- Corrections never enter the Qwen lane. They remain assigned to
+  `coder-claude`.
+- `coder-qwen` must use the dedicated implementation-validation bridge and
+  cannot commit or push. The formal reviewer and human commit/push boundaries
+  are unchanged.
+
+The runtime profile is intentionally separate. Before enabling a live canary,
+an operator must use this exact sequence after the approved controller/adapter
+rollout has established source/runtime SHA-256 parity:
+
+```bash
+QWEN_PROFILE="$HOME/.hermes/profiles/coder-qwen"
+QWEN_STAGE="$(mktemp "$HOME/.hermes/.coder-qwen-config.XXXXXX")"
+test ! -e "$QWEN_PROFILE" || {
+  echo "refusing to replace an existing coder-qwen profile" >&2
+  exit 1
+}
+test -f "$HOME/.hermes/profiles/coder-claude/config.yaml" || {
+  echo "missing reviewed coder-claude baseline" >&2
+  exit 1
+}
+python3 - "$HOME/.hermes/profiles/coder-claude/config.yaml" "$QWEN_STAGE" <<'PY'
+from pathlib import Path
+import sys
+
+source, stage = map(Path, sys.argv[1:])
+text = source.read_text(encoding="utf-8")
+block = '''  claude_bridge:
+    command: /usr/local/lib/claude-bridge-mcp/.venv/bin/python
+    args:
+      - /usr/local/lib/claude-bridge-mcp/server.py
+    timeout: 1800
+    connect_timeout: 30
+'''
+if text.count(block) != 1:
+    raise SystemExit("refusing unexpected coder-claude bridge layout")
+stage.write_text(text.replace(block, ""), encoding="utf-8")
+PY
+cat templates/coder-qwen-implementation-validation.yaml >> "$QWEN_STAGE"
+install -d -m 0700 "$QWEN_PROFILE"
+install -m 0600 "$QWEN_STAGE" "$QWEN_PROFILE/config.yaml"
+install -m 0600 templates/coder-qwen-SOUL.md "$QWEN_PROFILE/SOUL.md"
+rm -f "$QWEN_STAGE"
+```
+
+The copied `coder-claude` baseline pins `model.default` to `qwen3.8:27b` and
+keeps the isolated CLI allowlist (`clarify`, `context_engine`, `kanban`, and
+`memory`), without a direct terminal, file, browser, web, code-execution, or
+delegation tool. Do not substitute a different model or toolset for the first
+canary. The resulting configuration must not mention `pipeline_controller`,
+`claude_bridge`, `review_bridge`, or `review_archive_bridge`. Then run:
+
+```bash
+env HOME="$HOME" bash scripts/audit-hermes-pipeline-hardening.sh --runtime
+```
+
+The runtime audit must pass before the explicit canary flag is used. This
+profile is created once, never overwritten by this procedure; a later update
+requires an explicit reviewed rollout. The source change alone does not alter
+an installed worker or route a task to Qwen.
+
 Installation implications: a deployed adapter and controller emit shadow
 records only when a caller passes shadow arguments. Changing either source
 file breaks the `--runtime` audit's source/runtime SHA-256 parity until the

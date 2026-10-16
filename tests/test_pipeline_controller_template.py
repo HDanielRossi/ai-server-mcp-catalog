@@ -363,6 +363,43 @@ def test_create_implementation_forwards_explicit_shadow_inputs(monkeypatch):
     assert captured["kwargs"]["shell"] is False
 
 
+def test_create_implementation_forwards_explicit_qwen_canary_opt_in(monkeypatch):
+    captured = _capture_argv(monkeypatch)
+    pipeline_controller_server._tool_create_implementation(
+        "/opt/ai/projects/demo", "feature-x", body="do the thing",
+        system_one_qwen_canary=True,
+        shadow_declared_paths=["src/app.py", "tests/test_app.py"],
+        shadow_components=["repository-source", "tests"],
+        shadow_mandatory_block=False,
+    )
+    assert captured["argv"] == [
+        CONTROLLER_PATH, "create-implementation",
+        "--workdir", "/opt/ai/projects/demo",
+        "--feature", "feature-x",
+        "--body", "do the thing",
+        "--system-one-qwen-canary=true",
+        "--shadow-declared-path=src/app.py",
+        "--shadow-declared-path=tests/test_app.py",
+        "--shadow-component=repository-source",
+        "--shadow-component=tests",
+        "--shadow-mandatory-block=false",
+    ]
+
+
+@pytest.mark.parametrize("canary, expected", [
+    (False, "--system-one-qwen-canary=false"),
+    (None, None),
+])
+def test_create_implementation_forwards_false_or_omits_unset_qwen_canary(monkeypatch, canary, expected):
+    captured = _capture_argv(monkeypatch)
+    pipeline_controller_server._tool_create_implementation(
+        "/opt/ai/projects/demo", "feature-x", body="do the thing",
+        system_one_qwen_canary=canary,
+    )
+    assert "--system-one-qwen-canary=true" not in captured["argv"]
+    assert ("--system-one-qwen-canary=false" in captured["argv"]) is (expected is not None)
+
+
 def test_create_correction_forwards_explicit_shadow_inputs(monkeypatch):
     captured = _capture_argv(monkeypatch)
     pipeline_controller_server._tool_create_correction(

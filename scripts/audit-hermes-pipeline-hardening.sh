@@ -59,6 +59,8 @@ Environment:
                           usr/local/bin/hermes-pipeline-controller
                           home/.hermes/profiles/coder/config.yaml
                           home/.hermes/profiles/coder-claude/config.yaml
+                          home/.hermes/profiles/coder-qwen/config.yaml
+                          home/.hermes/profiles/coder-qwen/SOUL.md
                           home/.hermes/profiles/planner-codex/config.yaml
                           home/.hermes/profiles/sysadmin/config.yaml
 
@@ -173,6 +175,8 @@ runtime_path() {
       pipeline_controller_binary)           echo "$root/usr/local/bin/hermes-pipeline-controller" ;;
       coder_config)           echo "$root/home/.hermes/profiles/coder/config.yaml" ;;
       coder_claude_config)    echo "$root/home/.hermes/profiles/coder-claude/config.yaml" ;;
+      coder_qwen_config)      echo "$root/home/.hermes/profiles/coder-qwen/config.yaml" ;;
+      coder_qwen_soul)        echo "$root/home/.hermes/profiles/coder-qwen/SOUL.md" ;;
       planner_codex_config)   echo "$root/home/.hermes/profiles/planner-codex/config.yaml" ;;
       sysadmin_config)        echo "$root/home/.hermes/profiles/sysadmin/config.yaml" ;;
     esac
@@ -192,6 +196,8 @@ runtime_path() {
       pipeline_controller_binary)           echo "/usr/local/bin/hermes-pipeline-controller" ;;
       coder_config)           echo "$HOME/.hermes/profiles/coder/config.yaml" ;;
       coder_claude_config)    echo "$HOME/.hermes/profiles/coder-claude/config.yaml" ;;
+      coder_qwen_config)      echo "$HOME/.hermes/profiles/coder-qwen/config.yaml" ;;
+      coder_qwen_soul)        echo "$HOME/.hermes/profiles/coder-qwen/SOUL.md" ;;
       planner_codex_config)   echo "$HOME/.hermes/profiles/planner-codex/config.yaml" ;;
       sysadmin_config)        echo "$HOME/.hermes/profiles/sysadmin/config.yaml" ;;
     esac
@@ -1809,6 +1815,26 @@ for line in lines[mcp_servers_idx + 1:]:
 PY
 }
 
+qwen_profile_toolsets_ok() {
+  local file="$1"
+  awk '
+    $0 == "platform_toolsets:" { inside = 1; next }
+    inside && /^[^[:space:]]/ { exit }
+    inside && /^  cli:$/ { cli = 1; next }
+    cli && /^  [^[:space:]]/ { exit }
+    cli && /^    - / { seen[$2] = 1; count += 1 }
+    END {
+      wanted["clarify"] = 1
+      wanted["context_engine"] = 1
+      wanted["kanban"] = 1
+      wanted["memory"] = 1
+      if (count != 4) exit 1
+      for (name in wanted) if (!(name in seen)) exit 1
+      for (name in seen) if (!(name in wanted)) exit 1
+    }
+  ' "$file"
+}
+
 hermes_config_has_mcp_servers_child() {
   local file="$1"
   local key="$2"
@@ -1959,7 +1985,7 @@ pipeline_controller_a7_runtime_audit() {
   fi
 
   local pair kind name cfg
-  for pair in reviewer_config:reviewer coder_config:coder coder_claude_config:coder-claude planner_codex_config:planner-codex sysadmin_config:sysadmin; do
+  for pair in reviewer_config:reviewer coder_config:coder coder_claude_config:coder-claude coder_qwen_config:coder-qwen planner_codex_config:planner-codex sysadmin_config:sysadmin; do
     kind="${pair%%:*}"
     name="${pair##*:}"
     cfg="$(runtime_path "$kind")"
@@ -2069,7 +2095,7 @@ run_a8_invariant_audit() {
   fi
 
   # INV-07: pipeline_controller forbidden in non-default profiles.
-  if a8_soul_has_exact_line "$soul" "A8-PROHIBIT-03: pipeline_controller is forbidden in profiles: reviewer, coder, coder-claude, planner-codex, sysadmin."; then
+  if a8_soul_has_exact_line "$soul" "A8-PROHIBIT-03: pipeline_controller is forbidden in profiles: reviewer, coder, coder-claude, coder-qwen, planner-codex, sysadmin."; then
     a8_report "INV-07" "pipeline_controller-forbidden-profiles" 0
   else
     a8_report "INV-07" "pipeline_controller-forbidden-profiles" 1 "$soul missing exact A8-PROHIBIT-03 marker line"
@@ -2255,7 +2281,7 @@ PY
     '`pipeline_controller` exposes exactly seven tools: `check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`.'
     'No MCP tool defined in this repository (`planner_bridge`, `pipeline_bridge`, `review_archive_bridge`, `pipeline_controller`, `review_bridge`, `claude_bridge`) is named `commit*`, `push*`, or `staging*`.'
     '`planner_bridge` remains planning-only: it never creates, checks, waits on, reviews, corrects, archives, or attests readiness for any Kanban task.'
-    '`pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, `coder-claude`, `planner-codex`, and `sysadmin` profiles.'
+    '`pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, `coder-claude`, `coder-qwen`, `planner-codex`, and `sysadmin` profiles.'
     'Commit approval requires one explicit human authorization; push approval requires a second, separate explicit human authorization.'
   )
 
@@ -2264,7 +2290,7 @@ PY
     '- `pipeline_controller` exposes exactly seven tools: `check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`. No MCP tool defined in this repository (`planner_bridge`, `pipeline_bridge`, `review_archive_bridge`, `pipeline_controller`, `review_bridge`, `claude_bridge`) is named `commit*`, `push*`, or `staging*`.'
     '- `pipeline_controller` exposes exactly seven tools: `check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`. No MCP tool defined in this repository (`planner_bridge`, `pipeline_bridge`, `review_archive_bridge`, `pipeline_controller`, `review_bridge`, `claude_bridge`) is named `commit*`, `push*`, or `staging*`.'
     '- `planner_bridge` remains planning-only: it never creates, checks, waits on, reviews, corrects, archives, or attests readiness for any Kanban task.'
-    '- `pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, `coder-claude`, `planner-codex`, and `sysadmin` profiles.'
+    '- `pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, `coder-claude`, `coder-qwen`, `planner-codex`, and `sysadmin` profiles.'
     '- `ready_to_commit` remains strictly read-only technical attestation (A5). Commit approval requires one explicit human authorization; push approval requires a second, separate explicit human authorization. Commit authorization never implies push authorization.'
   )
 
@@ -2349,6 +2375,8 @@ run_repo_only() {
   require_file_nonempty "templates/claude_bridge_server.py"
   require_file_nonempty "templates/implementation_validation_bridge_server.py"
   require_file_nonempty "templates/coder-claude-implementation-validation.yaml"
+  require_file_nonempty "templates/coder-qwen-implementation-validation.yaml"
+  require_file_nonempty "templates/coder-qwen-SOUL.md"
   require_file_nonempty "templates/planner_bridge_server.py"
   require_file_nonempty "scripts/planner-bridge"
   require_file_nonempty "tests/test_review_bridge_template.py"
@@ -2523,12 +2551,20 @@ run_repo_only() {
     if grep_ok "$VALIDATION_FILE" "$s"; then check_ok "implementation validation bridge contains: $s"; else check_fail "implementation validation bridge missing: $s"; fi
   done
   if grep -qF -- 'shell=True' "$VALIDATION_FILE" 2>/dev/null; then check_fail "implementation validation bridge contains shell=True"; else check_ok "implementation validation bridge contains no shell=True"; fi
-  PROFILE_FILE="$REPO_DIR/templates/coder-claude-implementation-validation.yaml"
-  for s in 'implementation_validation_bridge' '/usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python' '/usr/local/lib/implementation-validation-bridge-mcp/server.py'; do
-    if grep_ok "$PROFILE_FILE" "$s"; then check_ok "coder profile fragment contains: $s"; else check_fail "coder profile fragment missing: $s"; fi
+  local profile_fragment
+  for profile_fragment in \
+      "$REPO_DIR/templates/coder-claude-implementation-validation.yaml" \
+      "$REPO_DIR/templates/coder-qwen-implementation-validation.yaml"; do
+    for s in 'implementation_validation_bridge' '/usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python' '/usr/local/lib/implementation-validation-bridge-mcp/server.py'; do
+      if grep_ok "$profile_fragment" "$s"; then check_ok "$(basename "$profile_fragment") contains: $s"; else check_fail "$(basename "$profile_fragment") missing: $s"; fi
+    done
+    for s in 'review_bridge' 'pipeline_controller' 'archive_review' 'ready_to_commit' 'claude_bridge'; do
+      if grep -qF -- "$s" "$profile_fragment" 2>/dev/null; then check_fail "$(basename "$profile_fragment") exposes forbidden authority: $s"; else check_ok "$(basename "$profile_fragment") omits: $s"; fi
+    done
   done
-  for s in 'review_bridge' 'pipeline_controller' 'archive_review' 'ready_to_commit'; do
-    if grep -qF -- "$s" "$PROFILE_FILE" 2>/dev/null; then check_fail "coder profile fragment exposes forbidden authority: $s"; else check_ok "coder profile fragment omits: $s"; fi
+  QWEN_SOUL_FILE="$REPO_DIR/templates/coder-qwen-SOUL.md"
+  for s in 'HERMES_SYSTEM_ONE_QWEN_CANARY_V1' 'implementation_validation_bridge' 'Do not commit, push' 'formal reviewer remains authoritative'; do
+    if grep_ok "$QWEN_SOUL_FILE" "$s"; then check_ok "coder-qwen SOUL contains: $s"; else check_fail "coder-qwen SOUL missing: $s"; fi
   done
 
   echo
@@ -3007,6 +3043,40 @@ PY
     check_ok "coder-claude profile exposes the dedicated implementation-validation bridge"
   else
     check_fail "coder-claude profile does not expose the dedicated implementation-validation bridge"
+  fi
+
+  local coder_qwen_config coder_qwen_soul qwen_template qwen_source_sha qwen_runtime_sha
+  coder_qwen_config="$(runtime_path coder_qwen_config)"
+  coder_qwen_soul="$(runtime_path coder_qwen_soul)"
+  qwen_template="$REPO_DIR/templates/coder-qwen-SOUL.md"
+  if [[ ! -s "$coder_qwen_config" ]]; then
+    check_fail "coder-qwen profile config missing or empty at $coder_qwen_config"
+  elif ! grep_ok "$coder_qwen_config" \
+      'default: qwen3.8:27b' \
+      'implementation_validation_bridge:' \
+      '/usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python' \
+      '/usr/local/lib/implementation-validation-bridge-mcp/server.py'; then
+    check_fail "coder-qwen profile does not pin the approved model and dedicated implementation-validation bridge"
+  elif ! qwen_profile_toolsets_ok "$coder_qwen_config"; then
+    check_fail "coder-qwen profile toolsets are not the isolated coder-claude allowlist"
+  elif grep -qF -- 'pipeline_controller' "$coder_qwen_config" \
+      || grep -qF -- 'claude_bridge' "$coder_qwen_config" \
+      || grep -qF -- 'review_bridge' "$coder_qwen_config" \
+      || grep -qF -- 'review_archive_bridge' "$coder_qwen_config"; then
+    check_fail "coder-qwen profile config exposes forbidden control or review authority"
+  else
+    check_ok "coder-qwen profile pins the approved model and dedicated implementation-validation bridge without forbidden authority"
+  fi
+  if [[ ! -s "$qwen_template" || ! -s "$coder_qwen_soul" ]]; then
+    check_fail "coder-qwen SOUL source or runtime file missing:source=$qwen_template;runtime=$coder_qwen_soul"
+  else
+    qwen_source_sha="$(sha256_of "$qwen_template")"
+    qwen_runtime_sha="$(sha256_of "$coder_qwen_soul")"
+    if [[ "$qwen_source_sha" == "$qwen_runtime_sha" ]]; then
+      check_ok "coder-qwen SOUL source/runtime SHA-256 parity holds"
+    else
+      check_fail "coder-qwen SOUL SHA-256 mismatch:source=$qwen_source_sha;runtime=$qwen_runtime_sha"
+    fi
   fi
 
   echo

@@ -34,7 +34,7 @@ REQUIRED_MARKER_LINES = [
     ("INV-04", "A8-PROHIBIT-02: default profile MUST NOT register or use review_archive_bridge directly."),
     ("INV-05", "A8-ROLES-01: reviewer: read-only, uses review_bridge."),
     ("INV-06", "A8-ROLES-02: coder-claude: implementation, uses claude_bridge."),
-    ("INV-07", "A8-PROHIBIT-03: pipeline_controller is forbidden in profiles: reviewer, coder, coder-claude, planner-codex, sysadmin."),
+    ("INV-07", "A8-PROHIBIT-03: pipeline_controller is forbidden in profiles: reviewer, coder, coder-claude, coder-qwen, planner-codex, sysadmin."),
     ("INV-10", "A8-READY-01: READY_TO_COMMIT is read-only; no MCP tool performs a commit."),
     ("INV-11", "A8-PHASES-01: A8.1 = repository implementation. A8.2 = read-only review + archive + READY_TO_COMMIT + human commit/push. A8.3 = runtime policy/config rollout (separate human authorization)."),
     ("INV-12", "A8-TEMPLATE-01: This file is a versioned, installable TEMPLATE of the default profile SOUL policy. It is NOT the live executable SOUL and is not on any runtime path."),

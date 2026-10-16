@@ -255,6 +255,7 @@ def _tool_create_implementation(
     workdir: str,
     feature: str,
     body: str | None = None,
+    system_one_qwen_canary: ShadowBool = None,
     shadow_declared_paths: ShadowStrList = None,
     shadow_components: ShadowStrList = None,
     shadow_mandatory_block: ShadowBool = None,
@@ -263,11 +264,17 @@ def _tool_create_implementation(
     """Create an implementation task (`create-implementation`).
 
     The optional shadow_* inputs are forwarded verbatim as observe-only
-    S0.1b --shadow-* flags; omitted inputs are not forwarded.
+    S0.1b --shadow-* flags. ``system_one_qwen_canary`` is a separate,
+    explicit S0.2 opt-in; the controller still assigns Qwen only when the
+    declared scope itself classifies as QWEN_CANDIDATE.
     """
     argv_tail = ["--workdir", workdir, "--feature", feature]
     if body is not None:
         argv_tail += ["--body", body]
+    if system_one_qwen_canary is not None:
+        argv_tail.append(
+            "--system-one-qwen-canary=" + ("true" if system_one_qwen_canary else "false")
+        )
     argv_tail += _shadow_argv(
         shadow_declared_paths,
         shadow_components,

@@ -41,13 +41,12 @@ IMPLEMENTATION_VALIDATION_TEMPLATE_PATH = os.path.join(
 # 681834f1180145d5ced38e8e34f202a3c25f326a43d99344423c5a9970327eb9; this
 # value pins the post-S0.1b adapter bytes. Any further drift must again be
 # a reviewed change that re-pins this hash with its own justification.
-# S0.1b strict-validation re-pin: the shadow_* parameters were retyped to
-# Pydantic strict scalars (StrictBool, StrictStr) so MCP argument validation
-# rejects wrong-typed values instead of coercing them; the generated JSON
-# schema is unchanged. The previous post-S0.1b lock was
-# cdd600669f1eca9e249e822260bcfd178b589758483e771c659e48ddcb3815a4.
+# S0.2 re-pin: create_implementation gained the explicitly selected
+# system_one_qwen_canary pass-through. It does not add a tool or reimplement
+# controller policy, so the seven-tool surface remains frozen. The previous
+# strict-validation lock was cdd600669f1eca9e249e822260bcfd178b589758483e771c659e48ddcb3815a4.
 FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
-    "ab9abf6bf0e7b95630dc978e6b42a457bcd364dc50e2fbdc23185b7bf46da37a"
+    "c8418bdb87c0a64e5fdb69f8f04237c40fe9dca47461267c41b4b5ebce73d52d"
 )
 # S0.1b re-pin: scripts/hermes-pipeline-controller.py was intentionally
 # changed by the reviewed S0.1b shadow routing instrumentation (9299fe4,
@@ -57,9 +56,11 @@ FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
 # administrative-closure compatibility change (0f10c93) extended the accepted
 # terminal run statuses and therefore re-pins this value. Any further drift
 # must again be a reviewed change that re-pins this hash with its own
-# justification.
+# justification. S0.2 adds the fail-closed explicit Qwen canary selector,
+# declared-scope task marker, separate idempotency identity, and matching
+# task/run provenance check.
 FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256 = (
-    "3eb2727c370eca8c8c5122e1c1934b1500f94719df8dbf022e4e15852b90409a"
+    "1bf3ce33dfcb7adc2e5d639cb6b9d7852107714b880bb0e67be798c87a1fc3c0"
 )
 
 REPO_ONLY_FILES = [
@@ -69,6 +70,8 @@ REPO_ONLY_FILES = [
     os.path.join("templates", "claude_bridge_server.py"),
     os.path.join("templates", "implementation_validation_bridge_server.py"),
     os.path.join("templates", "coder-claude-implementation-validation.yaml"),
+    os.path.join("templates", "coder-qwen-implementation-validation.yaml"),
+    os.path.join("templates", "coder-qwen-SOUL.md"),
     os.path.join("templates", "planner_bridge_server.py"),
     os.path.join("scripts", "planner-bridge"),
     os.path.join("tests", "test_review_bridge_template.py"),
@@ -179,7 +182,7 @@ def _build_runtime_fixture(tmp_path, compliant=True):
     # invariant audit sees the real, currently-compliant repo SOUL text.
     shutil.copy(REVIEWER_SOUL_TEMPLATE_PATH, reviewer_dir / "SOUL.md")
 
-    # A7.1: coder/coder-claude/planner-codex/sysadmin profile configs are
+    # A7.1: coder/coder-claude/coder-qwen/planner-codex/sysadmin profile configs are
     # present (mirroring the reviewer profile), none registering the
     # default-only pipeline_controller MCP.
     for profile_name, mcp_entry in (
@@ -205,6 +208,29 @@ def _build_runtime_fixture(tmp_path, compliant=True):
         "    args:\n"
         "      - /usr/local/lib/implementation-validation-bridge-mcp/server.py\n",
         encoding="utf-8",
+    )
+
+    coder_qwen_dir = hermes_dir / "profiles" / "coder-qwen"
+    coder_qwen_dir.mkdir(parents=True, exist_ok=True)
+    (coder_qwen_dir / "config.yaml").write_text(
+        "model:\n"
+        "  default: qwen3.8:27b\n"
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - clarify\n"
+        "    - context_engine\n"
+        "    - kanban\n"
+        "    - memory\n"
+        "mcp_servers:\n"
+        "  implementation_validation_bridge:\n"
+        "    command: /usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python\n"
+        "    args:\n"
+        "      - /usr/local/lib/implementation-validation-bridge-mcp/server.py\n",
+        encoding="utf-8",
+    )
+    shutil.copy(
+        os.path.join(REPO_ROOT, "templates", "coder-qwen-SOUL.md"),
+        coder_qwen_dir / "SOUL.md",
     )
 
     validation_venv_dir = validation_dir / ".venv"
@@ -2075,7 +2101,7 @@ def test_a7_registration_nested_key_does_not_count(tmp_path):
 
 @pytest.mark.parametrize(
     "profile_name",
-    ["reviewer", "coder", "coder-claude", "planner-codex", "sysadmin"],
+    ["reviewer", "coder", "coder-claude", "coder-qwen", "planner-codex", "sysadmin"],
 )
 def test_a7_registration_forbidden_profile_fails(tmp_path, profile_name):
     fixture = _build_repo_fixture(tmp_path)
@@ -2116,6 +2142,67 @@ def test_a7_registration_forbidden_profile_fails(tmp_path, profile_name):
         f"{profile_name}:{profile_cfg}"
         in result.stdout
     )
+
+
+def test_runtime_qwen_profile_requires_pinned_model_and_validation_bridge(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    profile_cfg = _a7_profile_config(runtime_root, "coder-qwen")
+    profile_cfg.write_text("model:\n  default: qwen3.6:27b\n", encoding="utf-8")
+
+    result = _run(
+        ["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)}
+    )
+
+    assert result.returncode == 1
+    assert "coder-qwen profile does not pin the approved model and dedicated implementation-validation bridge" in result.stdout
+
+
+def test_runtime_qwen_profile_rejects_control_or_review_bridge(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    profile_cfg = _a7_profile_config(runtime_root, "coder-qwen")
+    with open(profile_cfg, "a", encoding="utf-8") as f:
+        f.write("  pipeline_controller:\n    enabled: true\n")
+
+    result = _run(
+        ["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)}
+    )
+
+    assert result.returncode == 1
+    assert "coder-qwen profile config exposes forbidden control or review authority" in result.stdout
+
+
+def test_runtime_qwen_profile_rejects_broad_toolsets(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    profile_cfg = _a7_profile_config(runtime_root, "coder-qwen")
+    text = profile_cfg.read_text(encoding="utf-8")
+    profile_cfg.write_text(
+        text.replace("    - memory\n", "    - memory\n    - terminal\n"), encoding="utf-8"
+    )
+
+    result = _run(
+        ["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)}
+    )
+
+    assert result.returncode == 1
+    assert "coder-qwen profile toolsets are not the isolated coder-claude allowlist" in result.stdout
+
+
+def test_runtime_qwen_soul_must_match_reviewed_source(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    runtime_root = _build_runtime_fixture(tmp_path, compliant=True)
+    qwen_soul = runtime_root / "home" / ".hermes" / "profiles" / "coder-qwen" / "SOUL.md"
+    with open(qwen_soul, "a", encoding="utf-8") as f:
+        f.write("\n# drift\n")
+
+    result = _run(
+        ["--runtime"], cwd=str(fixture), env_overrides={"AUDIT_RUNTIME_ROOT": str(runtime_root)}
+    )
+
+    assert result.returncode == 1
+    assert "coder-qwen SOUL SHA-256 mismatch" in result.stdout
 
 
 def test_a7_unrelated_mcp_children_remain_accepted(tmp_path):
@@ -2215,7 +2302,7 @@ A8_SOUL_MARKER_CASES = [
     ("INV-06", "coder-claude-role-boundary",
      "A8-ROLES-02: coder-claude: implementation, uses claude_bridge."),
     ("INV-07", "pipeline_controller-forbidden-profiles",
-     "A8-PROHIBIT-03: pipeline_controller is forbidden in profiles: reviewer, coder, coder-claude, planner-codex, sysadmin."),
+    "A8-PROHIBIT-03: pipeline_controller is forbidden in profiles: reviewer, coder, coder-claude, coder-qwen, planner-codex, sysadmin."),
     ("INV-10", "controller-lifecycle",
      "A8-OWNERSHIP-01: default is the sole owner of the Kanban graph (create, check, wait, review, correction, archive, READY_TO_COMMIT)."),
     ("INV-11", "no-direct-pipeline_bridge-instruction",
@@ -2247,7 +2334,7 @@ A8_CONTRACT_STRINGS = [
     "`planner_bridge` remains planning-only: it never creates, checks, waits on, "
     "reviews, corrects, archives, or attests readiness for any Kanban task.",
     "`pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, "
-    "`coder-claude`, `planner-codex`, and `sysadmin` profiles.",
+    "`coder-claude`, `coder-qwen`, `planner-codex`, and `sysadmin` profiles.",
     "Commit approval requires one explicit human authorization; push approval "
     "requires a second, separate explicit human authorization.",
 ]

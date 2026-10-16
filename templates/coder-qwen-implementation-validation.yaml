@@ -1,0 +1,9 @@
+# Operator-applied fragment for coder-qwen only. It exposes the same sandboxed
+# validation bridge as coder-claude and no lifecycle authority.
+mcp_servers:
+  implementation_validation_bridge:
+    command: /usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python
+    args:
+      - /usr/local/lib/implementation-validation-bridge-mcp/server.py
+    timeout: 370
+    connect_timeout: 30

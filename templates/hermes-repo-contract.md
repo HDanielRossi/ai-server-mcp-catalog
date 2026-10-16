@@ -214,6 +214,7 @@ It must not be registered in these Hermes profiles:
 - `reviewer`
 - `coder`
 - `coder-claude`
+- `coder-qwen`
 - `planner-codex`
 - `sysadmin`
 
@@ -245,8 +246,8 @@ The default profile's Kanban lifecycle ownership is exercised exclusively throug
 
 - `pipeline_controller` exposes exactly seven tools: `check_task`, `create_implementation`, `create_review`, `create_correction`, `wait_task`, `archive_review`, `ready_to_commit`. No MCP tool defined in this repository (`planner_bridge`, `pipeline_bridge`, `review_archive_bridge`, `pipeline_controller`, `review_bridge`, `claude_bridge`) is named `commit*`, `push*`, or `staging*`.
 - `planner_bridge` remains planning-only: it never creates, checks, waits on, reviews, corrects, archives, or attests readiness for any Kanban task.
-- `reviewer` remains read-only and uses only `review_bridge`. `coder-claude` implements only through `claude_bridge`. Neither role gains direct Kanban lifecycle authority.
-- `pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, `coder-claude`, `planner-codex`, and `sysadmin` profiles.
+- `reviewer` remains read-only and uses only `review_bridge`. `coder-claude` implements only through `claude_bridge`. `coder-qwen` is an explicitly selected System One canary worker and uses only the sandboxed `implementation_validation_bridge` for self-validation. None gains direct Kanban lifecycle authority.
+- `pipeline_controller` itself remains forbidden in the `reviewer`, `coder`, `coder-claude`, `coder-qwen`, `planner-codex`, and `sysadmin` profiles.
 - `ready_to_commit` remains strictly read-only technical attestation (A5). Commit approval requires one explicit human authorization; push approval requires a second, separate explicit human authorization. Commit authorization never implies push authorization.
 
 ### Phases
