@@ -1667,6 +1667,29 @@ from the expected revision, stop and investigate from this verified worktree;
 do not retry from an unspecified shell directory. The operator may remove the
 temporary worktree later through the normal reviewed cleanup procedure.
 
+## S0.4 — Minimal documentation-path expansion
+
+After the three consecutive, formally reviewed low-risk canaries, S0.4 is the
+single approved expansion: the dedicated Qwen write bridge allows exactly
+`app.py`, `tests/test_app.py`, and `README.md`. This is a three-path allowlist,
+not a pattern: every other path, including other Markdown files, configuration,
+CI, dependency, Git, profile, and secret paths remains rejected before a write.
+
+The first S0.4 task must be one pure helper change with direct tests and a
+small matching `README.md` usage update. It must declare the exact three paths
+and the three components `repository-source`, `tests`, and `documentation`.
+The bridge performs only an exact one-occurrence replacement; it has no shell,
+Git, subprocess, patch, commit, push, or task-lifecycle capability.
+
+Before dispatch, runtime audit and source/runtime SHA-256 parity must pass.
+The ready-to-commit controller still compares every reviewed changed path with
+the controller-authored declared-scope block. A scope escape, unauthorized
+mutation, review failure, test failure, sandbox violation, or parity mismatch
+immediately revokes S0.4 and restores the two-path allowlist by a separately
+reviewed operator rollout. Corrections remain Claude-only, and commit, push,
+and merge retain their separate human approvals. One successful S0.4 canary is
+evidence for review, not automatic authorization for another expansion.
+
 Installation implications: a deployed adapter and controller emit shadow
 records only when a caller passes shadow arguments. Changing either source
 file breaks the `--runtime` audit's source/runtime SHA-256 parity until the

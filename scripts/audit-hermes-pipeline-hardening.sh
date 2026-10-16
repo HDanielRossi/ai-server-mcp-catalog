@@ -2572,6 +2572,21 @@ run_repo_only() {
   done
 
   echo
+  echo "6b.1) System One Qwen S0.4 write-boundary contract:"
+  QWEN_WRITE_FILE="$REPO_DIR/templates/qwen_canary_write_bridge_server.py"
+  if grep_ok "$QWEN_WRITE_FILE" 'ALLOWED_PATHS = frozenset({"app.py", "tests/test_app.py", "README.md"})'; then
+    check_ok "Qwen write bridge pins the exact S0.4 three-path allowlist"
+  else
+    check_fail "Qwen write bridge does not pin the exact S0.4 three-path allowlist"
+  fi
+  for s in 'no shell, Git, subprocess, arbitrary path, or patch' 'path is outside the fixed canary allowlist' 'expected text must occur exactly once'; do
+    if grep_ok "$QWEN_WRITE_FILE" "$s"; then check_ok "Qwen write bridge contains: $s"; else check_fail "Qwen write bridge missing: $s"; fi
+  done
+  for s in 'import subprocess' 'subprocess.' 'shell=True' 'git '; do
+    if grep -qF -- "$s" "$QWEN_WRITE_FILE" 2>/dev/null; then check_fail "Qwen write bridge exposes forbidden execution capability: $s"; else check_ok "Qwen write bridge omits forbidden execution capability: $s"; fi
+  done
+
+  echo
   echo "6a) planner-bridge MCP server template (templates/planner_bridge_server.py) — A3.5.0 bootstrap:"
   PLANNER_SERVER_FILE="$REPO_DIR/templates/planner_bridge_server.py"
   PLANNER_SERVER_STRINGS=(
