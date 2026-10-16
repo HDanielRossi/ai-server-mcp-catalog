@@ -217,6 +217,8 @@ def validate_qwen_canary_serial(workdir, python_paths, test_paths, timeout=DEFAU
 
 mcp_server = MCPServer("implementation-validation-bridge")
 qwen_canary_mcp_server = MCPServer("qwen-canary-validation-bridge")
+_qwen_canary_validation_lock = threading.Lock()
+_qwen_canary_validation_consumed = False
 
 
 @mcp_server.tool(name="validate")
@@ -225,7 +227,18 @@ def _tool_validate(operation, workdir, paths=None, timeout=DEFAULT_TIMEOUT_SECON
 
 
 @qwen_canary_mcp_server.tool(name="validate_qwen_canary_serial")
-def _tool_validate_qwen_canary_serial(workdir, python_paths, test_paths, timeout=DEFAULT_TIMEOUT_SECONDS):
+def _tool_validate_qwen_canary_serial(
+    workdir: str,
+    python_paths: list[str],
+    test_paths: list[str],
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+):
+    """Execute the sole permitted Qwen validation request for this server run."""
+    global _qwen_canary_validation_consumed
+    with _qwen_canary_validation_lock:
+        if _qwen_canary_validation_consumed:
+            raise ValidationBridgeError("Qwen canary serial validation may be invoked only once per server run")
+        _qwen_canary_validation_consumed = True
     return validate_qwen_canary_serial(workdir, python_paths, test_paths, timeout)
 
 

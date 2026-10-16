@@ -1,6 +1,7 @@
 """Hermetic security and contract tests for the implementation validator."""
 
 import importlib.util
+import inspect
 import os
 import subprocess
 import sys
@@ -160,6 +161,33 @@ def test_qwen_only_server_mode_exposes_only_the_qwen_server(monkeypatch):
     bridge.run_server()
 
     assert called == ["qwen"]
+
+
+def test_qwen_serial_tool_declares_native_array_arguments():
+    params = inspect.signature(bridge._tool_validate_qwen_canary_serial).parameters
+    assert params["workdir"].annotation is str
+    assert params["python_paths"].annotation == list[str]
+    assert params["test_paths"].annotation == list[str]
+    assert params["timeout"].annotation is int
+
+
+def test_qwen_serial_tool_consumes_its_single_invocation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bridge, "_qwen_canary_validation_consumed", False)
+    monkeypatch.setattr(
+        bridge,
+        "validate_qwen_canary_serial",
+        lambda *args: calls.append(args) or {"passed": True},
+    )
+
+    assert bridge._tool_validate_qwen_canary_serial(
+        "/opt/ai/projects/example", ["app.py"], ["tests/test_app.py"]
+    ) == {"passed": True}
+    with pytest.raises(bridge.ValidationBridgeError, match="only once"):
+        bridge._tool_validate_qwen_canary_serial(
+            "/opt/ai/projects/example", ["app.py"], ["tests/test_app.py"]
+        )
+    assert len(calls) == 1
 
 
 def test_no_caller_command_or_environment_and_read_only_git():
