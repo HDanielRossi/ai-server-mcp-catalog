@@ -1552,6 +1552,9 @@ as `--system-one-qwen-canary=true|false`.
   the first failed step. Its `hermes.qwen-canary-validation/v1` envelope must
   be attached verbatim as `validation` in the exact
   `hermes.qwen-canary-completion/v1` Qwen task-completion metadata;
+  it must be passed as a native `metadata` object, not a serialized JSON
+  string. A rejected completion blocks the worker immediately: it must not
+  retry with substitute metadata or complete without the envelope.
   `ready-to-commit`
   rejects absent, reordered, failed, or scope-mismatched evidence. The formal
   reviewer and human commit/push boundaries are unchanged.
