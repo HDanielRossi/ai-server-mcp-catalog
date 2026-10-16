@@ -1626,6 +1626,47 @@ fixed pilot scope. Even after the threshold, promotion may only authorize a
 new reviewed scope; it never grants Qwen direct lifecycle, commit, or push
 authority.
 
+### S0.3.1 Post-merge verification worktree
+
+`git worktree add` creates a checkout but deliberately does **not** change the
+current shell directory. Therefore a `pytest` command issued immediately after
+it, without an explicit `cd`, may test the caller's older checkout instead of
+the just-created post-merge worktree. A lower test count in that situation is
+not pytest collection evidence and must not be recorded as a canary failure or
+success.
+
+For every post-merge verification, bind both the Git identity and the process
+working directory before collecting or executing tests. Substitute the remote
+tracking ref with the approved integration ref when it differs:
+
+```bash
+set -Eeuo pipefail
+REPO=/opt/ai/projects/agent-pipeline-test
+REF=beor-pilot/main
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+VERIFY_WORKTREE="/opt/ai/projects/.system-one-postmerge-$STAMP"
+PYTEST=/home/hdgr/.hermes/hermes-agent/venv/bin/python3
+
+git -C "$REPO" fetch beor-pilot main
+EXPECTED_REV=$(git -C "$REPO" rev-parse "$REF")
+git -C "$REPO" worktree add --detach "$VERIFY_WORKTREE" "$EXPECTED_REV"
+VERIFY_WORKTREE=$(realpath -e "$VERIFY_WORKTREE")
+
+(
+  cd -- "$VERIFY_WORKTREE"
+  test "$(git rev-parse --show-toplevel)" = "$VERIFY_WORKTREE"
+  test "$(git rev-parse HEAD)" = "$EXPECTED_REV"
+  printf 'verified worktree=%s rev=%s\n' "$PWD" "$(git rev-parse HEAD)"
+  "$PYTEST" -m pytest --collect-only -q
+  "$PYTEST" -m pytest -q
+)
+```
+
+Keep the command output with the canary evidence. If collection count differs
+from the expected revision, stop and investigate from this verified worktree;
+do not retry from an unspecified shell directory. The operator may remove the
+temporary worktree later through the normal reviewed cleanup procedure.
+
 Installation implications: a deployed adapter and controller emit shadow
 records only when a caller passes shadow arguments. Changing either source
 file breaks the `--runtime` audit's source/runtime SHA-256 parity until the
