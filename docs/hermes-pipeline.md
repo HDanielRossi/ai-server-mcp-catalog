@@ -1544,13 +1544,17 @@ as `--system-one-qwen-canary=true|false`.
   idempotency key.
 - Corrections never enter the Qwen lane. They remain assigned to
   `coder-claude`.
-- `coder-qwen` must use the dedicated implementation-validation bridge and
-  cannot commit or push. The formal reviewer and human commit/push boundaries
-  are unchanged.
-- Qwen validation calls are serial, never parallel: first `git_diff_check`,
-  then `py_compile` for each changed Python path, then `pytest_targeted` for
-  the declared test path, and finally `pytest_full`. A failure or block ends
-  validation immediately and is reported as evidence.
+- `coder-qwen` receives only the dedicated fixed serial-validation tool,
+  `validate_qwen_canary_serial`, and cannot commit or push. It does not expose
+  the generic validation-operation selector. The tool internally runs
+  `git_diff_check`, `py_compile` for every changed Python path,
+  `pytest_targeted` for the declared test path, and `pytest_full`, stopping at
+  the first failed step. Its `hermes.qwen-canary-validation/v1` envelope must
+  be attached verbatim as `validation` in the exact
+  `hermes.qwen-canary-completion/v1` Qwen task-completion metadata;
+  `ready-to-commit`
+  rejects absent, reordered, failed, or scope-mismatched evidence. The formal
+  reviewer and human commit/push boundaries are unchanged.
 
 The runtime profile is intentionally separate. Before enabling a live canary,
 an operator must use this exact sequence after the approved controller/adapter

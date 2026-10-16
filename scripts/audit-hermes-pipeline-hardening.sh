@@ -2566,8 +2566,13 @@ run_repo_only() {
       if grep -qF -- "$s" "$profile_fragment" 2>/dev/null; then check_fail "$(basename "$profile_fragment") exposes forbidden authority: $s"; else check_ok "$(basename "$profile_fragment") omits: $s"; fi
     done
   done
+  if grep_ok "$REPO_DIR/templates/coder-qwen-implementation-validation.yaml" '--qwen-canary-only'; then
+    check_ok "coder-qwen-implementation-validation.yaml selects the fixed Qwen-only validator"
+  else
+    check_fail "coder-qwen-implementation-validation.yaml does not select the fixed Qwen-only validator"
+  fi
   QWEN_SOUL_FILE="$REPO_DIR/templates/coder-qwen-SOUL.md"
-  for s in 'HERMES_SYSTEM_ONE_QWEN_CANARY_V1' 'mcp__implementation_validation_bridge__validate' 'qwen_canary_write_bridge' 'Do not commit, push' 'formal reviewer remains authoritative' 'Validation policy: strictly one at a time; serial order is `git_diff_check`, then `py_compile` for every changed Python path, then `pytest_targeted` for the declared test path, then `pytest_full`.' 'parallel validation-bridge calls' 'Stop at the first failed or blocked'; do
+  for s in 'HERMES_SYSTEM_ONE_QWEN_CANARY_V1' 'validate_qwen_canary_serial' 'qwen_canary_write_bridge' 'Do not commit, push' 'formal reviewer remains authoritative' 'This fixed tool runs `git_diff_check`,' '`py_compile`, `pytest_targeted`, and `pytest_full` in that order' 'Never invoke generic `validate`' 'unsupported `git_status`/`git_diff`' 'hermes.qwen-canary-completion/v1' 'hermes.qwen-canary-validation/v1'; do
     if grep_ok "$QWEN_SOUL_FILE" "$s"; then check_ok "coder-qwen SOUL contains: $s"; else check_fail "coder-qwen SOUL missing: $s"; fi
   done
 
@@ -3075,6 +3080,7 @@ PY
       'implementation_validation_bridge:' \
       '/usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python' \
       '/usr/local/lib/implementation-validation-bridge-mcp/server.py' \
+      '--qwen-canary-only' \
       'qwen_canary_write_bridge:' \
       '/usr/local/lib/qwen-canary-write-bridge-mcp/server.py'; then
     check_fail "coder-qwen profile does not pin the approved model and dedicated canary bridges"

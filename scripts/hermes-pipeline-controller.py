@@ -93,6 +93,9 @@ SYSTEM_ONE_QWEN_CANARY_FLAG = "--system-one-qwen-canary"
 DEFAULT_IMPLEMENTATION_PROFILE = "coder-claude"
 SYSTEM_ONE_QWEN_PROFILE = "coder-qwen"
 QWEN_CANARY_SCOPE_MARKER = "HERMES_SYSTEM_ONE_QWEN_CANARY_V1"
+QWEN_CANARY_COMPLETION_SCHEMA = "hermes.qwen-canary-completion/v1"
+QWEN_CANARY_VALIDATION_SCHEMA = "hermes.qwen-canary-validation/v1"
+IMPLEMENTATION_VALIDATION_SCHEMA = "hermes.implementation-validation/v1"
 SHADOW_ARG_DESTS = (
     "shadow_declared_path", "shadow_component",
     "shadow_mandatory_block", "shadow_mandatory_block_reason",
@@ -1084,6 +1087,57 @@ def _validate_qwen_canary_changed_paths(task, changed_paths):
             "qwen_canary_changed_paths_out_of_scope",
             "Qwen canary changed paths are outside its declared scope",
         )
+
+
+def _validate_qwen_canary_validation_metadata(run, task_id, canonical_workdir, changed_paths):
+    """Require the fixed serial-validation envelope from a Qwen completion."""
+    metadata = run.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ReadyToCommitReject("qwen_canary_validation_metadata_missing", "Qwen completion metadata must be an object")
+    if set(metadata) != {"schema", "implementation_task_id", "validation"}:
+        raise ReadyToCommitReject("qwen_canary_validation_metadata_keys", "Qwen completion metadata keys are not exact")
+    if metadata.get("schema") != QWEN_CANARY_COMPLETION_SCHEMA:
+        raise ReadyToCommitReject("qwen_canary_validation_metadata_schema", "Qwen completion metadata schema is invalid")
+    if metadata.get("implementation_task_id") != task_id:
+        raise ReadyToCommitReject("qwen_canary_validation_task_mismatch", "Qwen completion metadata task id is invalid")
+
+    validation = metadata.get("validation")
+    if not isinstance(validation, dict) or set(validation) != {"schema", "workdir", "passed", "failed_operation", "steps"}:
+        raise ReadyToCommitReject("qwen_canary_validation_envelope_shape", "Qwen validation envelope shape is invalid")
+    if (
+        validation.get("schema") != QWEN_CANARY_VALIDATION_SCHEMA
+        or validation.get("workdir") != canonical_workdir
+        or validation.get("passed") is not True
+        or validation.get("failed_operation") is not None
+    ):
+        raise ReadyToCommitReject("qwen_canary_validation_envelope_invalid", "Qwen validation envelope is not a successful canonical result")
+
+    expected_python_paths = sorted(path for path in changed_paths if path.endswith(".py"))
+    expected_test_paths = sorted(path for path in changed_paths if path.startswith("tests/") and path.endswith(".py"))
+    expected_steps = (
+        ("git_diff_check", []),
+        ("py_compile", expected_python_paths),
+        ("pytest_targeted", expected_test_paths),
+        ("pytest_full", []),
+    )
+    steps = validation.get("steps")
+    if not isinstance(steps, list) or len(steps) != len(expected_steps):
+        raise ReadyToCommitReject("qwen_canary_validation_step_count", "Qwen validation must contain exactly four fixed steps")
+    for step, (operation, paths) in zip(steps, expected_steps):
+        if not isinstance(step, dict):
+            raise ReadyToCommitReject("qwen_canary_validation_step_shape", "Qwen validation step is not an object")
+        if (
+            step.get("schema") != IMPLEMENTATION_VALIDATION_SCHEMA
+            or step.get("operation") != operation
+            or step.get("workdir") != canonical_workdir
+            or step.get("paths") != paths
+            or step.get("timed_out") is not False
+            or step.get("exit_code") != 0
+        ):
+            raise ReadyToCommitReject(
+                "qwen_canary_validation_step_invalid",
+                "Qwen validation step is not a successful fixed-sequence result",
+            )
 
 
 def _shadow_route_hook(args, argv, resolved):
@@ -2322,6 +2376,9 @@ def ready_to_commit(args):
         )
     if impl_task.get("assignee") == SYSTEM_ONE_QWEN_PROFILE:
         _validate_qwen_canary_changed_paths(impl_task, current_state.get("changed_paths"))
+        _validate_qwen_canary_validation_metadata(
+            impl_latest, implementation_task_id, canonical_workdir, current_state.get("changed_paths"),
+        )
     if bootstrap_state is not None and current_state != bootstrap_state:
         raise ReadyToCommitReject(
             "bootstrap_repository_state_mismatch",

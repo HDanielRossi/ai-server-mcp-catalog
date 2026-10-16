@@ -234,6 +234,7 @@ def _build_runtime_fixture(tmp_path, compliant=True):
         "    command: /usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python\n"
         "    args:\n"
         "      - /usr/local/lib/implementation-validation-bridge-mcp/server.py\n"
+        "      - --qwen-canary-only\n"
         "  qwen_canary_write_bridge:\n"
         "    command: /usr/local/lib/implementation-validation-bridge-mcp/.venv/bin/python\n"
         "    args:\n"
@@ -2167,7 +2168,7 @@ def test_runtime_qwen_profile_requires_pinned_model_and_validation_bridge(tmp_pa
     )
 
     assert result.returncode == 1
-    assert "coder-qwen profile does not pin the approved model and dedicated implementation-validation bridge" in result.stdout
+    assert "coder-qwen profile does not pin the approved model and dedicated canary bridges" in result.stdout
 
 
 def test_runtime_qwen_profile_rejects_control_or_review_bridge(tmp_path):
@@ -2222,14 +2223,14 @@ def test_repo_qwen_soul_requires_serial_validation_policy(tmp_path):
     qwen_soul = fixture / "templates" / "coder-qwen-SOUL.md"
     _mutate_file(
         qwen_soul,
-        "Validation policy: strictly one at a time; serial order is `git_diff_check`, then `py_compile` for every changed Python path, then `pytest_targeted` for the declared test path, then `pytest_full`.\n",
+        "   `mcp__implementation_validation_bridge__validate_qwen_canary_serial` call\n",
         "",
     )
 
     result = _run(["--repo-only"], cwd=str(fixture))
 
     assert result.returncode == 1
-    assert "coder-qwen SOUL missing: Validation policy: strictly one at a time" in result.stdout
+    assert "coder-qwen SOUL missing: validate_qwen_canary_serial" in result.stdout
 
 
 def test_a7_unrelated_mcp_children_remain_accepted(tmp_path):

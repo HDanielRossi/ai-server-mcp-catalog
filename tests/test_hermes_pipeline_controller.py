@@ -2332,6 +2332,39 @@ def make_impl_run_for(**overrides):
     return r
 
 
+def make_qwen_validation_metadata(workdir, changed_paths, **overrides):
+    python_paths = sorted(path for path in changed_paths if path.endswith(".py"))
+    test_paths = sorted(path for path in changed_paths if path.startswith("tests/") and path.endswith(".py"))
+    steps = []
+    for operation, paths in (
+        ("git_diff_check", []),
+        ("py_compile", python_paths),
+        ("pytest_targeted", test_paths),
+        ("pytest_full", []),
+    ):
+        steps.append({
+            "schema": hpc.IMPLEMENTATION_VALIDATION_SCHEMA,
+            "operation": operation,
+            "workdir": str(workdir),
+            "paths": paths,
+            "exit_code": 0,
+            "timed_out": False,
+        })
+    metadata = {
+        "schema": hpc.QWEN_CANARY_COMPLETION_SCHEMA,
+        "implementation_task_id": RTC_IMPL_ID,
+        "validation": {
+            "schema": hpc.QWEN_CANARY_VALIDATION_SCHEMA,
+            "workdir": str(workdir),
+            "passed": True,
+            "failed_operation": None,
+            "steps": steps,
+        },
+    }
+    metadata.update(overrides)
+    return metadata
+
+
 def make_impl_show_for(workdir, runs=None, task_overrides=None):
     task = make_impl_task_for(workdir, **(task_overrides or {}))
     if runs is None:
@@ -2381,6 +2414,31 @@ def test_qwen_canary_changed_paths_must_be_nonempty_and_declared(tmp_path):
         hpc._validate_qwen_canary_changed_paths(task, [])
     with pytest.raises(hpc.ReadyToCommitReject, match="outside its declared scope"):
         hpc._validate_qwen_canary_changed_paths(task, [".github/workflows/deploy.yml"])
+
+
+def test_qwen_canary_requires_successful_fixed_validation_metadata(tmp_path):
+    workdir = tmp_path / "qwen-validation"
+    workdir.mkdir()
+    changed_paths = ["README.md", "app.py", "tests/test_app.py"]
+    run = make_impl_run_for(
+        profile=hpc.SYSTEM_ONE_QWEN_PROFILE,
+        metadata=make_qwen_validation_metadata(workdir, changed_paths),
+    )
+    hpc._validate_qwen_canary_validation_metadata(run, RTC_IMPL_ID, str(workdir), changed_paths)
+
+    run["metadata"]["validation"]["steps"][1]["exit_code"] = 1
+    with pytest.raises(hpc.ReadyToCommitReject, match="step is not a successful"):
+        hpc._validate_qwen_canary_validation_metadata(run, RTC_IMPL_ID, str(workdir), changed_paths)
+
+
+def test_qwen_canary_rejects_missing_validation_metadata(tmp_path):
+    workdir = tmp_path / "qwen-validation-missing"
+    workdir.mkdir()
+    run = make_impl_run_for(profile=hpc.SYSTEM_ONE_QWEN_PROFILE)
+    with pytest.raises(hpc.ReadyToCommitReject, match="metadata must be an object"):
+        hpc._validate_qwen_canary_validation_metadata(
+            run, RTC_IMPL_ID, str(workdir), ["app.py", "tests/test_app.py"]
+        )
 
 
 def make_review_task_for(workdir, **overrides):

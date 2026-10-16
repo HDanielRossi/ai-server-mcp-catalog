@@ -10,6 +10,7 @@ semantics.
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -22,6 +23,7 @@ MAX_OUTPUT_CHARS = 16_000
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_SECONDS = 900
 RESULT_SCHEMA = "hermes.implementation-validation/v1"
+QWEN_CANARY_RESULT_SCHEMA = "hermes.qwen-canary-validation/v1"
 PYTHON = "/home/hdgr/.hermes/hermes-agent/venv/bin/python3"
 AUDIT_SCRIPT = "./scripts/audit-hermes-pipeline-hardening.sh"
 
@@ -172,7 +174,49 @@ def validate(operation, workdir, paths=None, timeout=DEFAULT_TIMEOUT_SECONDS):
     return result
 
 
+def validate_qwen_canary_serial(workdir, python_paths, test_paths, timeout=DEFAULT_TIMEOUT_SECONDS):
+    """Run the fixed Qwen canary validation sequence as one fail-closed call.
+
+    Qwen receives this entrypoint instead of the generic operation selector.
+    The caller cannot choose an operation, reorder steps, or continue after a
+    failing step.  The returned envelope is suitable for the task-completion
+    metadata checked by the pipeline controller.
+    """
+    repo = validate_workdir(workdir)
+    python_paths = validate_paths(python_paths, repo)
+    if any(not path.endswith(".py") for path in python_paths):
+        raise ValidationBridgeError("qwen canary Python paths must end in .py")
+    test_paths = validate_paths(test_paths, repo, require_tests=True)
+
+    sequence = (
+        ("git_diff_check", []),
+        ("py_compile", python_paths),
+        ("pytest_targeted", test_paths),
+        ("pytest_full", []),
+    )
+    steps = []
+    for operation, paths in sequence:
+        result = validate(operation, str(repo), paths or None, timeout)
+        steps.append(result)
+        if result["timed_out"] or result["exit_code"] != 0:
+            return {
+                "schema": QWEN_CANARY_RESULT_SCHEMA,
+                "workdir": str(repo),
+                "passed": False,
+                "failed_operation": operation,
+                "steps": steps,
+            }
+    return {
+        "schema": QWEN_CANARY_RESULT_SCHEMA,
+        "workdir": str(repo),
+        "passed": True,
+        "failed_operation": None,
+        "steps": steps,
+    }
+
+
 mcp_server = MCPServer("implementation-validation-bridge")
+qwen_canary_mcp_server = MCPServer("qwen-canary-validation-bridge")
 
 
 @mcp_server.tool(name="validate")
@@ -180,7 +224,17 @@ def _tool_validate(operation, workdir, paths=None, timeout=DEFAULT_TIMEOUT_SECON
     return validate(operation, workdir, paths, timeout)
 
 
+@qwen_canary_mcp_server.tool(name="validate_qwen_canary_serial")
+def _tool_validate_qwen_canary_serial(workdir, python_paths, test_paths, timeout=DEFAULT_TIMEOUT_SECONDS):
+    return validate_qwen_canary_serial(workdir, python_paths, test_paths, timeout)
+
+
 def run_server():
+    if sys.argv[1:] == ["--qwen-canary-only"]:
+        qwen_canary_mcp_server.run()
+        return
+    if len(sys.argv) != 1:
+        raise SystemExit("usage: server.py [--qwen-canary-only]")
     mcp_server.run()
 
 

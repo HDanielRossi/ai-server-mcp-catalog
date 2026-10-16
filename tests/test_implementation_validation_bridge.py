@@ -3,6 +3,7 @@
 import importlib.util
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ def repo(tmp_path):
     path = tmp_path / "repo"
     path.mkdir()
     (path / ".git").mkdir()
+    (path / "app.py").write_text("VALUE = 1\n")
     (path / "tests").mkdir()
     (path / "tests" / "test_ok.py").write_text("assert True\n")
     return path
@@ -82,6 +84,82 @@ def test_compile_failure_is_reported_without_writing_bytecode_to_worktree(tmp_pa
     assert result["exit_code"] != 0
     assert "SyntaxError" in result["stderr"]
     assert not list(worktree.rglob("*.pyc"))
+
+
+def test_qwen_canary_serial_validation_uses_fixed_order_and_stops_on_failure(tmp_path, monkeypatch):
+    worktree = repo(tmp_path)
+    monkeypatch.setattr(bridge, "ALLOWED_ROOT", tmp_path.resolve())
+    calls = []
+
+    def fake_validate(operation, workdir, paths=None, timeout=bridge.DEFAULT_TIMEOUT_SECONDS):
+        calls.append((operation, paths or []))
+        return {
+            "schema": bridge.RESULT_SCHEMA,
+            "operation": operation,
+            "workdir": workdir,
+            "paths": paths or [],
+            "exit_code": 1 if operation == "py_compile" else 0,
+            "timed_out": False,
+        }
+
+    monkeypatch.setattr(bridge, "validate", fake_validate)
+    result = bridge.validate_qwen_canary_serial(
+        str(worktree), ["app.py", "tests/test_ok.py"], ["tests/test_ok.py"]
+    )
+
+    assert calls == [
+        ("git_diff_check", []),
+        ("py_compile", ["app.py", "tests/test_ok.py"]),
+    ]
+    assert result["schema"] == bridge.QWEN_CANARY_RESULT_SCHEMA
+    assert result["passed"] is False
+    assert result["failed_operation"] == "py_compile"
+    assert [step["operation"] for step in result["steps"]] == ["git_diff_check", "py_compile"]
+
+
+def test_qwen_canary_serial_validation_returns_full_passed_envelope(tmp_path, monkeypatch):
+    worktree = repo(tmp_path)
+    monkeypatch.setattr(bridge, "ALLOWED_ROOT", tmp_path.resolve())
+
+    def fake_validate(operation, workdir, paths=None, timeout=bridge.DEFAULT_TIMEOUT_SECONDS):
+        return {
+            "schema": bridge.RESULT_SCHEMA,
+            "operation": operation,
+            "workdir": workdir,
+            "paths": paths or [],
+            "exit_code": 0,
+            "timed_out": False,
+        }
+
+    monkeypatch.setattr(bridge, "validate", fake_validate)
+    result = bridge.validate_qwen_canary_serial(
+        str(worktree), ["app.py", "tests/test_ok.py"], ["tests/test_ok.py"]
+    )
+
+    assert result["passed"] is True
+    assert result["failed_operation"] is None
+    assert [step["operation"] for step in result["steps"]] == [
+        "git_diff_check", "py_compile", "pytest_targeted", "pytest_full",
+    ]
+
+
+def test_qwen_canary_serial_validation_rejects_non_python_compile_paths(tmp_path, monkeypatch):
+    worktree = repo(tmp_path)
+    (worktree / "README.md").write_text("docs\n")
+    monkeypatch.setattr(bridge, "ALLOWED_ROOT", tmp_path.resolve())
+    with pytest.raises(bridge.ValidationBridgeError, match="must end in .py"):
+        bridge.validate_qwen_canary_serial(str(worktree), ["README.md"], ["tests/test_ok.py"])
+
+
+def test_qwen_only_server_mode_exposes_only_the_qwen_server(monkeypatch):
+    called = []
+    monkeypatch.setattr(bridge.mcp_server, "run", lambda: called.append("generic"))
+    monkeypatch.setattr(bridge.qwen_canary_mcp_server, "run", lambda: called.append("qwen"))
+    monkeypatch.setattr(sys, "argv", ["server.py", "--qwen-canary-only"])
+
+    bridge.run_server()
+
+    assert called == ["qwen"]
 
 
 def test_no_caller_command_or_environment_and_read_only_git():
