@@ -1196,6 +1196,13 @@ The MCP server is named `pipeline-controller` and exposes exactly these seven to
 | `archive_review` | `archive-review` | Deterministically archive a completed reviewer task. |
 | `ready_to_commit` | `ready-to-commit` | Read-only technical attestation that a workdir is ready to commit. |
 
+The read-only `check` command accepts terminal Kanban run statuses `done`,
+`blocked`, and `completed`. Worker-owned runs normally use `done` or
+`blocked`; `completed` is the administrative run status written by
+`hermes kanban complete` when an operator closes a task after independently
+verifying its evidence. Downstream formal review and READY_TO_COMMIT gates
+retain their stricter phase-specific status and outcome requirements.
+
 No other tool exists: there is no arbitrary command, argv, executable, or shell-command tool, and no `git add`/`git commit`/`git push`/reset/restore/checkout tool. The adapter has exactly one subprocess execution point, and it is always `[CONTROLLER_PATH, <subcommand>, ...]` with `shell=False`.
 
 ### Execution boundary

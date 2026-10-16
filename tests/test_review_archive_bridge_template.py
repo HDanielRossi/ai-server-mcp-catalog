@@ -110,6 +110,47 @@ def make_db(
     return db
 
 
+def test_resolve_kanban_db_path_uses_persisted_active_board(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    board = "system-one-pilot"
+    expected = hermes_home / "kanban" / "boards" / board / "kanban.db"
+    current = hermes_home / "kanban" / "current"
+    current.parent.mkdir(parents=True)
+    current.write_text(board + "\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setattr(archive, "KANBAN_HOME", hermes_home)
+    monkeypatch.setattr(archive, "KANBAN_DB", hermes_home / "kanban.db")
+
+    assert archive.resolve_kanban_db_path() == expected
+
+
+def test_resolve_kanban_db_path_env_board_overrides_current(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    current = hermes_home / "kanban" / "current"
+    current.parent.mkdir(parents=True)
+    current.write_text("current-board\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "env-board")
+    monkeypatch.setattr(archive, "KANBAN_HOME", hermes_home)
+    monkeypatch.setattr(archive, "KANBAN_DB", hermes_home / "kanban.db")
+
+    assert archive.resolve_kanban_db_path() == (
+        hermes_home / "kanban" / "boards" / "env-board" / "kanban.db"
+    )
+
+
+def test_resolve_kanban_db_path_rejects_invalid_active_board(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "../other-board")
+    monkeypatch.setattr(archive, "KANBAN_HOME", hermes_home)
+    monkeypatch.setattr(archive, "KANBAN_DB", hermes_home / "kanban.db")
+
+    with pytest.raises(ArchiveValidationError, match="invalid active Kanban board"):
+        archive.resolve_kanban_db_path()
+
+
 def repository_state(repo):
     empty_sha = hashlib.sha256(
         b""

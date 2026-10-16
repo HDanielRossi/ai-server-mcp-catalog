@@ -157,6 +157,21 @@ repository_state_sha256 string returned by that final call verbatim into
 the completion metadata — byte-for-byte, with no summarization,
 truncation, retyping, or reformatting.
 
+For every formal review created by `pipeline_controller`, the completion
+metadata must also be a JSON object containing all of these exact fields:
+
+- `implementation_task_id`: the single parent implementation task ID, copied
+  exactly from the review task's parent list;
+- `verdict`: exactly `PASS` or `CHANGES REQUIRED`;
+- `mutation_performed`: exactly `false` (the reviewer is read-only);
+- `repository_state`: the complete object from the final collect call; and
+- `repository_state_sha256`: the complete string from that same collect call.
+
+Pass this object to `kanban_complete` as its metadata. A narrative summary,
+`scope_paths`, or the repository fingerprint alone is not sufficient metadata,
+and the reviewer must not complete the task while any required field is
+missing or altered.
+
 If the final collect(workdir) call fails, or its result is missing
 repository_state or repository_state_sha256, or either field is malformed
 (not the exact object/string collect returned), or the underlying capture

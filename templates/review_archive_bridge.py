@@ -25,7 +25,9 @@ from datetime import datetime
 from pathlib import Path
 
 ALLOWED_ROOT = Path("/opt/ai/projects").resolve()
-KANBAN_DB = Path.home() / ".hermes" / "kanban.db"
+KANBAN_HOME = Path.home() / ".hermes"
+KANBAN_DB = KANBAN_HOME / "kanban.db"
+KANBAN_BOARD_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 GIT_TIMEOUT_SECONDS = 30
 
 REVIEW_ARCHIVE_SCHEMA_V2 = "hermes.review-archive/v2"
@@ -157,13 +159,34 @@ def validate_review_task_id(raw):
     return raw
 
 
+def resolve_kanban_db_path():
+    """Resolve the active Hermes board DB without allowing board-path traversal.
+
+    Mirrors Hermes' board precedence for this read-only helper: an explicit
+    database path, then an environment-pinned board, then the persisted
+    current board, and finally the legacy default board.
+    """
+    explicit_db = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if explicit_db:
+        return Path(explicit_db).expanduser()
+
+    board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if not board:
+        current = KANBAN_HOME / "kanban" / "current"
+        try:
+            board = current.read_text(encoding="utf-8").strip()
+        except OSError:
+            board = ""
+
+    if not board or board == "default":
+        return KANBAN_DB
+    if KANBAN_BOARD_SLUG_RE.fullmatch(board) is None:
+        raise ArchiveValidationError("invalid active Kanban board: %r" % board)
+    return KANBAN_HOME / "kanban" / "boards" / board / "kanban.db"
+
+
 def open_kanban_db_readonly():
-    db_path = Path(
-        os.environ.get(
-            "HERMES_KANBAN_DB",
-            str(KANBAN_DB),
-        )
-    ).expanduser()
+    db_path = resolve_kanban_db_path()
 
     try:
         con = sqlite3.connect(

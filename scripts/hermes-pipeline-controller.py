@@ -41,7 +41,10 @@ EVENT_KINDS = frozenset({
     "unblocked", "commented", "block_loop_detected", "archived",
 })
 TASK_STATUSES = frozenset({"done", "archived"})
-RUN_STATUSES = frozenset({"done", "blocked"})
+# Worker runs normally close as ``done`` or ``blocked``.  An operator-side
+# ``hermes kanban complete`` closes its administrative run as ``completed``;
+# structural validation must accept that terminal status as well.
+RUN_STATUSES = frozenset({"done", "blocked", "completed"})
 EXIT_OK = 0
 EXIT_VALIDATION = 2
 EXIT_TRANSPORT = 3
@@ -639,7 +642,10 @@ def validate_runs(value, path, errors):
         validate_exact_keys(run, RUN_KEYS, p, errors)
         status = run.get("status")
         if status not in RUN_STATUSES:
-            errors.append(p + ".status is " + repr(status) + ", expected one of done|blocked")
+            errors.append(
+                p + ".status is " + repr(status)
+                + ", expected one of done|blocked|completed"
+            )
 
 
 def validate_events(value, errors):

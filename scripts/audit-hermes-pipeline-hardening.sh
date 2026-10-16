@@ -717,6 +717,13 @@ INVARIANTS = [
         "that final call verbatim into the completion metadata",
     ),
     ("copy_byte_for_byte", "byte-for-byte, with no summarization, truncation, retyping, or reformatting"),
+    (
+        "formal_completion_metadata_fields",
+        "For every formal review created by `pipeline_controller`, the completion metadata must also be a JSON object containing all of these exact fields",
+    ),
+    ("formal_parent_id_field", "`implementation_task_id`: the single parent implementation task ID"),
+    ("formal_mutation_false_field", "`mutation_performed`: exactly `false`"),
+    ("formal_metadata_to_kanban_complete", "Pass this object to `kanban_complete` as its metadata"),
     ("block_on_missing_or_unstable", "the reviewer must BLOCK the task instead of completing it"),
     ("unstable_capture_blocks", "repository state was unstable across consecutive captures"),
     ("scope_paths_no_substitute", "scope_paths never substitutes for a fingerprint"),
@@ -2812,6 +2819,9 @@ run_runtime() {
   echo
   echo "12a) reviewer SOUL protocol invariants (installed runtime) — A4.1 reviewer collect protocol:"
   reviewer_soul_invariant_audit "reviewer SOUL (installed runtime)" "$reviewer_soul"
+
+  echo "12b) reviewer SOUL repository-state and formal metadata invariants (installed runtime) — A4.2/A8:"
+  reviewer_soul_a5_repository_state_invariant_audit "reviewer SOUL (installed runtime)" "$reviewer_soul"
 
   echo
   echo "13) reviewer must NOT expose Memory:"

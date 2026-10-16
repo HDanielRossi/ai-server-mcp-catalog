@@ -363,6 +363,17 @@ def test_check_done_pass_is_valid(capsys):
     assert obj["errors"] == []
 
 
+def test_check_operator_completed_run_is_valid(capsys):
+    runs = [make_run(status="completed")]
+    with stub_hermes(make_show(runs=runs), runs) as m:
+        rc = hpc.main(["check", TASK_ID])
+    assert rc == hpc.EXIT_OK
+    assert m.call_count == 2
+    _, obj = parse_stdout_line(capsys)
+    assert obj["valid"] is True
+    assert obj["errors"] == []
+
+
 def test_check_archived_with_blocked_runs_is_valid(capsys):
     runs = [make_run(status="blocked", outcome="blocked")]
     with stub_hermes(make_show(task=make_task(status="archived"), runs=runs), runs) as m:
