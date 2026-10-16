@@ -56,10 +56,32 @@ def test_symlink_escape_rejected(tmp_path):
 def test_paths_required_for_compile_and_compile_is_fixed(tmp_path):
     worktree = repo(tmp_path)
     argv = bridge.build_argv("py_compile", ["tests/test_ok.py"])
-    assert argv[:3] == [bridge.PYTHON, "-c", argv[2]]
-    assert "py_compile.compile" in argv[2]
+    assert argv[:3] == [bridge.PYTHON, "-B", "-c"]
+    assert "py_compile.compile" in argv[3]
+    assert "TemporaryDirectory" in argv[3]
+    assert "dir='/tmp'" in argv[3]
+    assert "/dev/null" not in argv[3]
     with pytest.raises(bridge.ValidationBridgeError):
         bridge.validate("py_compile", str(worktree), paths=[])
+
+
+def test_compile_succeeds_without_writing_bytecode_to_worktree(tmp_path, monkeypatch):
+    worktree = repo(tmp_path)
+    monkeypatch.setattr(bridge, "ALLOWED_ROOT", tmp_path.resolve())
+    result = bridge.validate("py_compile", str(worktree), paths=["tests/test_ok.py"])
+    assert result["exit_code"] == 0
+    assert result["timed_out"] is False
+    assert not list(worktree.rglob("*.pyc"))
+
+
+def test_compile_failure_is_reported_without_writing_bytecode_to_worktree(tmp_path, monkeypatch):
+    worktree = repo(tmp_path)
+    (worktree / "bad.py").write_text("def broken(:\n", encoding="utf-8")
+    monkeypatch.setattr(bridge, "ALLOWED_ROOT", tmp_path.resolve())
+    result = bridge.validate("py_compile", str(worktree), paths=["bad.py"])
+    assert result["exit_code"] != 0
+    assert "SyntaxError" in result["stderr"]
+    assert not list(worktree.rglob("*.pyc"))
 
 
 def test_no_caller_command_or_environment_and_read_only_git():

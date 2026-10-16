@@ -83,10 +83,12 @@ def build_argv(operation, paths=None):
         return ["/usr/bin/git", "diff", "--check"]
     if operation == "py_compile":
         script = (
-            "import py_compile,sys; "
-            "[py_compile.compile(p, cfile='/dev/null', doraise=True) for p in sys.argv[1:]]"
+            "import os,py_compile,sys,tempfile\n"
+            "with tempfile.TemporaryDirectory(prefix='hermes-pycompile-', dir='/tmp') as d:\n"
+            "    [py_compile.compile(p, cfile=os.path.join(d, str(i) + '.pyc'), doraise=True) "
+            "for i,p in enumerate(sys.argv[1:])]"
         )
-        return [PYTHON, "-c", script, *paths]
+        return [PYTHON, "-B", "-c", script, *paths]
     raise ValidationBridgeError(f"unsupported operation: {operation!r}")
 
 
