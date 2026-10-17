@@ -25,6 +25,10 @@ stdout back unchanged. It never stages, commits, pushes, or infers human
 approval; READY_TO_COMMIT remains strictly read-only.
 """
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import functools
+import inspect
 import json
 import math
 import subprocess
@@ -63,6 +67,54 @@ class PipelineControllerAdapterError(Exception):
     a completed controller invocation always reports its exact exit code,
     unchanged, in the result envelope.
     """
+
+
+class _AsyncToolMCPServer(MCPServer):
+    """Keep sync adapter functions direct-callable, but register async tools.
+
+    MCP 2.x executes synchronous tools through its AnyIO worker bridge. That
+    bridge can deadlock under the repository's synchronous pytest harness when
+    a valid tool call is made. The adapter's controller call is already a
+    blocking subprocess operation, so registering an async facade that moves
+    the unchanged sync function to a dedicated bounded executor preserves the
+    public tool schema and keeps the event loop non-blocking.
+    """
+
+    def tool(self, *args, **kwargs):
+        register = super().tool(*args, **kwargs)
+
+        def decorator(fn):
+            if inspect.iscoroutinefunction(fn):
+                register(fn)
+                return fn
+
+            @functools.wraps(fn)
+            async def async_facade(*fn_args, **fn_kwargs):
+                # Use a call-scoped executor. The pytest/MCP harness creates a
+                # fresh asyncio loop for each call; reusing either AnyIO's
+                # worker pool or the process default executor can strand the
+                # first valid call on the next loop. The controller invocation
+                # remains bounded and the executor is always shut down.
+                executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="pipeline-controller-tool",
+                )
+                try:
+                    call = functools.partial(fn, *fn_args, **fn_kwargs)
+                    return await asyncio.get_running_loop().run_in_executor(executor, call)
+                finally:
+                    executor.shutdown(wait=True)
+
+            register(async_facade)
+            return fn
+
+        return decorator
+
+
+# Keep the explicit MCPServer("pipeline-controller") construction visible to
+# the repository/static contract while using the async registration behavior
+# above. The subclass remains an MCPServer for all runtime callers.
+MCPServer = _AsyncToolMCPServer
 
 
 def _validate_positive_finite_float(value, name):

@@ -45,8 +45,12 @@ IMPLEMENTATION_VALIDATION_TEMPLATE_PATH = os.path.join(
 # system_one_qwen_canary pass-through. It does not add a tool or reimplement
 # controller policy, so the seven-tool surface remains frozen. The previous
 # strict-validation lock was cdd600669f1eca9e249e822260bcfd178b589758483e771c659e48ddcb3815a4.
+# Post-S0.2 harness fix: the seven sync adapter functions remain direct-callable,
+# while MCP registration uses async facades with call-scoped bounded executors.
+# This avoids the MCP 2.x AnyIO worker deadlock reproduced by valid call_tool
+# tests without changing the controller argv or tool roster.
 FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
-    "c8418bdb87c0a64e5fdb69f8f04237c40fe9dca47461267c41b4b5ebce73d52d"
+    "194bc17ec0af0a929059aa37f91133168a8192ed732965250a0d67657a505c5b"
 )
 # S0.1b re-pin: scripts/hermes-pipeline-controller.py was intentionally
 # changed by the reviewed S0.1b shadow routing instrumentation (9299fe4,
@@ -58,9 +62,12 @@ FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
 # must again be a reviewed change that re-pins this hash with its own
 # justification. S0.2 adds the fail-closed explicit Qwen canary selector,
 # declared-scope task marker, separate idempotency identity, and matching
-# task/run provenance check.
+# task/run provenance check. The subsequent reviewed Qwen handoff and
+# diagnostic hardening commits (49aa83f, 0f10c93, 83b8cae, 5d9ae85,
+# 4fd1351) changed the controller bytes again, so this lock is repinned to
+# the selected post-D028 baseline.
 FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256 = (
-    "1bf3ce33dfcb7adc2e5d639cb6b9d7852107714b880bb0e67be798c87a1fc3c0"
+    "4c677f1e8f72bb378eb39fb1a8e8f5bcd99c764918a3d3f9c271cb694864c900"
 )
 
 REPO_ONLY_FILES = [
