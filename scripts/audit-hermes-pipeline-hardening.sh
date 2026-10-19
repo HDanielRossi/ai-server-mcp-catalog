@@ -2572,9 +2572,14 @@ run_repo_only() {
     check_fail "coder-qwen-implementation-validation.yaml does not select the fixed Qwen-only validator"
   fi
   QWEN_SOUL_FILE="$REPO_DIR/templates/coder-qwen-SOUL.md"
-  for s in 'HERMES_SYSTEM_ONE_QWEN_CANARY_V1' 'validate_qwen_canary_serial' 'qwen_canary_write_bridge' 'Do not commit, push' 'formal reviewer remains authoritative' 'This fixed tool runs `git_diff_check`,' '`py_compile`, `pytest_targeted`, and `pytest_full` in that order' 'Never invoke generic `validate`' 'unsupported `git_status`/`git_diff`' 'hermes.qwen-canary-completion/v1' 'hermes.qwen-canary-validation/v1' 'native object value of the `metadata` tool' 'never as serialized JSON text' 'If `kanban_complete` rejects the' 'metadata, block immediately'; do
+  for s in 'HERMES_SYSTEM_ONE_QWEN_CANARY_V1' 'validate_qwen_canary_serial' 'qwen_canary_write_bridge' 'Do not commit, push' 'formal reviewer remains authoritative' 'This fixed tool runs `git_diff_check`,' '`py_compile`, `pytest_targeted`, and `pytest_full` in that order' 'Never invoke generic `validate`' 'unsupported `git_status`/`git_diff`' 'hermes.qwen-canary-completion/v1' 'hermes.qwen-canary-validation/v1' '"metadata": {' 'native object value of the `metadata` tool' 'never a quoted JSON string' 'If `kanban_complete` rejects the' 'metadata, block immediately'; do
     if grep_ok "$QWEN_SOUL_FILE" "$s"; then check_ok "coder-qwen SOUL contains: $s"; else check_fail "coder-qwen SOUL missing: $s"; fi
   done
+  if grep -qF -- '\"schema\":' "$QWEN_SOUL_FILE" 2>/dev/null; then
+    check_fail "coder-qwen SOUL shows a serialized Qwen completion metadata example"
+  else
+    check_ok "coder-qwen SOUL does not show a serialized Qwen completion metadata example"
+  fi
 
   echo
   echo "6b.1) System One Qwen S0.4 write-boundary contract:"
