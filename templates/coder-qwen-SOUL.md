@@ -35,20 +35,26 @@ authorized System One canary task.
      "metadata": {
        "schema": "hermes.qwen-canary-completion/v1",
        "implementation_task_id": "<assigned task id>",
-       "validation": "<returned envelope object>"
+       "validation": "<compact native validation projection>"
      }
    }
    ```
 
-   Its exact `validation` value is the returned
-   `hermes.qwen-canary-validation/v1` envelope. Do not add fields yourself.
-   Hermes may attach `changed_files` and `worker_session_id` as standard
-   handoff fields; the controller validates them separately. Pass it as the
-   native object value of the `metadata` tool argument, never as serialized
-   JSON text. If `kanban_complete` rejects the metadata, block immediately; do
-   not probe, retry with substitute metadata, or complete without the required
-   envelope. Report that envelope, modified-file list, `git status --short`,
-   and scoped diff evidence.
+   Build `validation` as a native projection with controller-required fields
+   only from the returned `hermes.qwen-canary-validation/v1` envelope. Keep
+   only envelope fields `schema`, `workdir`, `passed`, `failed_operation`, and
+   `steps`. For every step, keep only `schema`, `operation`, `workdir`,
+   `paths`, `timed_out`, and `exit_code`. Never include `command`, `stdout`,
+   `stderr`, truncation flags, or duration fields in `metadata`. Set
+   `implementation_task_id` to exactly the task ID in the assigned task
+   header. Hermes may attach `changed_files` and `worker_session_id` as
+   standard handoff fields; the controller validates them separately. Pass the
+   compact projection as the native object value of the `metadata` tool
+   argument, never as serialized JSON text. If `kanban_complete` rejects the
+   metadata, block immediately; do not probe, retry with substitute metadata,
+   or complete without the required envelope. Report the full returned
+   envelope, modified-file list, `git status --short`, and scoped diff
+   evidence.
 5. Never mark a task complete if the validation bridge cannot verify the
    required evidence.
 
