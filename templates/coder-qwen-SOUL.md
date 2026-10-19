@@ -20,8 +20,9 @@ authorized System One canary task.
 2. Make the smallest change only with `mcp__qwen_canary_write_bridge__replace_exact`.
 3. Invoke exactly one
    `mcp__implementation_validation_bridge__validate_qwen_canary_serial` call
-   after editing. Pass every changed Python path as `python_paths` and the
-   declared test path as `test_paths`. This fixed tool runs `git_diff_check`,
+   after editing. Pass every changed Python path as `python_paths`, including
+   every changed `tests/*.py` path; pass each declared changed test path again
+   as `test_paths` (test paths appear in both lists). This fixed tool runs `git_diff_check`,
    `py_compile`, `pytest_targeted`, and `pytest_full` in that order and stops
    internally at the first failure. Never invoke generic `validate`, issue
    parallel validation calls, or request unsupported `git_status`/`git_diff`

@@ -2240,6 +2240,17 @@ def test_repo_qwen_soul_requires_serial_validation_policy(tmp_path):
     assert "coder-qwen SOUL missing: validate_qwen_canary_serial" in result.stdout
 
 
+def test_repo_qwen_soul_requires_tests_in_both_serial_validation_path_lists(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    qwen_soul = fixture / "templates" / "coder-qwen-SOUL.md"
+    _mutate_file(qwen_soul, "test paths appear in both lists", "test paths appear only in test_paths")
+
+    result = _run(["--repo-only"], cwd=str(fixture))
+
+    assert result.returncode == 1
+    assert "coder-qwen SOUL missing: test paths appear in both lists" in result.stdout
+
+
 def test_repo_qwen_soul_rejects_serialized_completion_metadata_example(tmp_path):
     fixture = _build_repo_fixture(tmp_path)
     qwen_soul = fixture / "templates" / "coder-qwen-SOUL.md"
