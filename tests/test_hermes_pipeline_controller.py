@@ -2458,12 +2458,21 @@ def test_qwen_canary_accepts_only_valid_platform_handoff_metadata(tmp_path):
             workdir,
             changed_paths,
             changed_files=["app.py", "tests/test_app.py", "README.md"],
+            artifact_files=["app.py", "tests/test_app.py", "README.md"],
             worker_session_id="20261016_example",
         ),
     )
     hpc._validate_qwen_canary_validation_metadata(run, RTC_IMPL_ID, str(workdir), changed_paths)
 
     run["metadata"]["changed_files"] = ["app.py"]
+    with pytest.raises(hpc.ReadyToCommitReject, match="does not exactly match"):
+        hpc._validate_qwen_canary_validation_metadata(run, RTC_IMPL_ID, str(workdir), changed_paths)
+
+    run["metadata"] = make_qwen_validation_metadata(
+        workdir,
+        changed_paths,
+        artifact_files=["app.py"],
+    )
     with pytest.raises(hpc.ReadyToCommitReject, match="does not exactly match"):
         hpc._validate_qwen_canary_validation_metadata(run, RTC_IMPL_ID, str(workdir), changed_paths)
 

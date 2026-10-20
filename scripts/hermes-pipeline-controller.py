@@ -1095,15 +1095,17 @@ def _validate_qwen_canary_validation_metadata(run, task_id, canonical_workdir, c
     if not isinstance(metadata, dict):
         raise ReadyToCommitReject("qwen_canary_validation_metadata_missing", "Qwen completion metadata must be an object")
     required_keys = {"schema", "implementation_task_id", "validation"}
-    permitted_platform_keys = {"changed_files", "worker_session_id"}
+    permitted_platform_keys = {"changed_files", "artifact_files", "worker_session_id"}
     metadata_keys = set(metadata)
     if not required_keys <= metadata_keys or not metadata_keys <= required_keys | permitted_platform_keys:
         raise ReadyToCommitReject(
             "qwen_canary_validation_metadata_keys",
             "Qwen completion metadata has missing or unrecognized keys",
         )
-    if "changed_files" in metadata:
-        reported_paths = metadata["changed_files"]
+    for field in ("changed_files", "artifact_files"):
+        if field not in metadata:
+            continue
+        reported_paths = metadata[field]
         if (
             not isinstance(reported_paths, list)
             or any(not isinstance(path, str) for path in reported_paths)
@@ -1111,8 +1113,8 @@ def _validate_qwen_canary_validation_metadata(run, task_id, canonical_workdir, c
             or set(reported_paths) != set(changed_paths)
         ):
             raise ReadyToCommitReject(
-                "qwen_canary_validation_changed_files_invalid",
-                "Qwen completion changed_files does not exactly match the reviewed diff",
+                "qwen_canary_validation_%s_invalid" % field,
+                "Qwen completion %s does not exactly match the reviewed diff" % field,
             )
     if "worker_session_id" in metadata and (
         not isinstance(metadata["worker_session_id"], str) or not metadata["worker_session_id"]
