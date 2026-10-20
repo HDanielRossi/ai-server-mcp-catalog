@@ -2277,6 +2277,21 @@ def test_repo_qwen_soul_requires_compact_native_validation_projection(tmp_path):
     assert "coder-qwen SOUL missing: controller-required fields" in result.stdout
 
 
+def test_repo_qwen_s05_write_contract_requires_architecture_path(tmp_path):
+    fixture = _build_repo_fixture(tmp_path)
+    write_bridge = fixture / "templates" / "qwen_canary_write_bridge_server.py"
+    _mutate_file(
+        write_bridge,
+        'ALLOWED_PATHS = frozenset({"app.py", "tests/test_app.py", "README.md", "ARCHITECTURE.md"})',
+        'ALLOWED_PATHS = frozenset({"app.py", "tests/test_app.py", "README.md"})',
+    )
+
+    result = _run(["--repo-only"], cwd=str(fixture))
+
+    assert result.returncode == 1
+    assert "Qwen write bridge does not pin the exact S0.5 four-path allowlist" in result.stdout
+
+
 def test_a7_unrelated_mcp_children_remain_accepted(tmp_path):
     fixture = _build_repo_fixture(tmp_path)
     runtime_root = _build_runtime_fixture(tmp_path, compliant=True)

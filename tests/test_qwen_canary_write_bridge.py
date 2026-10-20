@@ -18,6 +18,7 @@ def repo(tmp_path, monkeypatch):
     (workdir / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
     (workdir / "tests" / "test_app.py").write_text("def test_add():\n    pass\n", encoding="utf-8")
     (workdir / "README.md").write_text("# Pilot\n", encoding="utf-8")
+    (workdir / "ARCHITECTURE.md").write_text("# Architecture\n", encoding="utf-8")
     monkeypatch.setattr(bridge, "ALLOWED_ROOT", root.resolve())
     return workdir
 
@@ -30,15 +31,35 @@ def test_read_and_exact_replace_only_allowed_files(tmp_path, monkeypatch):
     assert "return a+b" in (workdir / "app.py").read_text()
 
 
-def test_read_and_exact_replace_allow_documentation_in_s04_scope(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("path", "before", "after"),
+    [
+        ("README.md", "# Pilot", "# System One pilot"),
+        ("ARCHITECTURE.md", "# Architecture", "# System One architecture"),
+    ],
+)
+def test_read_and_exact_replace_allow_documentation_in_s05_scope(
+    tmp_path, monkeypatch, path, before, after
+):
     workdir = repo(tmp_path, monkeypatch)
-    assert bridge.read_file(str(workdir), "README.md")["content"] == "# Pilot\n"
-    result = bridge.replace_exact(str(workdir), "README.md", "# Pilot", "# System One pilot")
+    assert before in bridge.read_file(str(workdir), path)["content"]
+    result = bridge.replace_exact(str(workdir), path, before, after)
     assert result["replaced"] is True
-    assert (workdir / "README.md").read_text() == "# System One pilot\n"
+    assert after in (workdir / path).read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("path", ["docs/README.md", ".git/config", "../app.py"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docs/README.md",
+        "docs/ARCHITECTURE.md",
+        "PROJECT.md",
+        "DECISIONS.md",
+        "TODO.md",
+        ".git/config",
+        "../app.py",
+    ],
+)
 def test_rejects_paths_outside_fixed_allowlist(tmp_path, monkeypatch, path):
     workdir = repo(tmp_path, monkeypatch)
     with pytest.raises(bridge.CanaryWriteError):

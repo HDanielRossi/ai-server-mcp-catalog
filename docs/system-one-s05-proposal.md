@@ -1,7 +1,8 @@
 # System One S0.5 proposal: bounded architecture-document path
 
-Status: proposal only. This document does not authorize a runtime rollout,
-does not change the Qwen write bridge, and does not widen any worker authority.
+Status: bounded S0.5 activation plan. Its source, runtime-rollout, and first-
+canary gates require separate explicit operator approvals; it does not widen
+worker authority.
 
 ## Objective
 
@@ -24,7 +25,7 @@ configuration, CI, dependency, profile, Git, and secret paths remain denied.
 
 ## Preconditions
 
-An operator may consider S0.5 only after all of the following are recorded:
+S0.5 may proceed only after all of the following are recorded:
 
 1. Three consecutive S0.4 canaries have passed implementation, formal review,
    `ready-to-commit`, merge, and verified post-merge testing.
