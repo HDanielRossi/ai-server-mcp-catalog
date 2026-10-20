@@ -1,7 +1,7 @@
 """Structured file bridge for the tightly bounded System One Qwen pilot.
 
 It deliberately has no shell, Git, subprocess, arbitrary path, or patch
-operation. The fixed S0.5 allowlist is the sole authorized pilot scope.
+operation. The fixed S0.6 allowlist is the sole authorized pilot scope.
 """
 
 from pathlib import Path
@@ -10,7 +10,7 @@ from mcp.server import MCPServer
 
 
 ALLOWED_ROOT = Path("/opt/ai/projects").resolve()
-ALLOWED_PATHS = frozenset({"app.py", "tests/test_app.py", "README.md", "ARCHITECTURE.md"})
+ALLOWED_PATHS = frozenset({"app.py", "tests/test_app.py", "README.md", "ARCHITECTURE.md", "PROJECT.md"})
 MAX_READ_CHARS = 24_000
 MAX_REPLACEMENT_CHARS = 8_000
 

@@ -1,7 +1,9 @@
 # System One S0.6 proposal: evidence-gated project-overview path
 
-Status: proposal only. This document does not change the active S0.5
-allowlist, installed runtime, Qwen profile, or worker authority.
+Status: source activation approved after the S0.5 evidence gate. Runtime
+rollout and the first S0.6 canary still require their own separate explicit
+operator approvals. This document does not itself change the installed runtime,
+Qwen profile, or worker authority.
 
 ## Objective
 

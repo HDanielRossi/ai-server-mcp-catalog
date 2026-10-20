@@ -2582,12 +2582,12 @@ run_repo_only() {
   fi
 
   echo
-  echo "6b.1) System One Qwen S0.5 write-boundary contract:"
+  echo "6b.1) System One Qwen S0.6 write-boundary contract:"
   QWEN_WRITE_FILE="$REPO_DIR/templates/qwen_canary_write_bridge_server.py"
-  if grep_ok "$QWEN_WRITE_FILE" 'ALLOWED_PATHS = frozenset({"app.py", "tests/test_app.py", "README.md", "ARCHITECTURE.md"})'; then
-    check_ok "Qwen write bridge pins the exact S0.5 four-path allowlist"
+  if grep_ok "$QWEN_WRITE_FILE" 'ALLOWED_PATHS = frozenset({"app.py", "tests/test_app.py", "README.md", "ARCHITECTURE.md", "PROJECT.md"})'; then
+    check_ok "Qwen write bridge pins the exact S0.6 five-path allowlist"
   else
-    check_fail "Qwen write bridge does not pin the exact S0.5 four-path allowlist"
+    check_fail "Qwen write bridge does not pin the exact S0.6 five-path allowlist"
   fi
   for s in 'no shell, Git, subprocess, arbitrary path, or patch' 'path is outside the fixed canary allowlist' 'expected text must occur exactly once'; do
     if grep_ok "$QWEN_WRITE_FILE" "$s"; then check_ok "Qwen write bridge contains: $s"; else check_fail "Qwen write bridge missing: $s"; fi

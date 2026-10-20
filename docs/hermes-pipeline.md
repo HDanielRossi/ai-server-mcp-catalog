@@ -1711,3 +1711,26 @@ Installation implications: a deployed adapter and controller emit shadow
 records only when a caller passes shadow arguments. Changing either source
 file breaks the `--runtime` audit's source/runtime SHA-256 parity until the
 operator separately installs the changed file.
+
+## S0.6 — Evidence-gated project-overview expansion
+
+S0.6 becomes eligible only after three consecutive S0.5 canaries complete
+implementation, formal review, `ready-to-commit`, merge, post-merge testing,
+and runtime parity checks without a scope or validation failure. Its source
+allowlist is exactly `app.py`, `tests/test_app.py`, `README.md`,
+`ARCHITECTURE.md`, and `PROJECT.md`. `PROJECT.md` is a literal fifth path, not
+a general Markdown capability: `DECISIONS.md`, `TODO.md`, all other documents,
+configuration, CI, dependencies, Git, profiles, and secrets remain denied.
+
+The source activation, runtime rollout, and first S0.6 canary each require a
+separate explicit operator approval. A source-only change must not be treated
+as a runtime rollout. The first canary must be one pure helper change with
+tests, matching README and architecture statements, plus one concise factual
+project-overview sentence. The formal reviewer must reject any operational,
+roadmap, policy, or inconsistent implementation claim in `PROJECT.md`.
+
+The write bridge retains its exact single-occurrence replacement boundary and
+has no shell, Git, subprocess, patch, commit, push, or lifecycle capability.
+Any S0.6 violation restores the prior four-path runtime adapter through a
+separately reviewed rollback, preserves the evidence, and resets this evidence
+sequence.

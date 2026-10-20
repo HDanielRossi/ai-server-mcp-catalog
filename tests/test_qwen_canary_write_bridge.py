@@ -19,6 +19,7 @@ def repo(tmp_path, monkeypatch):
     (workdir / "tests" / "test_app.py").write_text("def test_add():\n    pass\n", encoding="utf-8")
     (workdir / "README.md").write_text("# Pilot\n", encoding="utf-8")
     (workdir / "ARCHITECTURE.md").write_text("# Architecture\n", encoding="utf-8")
+    (workdir / "PROJECT.md").write_text("# Project\n", encoding="utf-8")
     monkeypatch.setattr(bridge, "ALLOWED_ROOT", root.resolve())
     return workdir
 
@@ -36,9 +37,10 @@ def test_read_and_exact_replace_only_allowed_files(tmp_path, monkeypatch):
     [
         ("README.md", "# Pilot", "# System One pilot"),
         ("ARCHITECTURE.md", "# Architecture", "# System One architecture"),
+        ("PROJECT.md", "# Project", "# System One project"),
     ],
 )
-def test_read_and_exact_replace_allow_documentation_in_s05_scope(
+def test_read_and_exact_replace_allow_documentation_in_s06_scope(
     tmp_path, monkeypatch, path, before, after
 ):
     workdir = repo(tmp_path, monkeypatch)
@@ -53,7 +55,6 @@ def test_read_and_exact_replace_allow_documentation_in_s05_scope(
     [
         "docs/README.md",
         "docs/ARCHITECTURE.md",
-        "PROJECT.md",
         "DECISIONS.md",
         "TODO.md",
         ".git/config",
