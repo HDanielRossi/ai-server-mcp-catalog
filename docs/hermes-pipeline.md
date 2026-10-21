@@ -1734,3 +1734,17 @@ has no shell, Git, subprocess, patch, commit, push, or lifecycle capability.
 Any S0.6 violation restores the prior four-path runtime adapter through a
 separately reviewed rollback, preserves the evidence, and resets this evidence
 sequence.
+
+## S0.7 — Five-path stability ceiling
+
+After three successful S0.6 canaries, the five-path scope is a stability
+ceiling, not permission to add a sixth path. `DECISIONS.md` remains denied
+because it carries architecture-policy meaning; `TODO.md` remains denied
+because it carries workflow-state meaning. No other document, configuration,
+CI, dependency, Git, profile, or secret path becomes eligible by implication.
+
+S0.7 records repeated evidence under the existing five-path contract only:
+exact declared scope, two classifier components, formal review and archive,
+`ready-to-commit`, source/runtime SHA-256 parity, and a passing runtime audit
+before dispatch and after merge. Any future authority expansion requires its
+own proposal and separate source, runtime-rollout, and first-canary approvals.
