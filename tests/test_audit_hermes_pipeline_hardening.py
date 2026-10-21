@@ -49,9 +49,13 @@ IMPLEMENTATION_VALIDATION_TEMPLATE_PATH = os.path.join(
 # while MCP registration uses async facades with call-scoped bounded executors.
 # This avoids the MCP 2.x AnyIO worker deadlock reproduced by valid call_tool
 # tests without changing the controller argv or tool roster.
+# A7 revalidation at HEAD 80d7eb0 (2e935ca baseline -> 80d7eb0): the on-disk
+# digest of templates/pipeline_controller_server.py was recomputed and still
+# equals this lock (194bc17e...a505c5b), so the value is unchanged.
 FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
     "194bc17ec0af0a929059aa37f91133168a8192ed732965250a0d67657a505c5b"
 )
+REVALIDATED_PIPELINE_CONTROLLER_TEMPLATE_SHA256 = FROZEN_PIPELINE_CONTROLLER_MCP_SHA256
 # S0.1b re-pin: scripts/hermes-pipeline-controller.py was intentionally
 # changed by the reviewed S0.1b shadow routing instrumentation (9299fe4,
 # fc45e00). The previous A6 lock was
@@ -66,8 +70,20 @@ FROZEN_PIPELINE_CONTROLLER_MCP_SHA256 = (
 # diagnostic hardening commits (49aa83f, 0f10c93, 83b8cae, 5d9ae85,
 # 4fd1351) changed the controller bytes again, so this lock is repinned to
 # the selected post-D028 baseline.
-FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256 = (
+# A7 revalidation at HEAD 80d7eb0 (2e935ca baseline -> 80d7eb0): later
+# legitimate S0.x commits (S0.5/S0.6/S0.7, e.g. f97d82c, ba41624, 5d9ae85,
+# 4fd1351, 44f0244) modified scripts/hermes-pipeline-controller.py after the
+# previous pin, so this lock is re-pinned to the verified on-disk bytes at
+# 80d7eb0. This is A7 test housekeeping, NOT an A8 change (A8.1 is 15/15
+# invariants PASS in 3be0bd9). Assertion semantics are unchanged: the test
+# still asserts both frozen digests equal the on-disk files.
+# SUPERSEDED by A7 revalidation at HEAD 80d7eb0 (provenance only; never
+# asserted against the live file).
+SUPERSEDED_A7_HERMES_PIPELINE_CONTROLLER_SHA256 = (
     "4c677f1e8f72bb378eb39fb1a8e8f5bcd99c764918a3d3f9c271cb694864c900"
+)
+FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256 = (
+    "d7c41ecdc1a22cfa3521e8f5c13ad315fc8c0236b234597b3cc68bdf0cbbf667"
 )
 
 REPO_ONLY_FILES = [
@@ -1732,7 +1748,12 @@ def test_a7_frozen_source_files_sha256_unchanged():
     """Locks the CURRENT SHA-256 of the two frozen A6 source files this task
     must never modify. If either file drifts (this task's edits or a future
     task's), this fails loudly instead of silently invalidating every A7.1
-    SHA-256 parity assertion below, which assumes these exact bytes."""
+    SHA-256 parity assertion below, which assumes these exact bytes.
+
+    Freeze REVALIDATED at HEAD 80d7eb0 (2e935ca baseline -> 80d7eb0) after
+    legitimate S0.x modifications to scripts/hermes-pipeline-controller.py.
+    A7 test housekeeping, NOT an A8 change (A8 is 15/15 PASS in 3be0bd9).
+    Assertion semantics are unchanged."""
     with open(PIPELINE_CONTROLLER_MCP_TEMPLATE_PATH, "rb") as f:
         assert hashlib.sha256(f.read()).hexdigest() == FROZEN_PIPELINE_CONTROLLER_MCP_SHA256
     with open(HERMES_PIPELINE_CONTROLLER_PATH, "rb") as f:
