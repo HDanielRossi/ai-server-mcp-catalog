@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import os
@@ -17,6 +18,22 @@ hpc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hpc)
 
 TASK_ID = "t_pipeline_controller_a1"
+# D029: independent literals for the reviewer identity contracts. They are
+# deliberately NOT read from the controller, so a drifted production constant
+# cannot move these expectations along with it.
+EXPECTED_REVIEWER_PROFILE = "reviewer"
+EXPECTED_REVIEWER_MODEL_LABEL = "GPT-5.6 Sol"
+EXPECTED_REVIEWER_PROVIDER_LABEL = "OpenAI Codex"
+EXPECTED_REVIEWER_MODEL_SLUG = "gpt-5.6-sol"
+EXPECTED_REVIEWER_PROVIDER_SLUG = "openai-codex"
+# sha256("reviewer\nGPT-5.6 Sol\nOpenAI Codex") and
+# sha256("reviewer\ngpt-5.6-sol\nopenai-codex"), written literally.
+EXPECTED_REVIEWER_LABEL_PIN_SHA256 = (
+    "a97d3050be9547857cce049fa3e3cff87afcf254ea52a13a43d0a515ad3c5566"
+)
+EXPECTED_REVIEWER_EXECUTION_PIN_SHA256 = (
+    "8b1ea43f3b6a43887fd249705f336c6b4271d0e37e12aa257dcf326564becde7"
+)
 
 
 def test_bootstrap_command_reaches_main_handler(monkeypatch):
@@ -308,6 +325,14 @@ def make_task(**overrides):
         "current_step_key": None,
     }
     t.update(overrides)
+    if t["assignee"] == "reviewer":
+        # D029: a controller-created review task carries the executable
+        # overrides Hermes recorded from create_review. Tests that need a wrong
+        # or missing identity pass model_override / provider_override explicitly.
+        if "model_override" not in overrides:
+            t["model_override"] = EXPECTED_REVIEWER_MODEL_SLUG
+        if "provider_override" not in overrides:
+            t["provider_override"] = EXPECTED_REVIEWER_PROVIDER_SLUG
     return t
 
 
@@ -329,6 +354,29 @@ def make_run(**overrides):
     return r
 
 
+def make_reviewer_events(run_ids=()):
+    """Hermes-shaped review history: one immutable `created` pin, then one
+    run-scoped `claimed` event per run id, in ascending order."""
+    events = [{
+        "kind": "created",
+        "payload": {
+            "assignee": EXPECTED_REVIEWER_PROFILE,
+            "model_override": EXPECTED_REVIEWER_MODEL_SLUG,
+            "provider_override": EXPECTED_REVIEWER_PROVIDER_SLUG,
+        },
+        "created_at": 1,
+        "run_id": None,
+    }]
+    for run_id in sorted(set(run_ids)):
+        events.append({
+            "kind": "claimed",
+            "payload": {"lock": "test-lock", "expires": 100, "run_id": run_id},
+            "created_at": 2,
+            "run_id": run_id,
+        })
+    return events
+
+
 def make_show(**overrides):
     s = {
         "task": make_task(),
@@ -340,6 +388,12 @@ def make_show(**overrides):
         "runs": [make_run()],
     }
     s.update(overrides)
+    if "events" not in overrides and isinstance(s["task"], dict) and s["task"].get("assignee") == "reviewer":
+        run_ids = [
+            r.get("id") for r in s["runs"] if isinstance(r, dict)
+            and isinstance(r.get("id"), int) and not isinstance(r.get("id"), bool)
+        ] if isinstance(s["runs"], list) else []
+        s["events"] = make_reviewer_events(run_ids)
     return s
 
 
@@ -707,7 +761,8 @@ def test_formal_review_metadata_valid_verdicts_are_accepted(verdict):
         "repository_state_sha256": state["aggregate_sha256"],
     }
     assert hpc._formal_review_metadata_errors(
-        task, [IMPL_ID], [make_run(id=2, profile="reviewer", metadata=metadata)]
+        task, [IMPL_ID], [make_run(id=2, profile="reviewer", metadata=metadata)],
+        make_reviewer_events([2]),
     ) == []
 
 
@@ -727,7 +782,8 @@ def test_formal_review_metadata_missing_field_is_rejected(field):
     metadata.pop(field)
     task = make_task(assignee="reviewer", body=hpc.FORMAL_REVIEW_MARKER, workspace_path=VALID_WD)
     errors = hpc._formal_review_metadata_errors(
-        task, [IMPL_ID], [make_run(id=2, profile="reviewer", metadata=metadata)]
+        task, [IMPL_ID], [make_run(id=2, profile="reviewer", metadata=metadata)],
+        make_reviewer_events([2]),
     )
     assert errors
     assert "FORMAL_REVIEW_METADATA_INVALID" in " ".join(errors)
@@ -841,8 +897,26 @@ def test_idempotency_key_returned_id_preserved(capsys):
     assert obj["task_id"] == "t_original"
 
 
+CREATED_REVIEW_ID = "t_review_created"
+
+
+def make_created_review_show(task_overrides=None, events=None):
+    """Authoritative post-create `show` for a freshly created formal review."""
+    fields = dict(
+        id=CREATED_REVIEW_ID, assignee="reviewer", status="ready",
+        workspace_path=VALID_WD, completed_at=None,
+    )
+    fields.update(task_overrides or {})
+    show = make_show(task=make_task(**fields), parents=[IMPL_ID], runs=[])
+    if events is not None:
+        show["events"] = events
+    return show
+
+
 def test_create_review_success(capsys):
-    patcher, calls = stub_create_aware(create_obj={"id": "t_review_created"})
+    patcher, calls = stub_create_aware(
+        show_obj=make_created_review_show(), create_obj={"id": CREATED_REVIEW_ID},
+    )
     with patcher:
         rc = hpc.main([
             "create-review", "--workdir", VALID_WD, "--feature", "widgets",
@@ -867,9 +941,16 @@ def test_create_review_success(capsys):
         "--idempotency-key", obj["idempotency_key"],
         "--created-by", "pipeline_bridge",
         "--max-retries", "1",
+        # D029: executable resolver slugs, never the human display labels.
+        "--model", EXPECTED_REVIEWER_MODEL_SLUG,
+        "--provider", EXPECTED_REVIEWER_PROVIDER_SLUG,
         "--json",
     ]
     assert argv[5].startswith(hpc.FORMAL_REVIEW_MARKER + "\n")
+    assert EXPECTED_REVIEWER_MODEL_LABEL not in argv
+    assert EXPECTED_REVIEWER_PROVIDER_LABEL not in argv
+    assert show_calls(calls) == [["hermes", "kanban", "show", CREATED_REVIEW_ID, "--json"]]
+    assert calls.index(argv) < calls.index(show_calls(calls)[0])
 
 
 def test_create_review_empty_impl_id(capsys):
@@ -3567,3 +3648,487 @@ def test_a51_unrelated_untracked_path_under_ai_outside_reviews_blocks_ready_to_c
     assert rc == hpc.EXIT_VALIDATION
     captured, obj = parse_rtc_reject(capsys)
     assert obj["reason_code"] == "repository_state_mismatch_kanban"
+
+
+# ---------------------------------------------------------------------------
+# D029: effective formal-review reviewer identity.
+#
+# Human labels and executable slugs are separate, independently pinned
+# contracts. create_review passes only the slugs to Hermes and proves the pin
+# from the authoritative post-create read; check/correction/archive (formal)
+# and READY_TO_COMMIT bind the accepted run to the immutable created -> claimed
+# history and fail closed on missing, stale or contradictory evidence.
+# ---------------------------------------------------------------------------
+
+def _attested_task(**overrides):
+    t = make_task(id=REVIEW_ID, assignee="reviewer")
+    t.update(overrides)
+    return t
+
+
+def _attested_run(run_id=7, **overrides):
+    return make_run(id=run_id, profile="reviewer", **overrides)
+
+
+def _override_set_event():
+    return {
+        "kind": "model_override_set",
+        "payload": {"model": EXPECTED_REVIEWER_MODEL_SLUG, "provider": EXPECTED_REVIEWER_PROVIDER_SLUG},
+        "created_at": 2,
+        "run_id": None,
+    }
+
+
+def _claim_event(run_id, payload_run_id=None):
+    return {
+        "kind": "claimed",
+        "payload": {"lock": "test-lock", "expires": 100,
+                    "run_id": run_id if payload_run_id is None else payload_run_id},
+        "created_at": 3,
+        "run_id": run_id,
+    }
+
+
+def _attest(task=None, events=None, run=None, metadata=None):
+    return hpc._require_reviewer_execution_attestation(
+        _attested_task() if task is None else task,
+        make_reviewer_events([7]) if events is None else events,
+        _attested_run() if run is None else run,
+        metadata,
+    )
+
+
+def _reject_code(fn, *args):
+    with pytest.raises(hpc.ReadyToCommitReject) as exc:
+        fn(*args)
+    return exc.value.reason_code
+
+
+def test_reviewer_identity_constants_match_independent_literals():
+    assert hpc.REVIEWER_PROFILE == EXPECTED_REVIEWER_PROFILE
+    assert hpc.REVIEWER_MODEL_LABEL == EXPECTED_REVIEWER_MODEL_LABEL
+    assert hpc.REVIEWER_PROVIDER_LABEL == EXPECTED_REVIEWER_PROVIDER_LABEL
+    assert hpc.REVIEWER_MODEL_SLUG == EXPECTED_REVIEWER_MODEL_SLUG
+    assert hpc.REVIEWER_PROVIDER_SLUG == EXPECTED_REVIEWER_PROVIDER_SLUG
+
+
+def test_reviewer_pins_are_literal_digests_of_the_independent_literals():
+    assert hpc.REVIEWER_LABEL_PIN_SHA256 == EXPECTED_REVIEWER_LABEL_PIN_SHA256
+    assert hpc.REVIEWER_EXECUTION_PIN_SHA256 == EXPECTED_REVIEWER_EXECUTION_PIN_SHA256
+    label = "\n".join((EXPECTED_REVIEWER_PROFILE, EXPECTED_REVIEWER_MODEL_LABEL, EXPECTED_REVIEWER_PROVIDER_LABEL))
+    slug = "\n".join((EXPECTED_REVIEWER_PROFILE, EXPECTED_REVIEWER_MODEL_SLUG, EXPECTED_REVIEWER_PROVIDER_SLUG))
+    assert hashlib.sha256(label.encode("utf-8")).hexdigest() == EXPECTED_REVIEWER_LABEL_PIN_SHA256
+    assert hashlib.sha256(slug.encode("utf-8")).hexdigest() == EXPECTED_REVIEWER_EXECUTION_PIN_SHA256
+
+
+def test_labels_and_slugs_are_separate_contracts():
+    assert hpc._reviewer_execution_contract() == (
+        EXPECTED_REVIEWER_PROFILE, EXPECTED_REVIEWER_MODEL_SLUG, EXPECTED_REVIEWER_PROVIDER_SLUG,
+    )
+    assert hpc._reviewer_label_contract() == (
+        EXPECTED_REVIEWER_PROFILE, EXPECTED_REVIEWER_MODEL_LABEL, EXPECTED_REVIEWER_PROVIDER_LABEL,
+    )
+    labels = {EXPECTED_REVIEWER_MODEL_LABEL, EXPECTED_REVIEWER_PROVIDER_LABEL}
+    slugs = {EXPECTED_REVIEWER_MODEL_SLUG, EXPECTED_REVIEWER_PROVIDER_SLUG}
+    assert not labels & slugs
+
+
+@pytest.mark.parametrize("constant,contract,reason_code", [
+    ("REVIEWER_PROFILE", "_reviewer_execution_contract", "reviewer_execution_pin_mismatch"),
+    ("REVIEWER_MODEL_SLUG", "_reviewer_execution_contract", "reviewer_execution_pin_mismatch"),
+    ("REVIEWER_PROVIDER_SLUG", "_reviewer_execution_contract", "reviewer_execution_pin_mismatch"),
+    ("REVIEWER_PROFILE", "_reviewer_label_contract", "reviewer_label_pin_mismatch"),
+    ("REVIEWER_MODEL_LABEL", "_reviewer_label_contract", "reviewer_label_pin_mismatch"),
+    ("REVIEWER_PROVIDER_LABEL", "_reviewer_label_contract", "reviewer_label_pin_mismatch"),
+])
+def test_drifted_reviewer_constant_fails_its_pin(monkeypatch, constant, contract, reason_code):
+    monkeypatch.setattr(hpc, constant, "drifted-value")
+    assert _reject_code(getattr(hpc, contract)) == reason_code
+
+
+def test_drifted_slug_with_self_consistent_evidence_is_rejected(monkeypatch):
+    """ADVERSARIAL: drift the constant AND every Hermes record together."""
+    monkeypatch.setattr(hpc, "REVIEWER_MODEL_SLUG", "wrong-model")
+    events = make_reviewer_events([7])
+    events[0]["payload"]["model_override"] = "wrong-model"
+    task = _attested_task(model_override="wrong-model")
+    assert _reject_code(_attest, task, events) == "reviewer_execution_pin_mismatch"
+
+
+def test_attestation_accepts_the_real_reviewer_execution():
+    assert _attest() == 7
+
+
+def test_attestation_accepts_self_report_matching_the_label_contract():
+    metadata = {
+        "reviewer_profile": EXPECTED_REVIEWER_PROFILE,
+        "reviewer_model": EXPECTED_REVIEWER_MODEL_LABEL,
+        "reviewer_provider": EXPECTED_REVIEWER_PROVIDER_LABEL,
+    }
+    assert _attest(metadata=metadata) == 7
+
+
+def test_attestation_ignores_non_object_metadata():
+    """Metadata shape is owned by the existing metadata gates."""
+    assert _attest(metadata=None) == 7
+
+
+@pytest.mark.parametrize("field,value", [
+    ("reviewer_model", EXPECTED_REVIEWER_MODEL_SLUG),
+    ("reviewer_provider", EXPECTED_REVIEWER_PROVIDER_SLUG),
+    ("reviewer_model", "Some Other Model"),
+    ("reviewer_profile", "coder-claude"),
+])
+def test_contradictory_self_report_is_rejected(field, value):
+    assert _reject_code(_attest, None, None, None, {field: value}) == "reviewer_self_report_contradiction"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("assignee", "coder-claude"),
+    ("model_override", None),
+    ("provider_override", None),
+    ("model_override", EXPECTED_REVIEWER_MODEL_LABEL),
+    ("provider_override", EXPECTED_REVIEWER_PROVIDER_LABEL),
+    ("model_override", "gpt-5"),
+])
+def test_wrong_current_task_configuration_is_rejected(field, value):
+    assert _reject_code(_attest, _attested_task(**{field: value})) == "reviewer_execution_config_mismatch"
+
+
+def test_display_labels_are_rejected_at_the_executable_creation_boundary():
+    events = make_reviewer_events([7])
+    events[0]["payload"]["model_override"] = EXPECTED_REVIEWER_MODEL_LABEL
+    events[0]["payload"]["provider_override"] = EXPECTED_REVIEWER_PROVIDER_LABEL
+    task = _attested_task(
+        model_override=EXPECTED_REVIEWER_MODEL_LABEL, provider_override=EXPECTED_REVIEWER_PROVIDER_LABEL,
+    )
+    assert _reject_code(hpc._require_reviewer_creation_pin, task, events) == "reviewer_execution_config_mismatch"
+
+
+def test_override_changed_away_and_back_is_rejected_even_when_current_values_match():
+    """ADVERSARIAL: a later override mutation cannot be erased by restoring it."""
+    events = make_reviewer_events([7])
+    events.insert(1, _override_set_event())
+    assert _reject_code(_attest, None, events) == "reviewer_execution_override_mutated"
+
+
+def test_unrecognized_history_event_is_rejected():
+    events = make_reviewer_events([7])
+    events.insert(1, {"kind": "assigned", "payload": {"assignee": "coder-claude"}, "run_id": None})
+    assert _reject_code(_attest, None, events) == "reviewer_execution_event_unrecognized"
+
+
+@pytest.mark.parametrize("events,reason_code", [
+    (None, "reviewer_execution_events_missing"),
+    ([], "reviewer_execution_events_missing"),
+    ({"kind": "created"}, "reviewer_execution_events_missing"),
+    (["created"], "reviewer_execution_event_malformed"),
+    ([{"payload": {}}], "reviewer_execution_event_malformed"),
+])
+def test_missing_or_malformed_history_is_rejected(events, reason_code):
+    task = _attested_task()
+    assert _reject_code(hpc._require_reviewer_creation_pin, task, events) == reason_code
+
+
+def test_created_event_must_be_unique_and_first():
+    events = make_reviewer_events([7])
+    assert _reject_code(_attest, None, list(reversed(events))) == "reviewer_execution_created_event_invalid"
+    duplicated = make_reviewer_events([7]) + make_reviewer_events()
+    assert _reject_code(_attest, None, duplicated) == "reviewer_execution_created_event_invalid"
+    without_created = make_reviewer_events([7])[1:]
+    assert _reject_code(_attest, None, without_created) == "reviewer_execution_created_event_invalid"
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda e: e[0].__setitem__("payload", None),
+    lambda e: e[0]["payload"].__setitem__("model_override", None),
+    lambda e: e[0]["payload"].__setitem__("provider_override", "openai"),
+    lambda e: e[0]["payload"].__setitem__("assignee", "coder-claude"),
+    lambda e: e[0].__setitem__("run_id", 7),
+])
+def test_created_event_must_record_the_executable_pin(mutate):
+    events = make_reviewer_events([7])
+    mutate(events)
+    assert _reject_code(_attest, None, events) == "reviewer_execution_created_event_mismatch"
+
+
+def test_accepted_run_without_its_claim_is_rejected():
+    assert _reject_code(_attest, None, make_reviewer_events()) == "reviewer_execution_claim_missing"
+
+
+def test_claim_for_another_run_does_not_attest_the_accepted_run():
+    """ADVERSARIAL: stale evidence from an earlier run cannot be reused."""
+    assert _reject_code(_attest, None, make_reviewer_events([6])) == "reviewer_execution_claim_missing"
+
+
+def test_duplicate_claims_for_the_accepted_run_are_rejected():
+    events = make_reviewer_events([7]) + [_claim_event(7)]
+    assert _reject_code(_attest, None, events) == "reviewer_execution_claim_missing"
+
+
+def test_later_claimed_run_makes_the_accepted_run_stale():
+    events = make_reviewer_events([7, 8])
+    assert _reject_code(_attest, None, events) == "reviewer_execution_claim_stale"
+
+
+@pytest.mark.parametrize("claim", [
+    _claim_event(7, payload_run_id=6),
+    dict(_claim_event(7), payload=None),
+    dict(_claim_event(7), run_id=None),
+    dict(_claim_event(7), run_id=True),
+])
+def test_malformed_claim_is_rejected(claim):
+    events = make_reviewer_events() + [claim]
+    assert _reject_code(_attest, None, events) == "reviewer_execution_claim_event_malformed"
+
+
+@pytest.mark.parametrize("payload_run_id", [True, 1.0])
+def test_claim_payload_run_id_must_be_a_non_bool_int_equal_to_event_run_id(payload_run_id):
+    # True == 1 and 1.0 == 1 in Python; neither may stand in for run id 1.
+    events = make_reviewer_events([7]) + [_claim_event(1, payload_run_id)]
+    assert _reject_code(_attest, None, events) == "reviewer_execution_claim_event_malformed"
+
+
+@pytest.mark.parametrize("run,reason_code", [
+    (None, None),
+    (dict(_attested_run(), profile="coder-claude"), "reviewer_execution_run_profile_mismatch"),
+    (dict(_attested_run(), id=True), "reviewer_execution_run_id_invalid"),
+    (dict(_attested_run(), id="7"), "reviewer_execution_run_id_invalid"),
+    (dict(_attested_run(), id=0), "reviewer_execution_run_id_invalid"),
+])
+def test_accepted_run_must_be_a_reviewer_run_with_a_valid_id(run, reason_code):
+    if run is None:
+        code = _reject_code(
+            hpc._require_reviewer_execution_attestation, _attested_task(), make_reviewer_events([7]), None, None,
+        )
+        assert code == "reviewer_execution_run_shape"
+        return
+    assert _reject_code(_attest, None, None, run) == reason_code
+
+
+def test_attestation_requires_a_task_object():
+    assert _reject_code(
+        hpc._require_reviewer_execution_attestation, None, make_reviewer_events([7]), _attested_run(), None,
+    ) == "reviewer_execution_task_shape"
+
+
+# --- create_review: executable pin and authoritative post-create proof ---
+
+def _run_create_review():
+    return hpc.main([
+        "create-review", "--workdir", VALID_WD, "--feature", "widgets",
+        "--implementation_task_id", IMPL_ID,
+    ])
+
+
+def _override_set_history():
+    events = make_reviewer_events()
+    events.append(_override_set_event())
+    return events
+
+
+def _label_pinned_history():
+    events = make_reviewer_events()
+    events[0]["payload"]["model_override"] = EXPECTED_REVIEWER_MODEL_LABEL
+    return events
+
+
+@pytest.mark.parametrize("task_overrides,events,reason_code", [
+    ({"model_override": None, "provider_override": None}, None, "reviewer_execution_config_mismatch"),
+    ({"model_override": EXPECTED_REVIEWER_MODEL_LABEL}, None, "reviewer_execution_config_mismatch"),
+    ({"provider_override": "openai"}, None, "reviewer_execution_config_mismatch"),
+    ({"assignee": "coder-claude"}, None, "reviewer_execution_config_mismatch"),
+    (None, _label_pinned_history(), "reviewer_execution_created_event_mismatch"),
+    (None, _override_set_history(), "reviewer_execution_override_mutated"),
+    (None, [], "reviewer_execution_events_missing"),
+])
+def test_create_review_fails_closed_when_the_pin_is_not_proven(capsys, task_overrides, events, reason_code):
+    show = make_created_review_show(task_overrides=task_overrides, events=events)
+    patcher, calls = stub_create_aware(show_obj=show, create_obj={"id": CREATED_REVIEW_ID})
+    with patcher:
+        rc = _run_create_review()
+    assert rc == hpc.EXIT_VALIDATION
+    _, obj = parse_single_json_line(capsys, ["phase", "blocked", "reason", "task_id"])
+    assert obj["phase"] == "review"
+    assert "reviewer-execution post-condition failed" in obj["reason"]
+    assert reason_code in obj["reason"]
+    assert len(create_calls(calls)) == 1
+    assert len(show_calls(calls)) == 1
+
+
+@pytest.mark.parametrize("show_mutation", [
+    lambda s: s.__setitem__("parents", ["t_other_impl"]),
+    lambda s: s["task"].__setitem__("id", "t_someone_else"),
+    lambda s: s["task"].__setitem__("workspace_path", "/opt/ai/projects/elsewhere"),
+])
+def test_create_review_fails_closed_on_ownership_mismatch(capsys, show_mutation):
+    show = make_created_review_show()
+    show_mutation(show)
+    patcher, calls = stub_create_aware(show_obj=show, create_obj={"id": CREATED_REVIEW_ID})
+    with patcher:
+        rc = _run_create_review()
+    assert rc == hpc.EXIT_VALIDATION
+    _, obj = parse_single_json_line(capsys, ["phase", "blocked", "reason", "task_id"])
+    assert "ownership post-condition failed" in obj["reason"]
+
+
+def test_create_review_post_create_read_failure_is_transport(capsys):
+    patcher, calls = stub_create_aware(
+        show_obj=make_created_review_show(), show_exit=1, create_obj={"id": CREATED_REVIEW_ID},
+    )
+    with patcher:
+        rc = _run_create_review()
+    assert rc == hpc.EXIT_TRANSPORT
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "transport error" in captured.err
+
+
+def test_create_review_drifted_constant_blocks_before_any_kanban_call(monkeypatch, capsys):
+    monkeypatch.setattr(hpc, "REVIEWER_PROVIDER_SLUG", EXPECTED_REVIEWER_PROVIDER_LABEL)
+    patcher, calls = stub_create_aware(show_obj=make_created_review_show(), create_obj={"id": CREATED_REVIEW_ID})
+    with patcher:
+        rc = _run_create_review()
+    assert rc == hpc.EXIT_VALIDATION
+    _, obj = parse_single_json_line(capsys, ["phase", "blocked", "reason", "task_id"])
+    assert "reviewer_execution_pin_mismatch" in obj["reason"]
+    assert create_calls(calls) == []
+    assert show_calls(calls) == []
+
+
+def test_create_review_idempotent_replay_of_a_completed_attested_review_succeeds(capsys):
+    show = make_created_review_show(task_overrides={"status": "done", "completed_at": 5})
+    show["runs"] = [make_run(id=3, profile="reviewer")]
+    show["events"] = make_reviewer_events([3])
+    patcher, calls = stub_create_aware(show_obj=show, create_obj={"id": CREATED_REVIEW_ID})
+    with patcher:
+        rc = _run_create_review()
+    assert rc == hpc.EXIT_OK
+
+
+# --- formal check / archive / correction consume the same attestation ---
+
+def _formal_review_metadata(verdict="PASS", **overrides):
+    state = _formal_state(VALID_WD)
+    md = {
+        "implementation_task_id": IMPL_ID,
+        "verdict": verdict,
+        "mutation_performed": False,
+        "repository_state": state,
+        "repository_state_sha256": state["aggregate_sha256"],
+    }
+    md.update(overrides)
+    return md
+
+
+def _formal_review_show(task_overrides=None, run_id=3, verdict="PASS", summary="PASS"):
+    task = make_task(
+        id=REVIEW_ID, assignee="reviewer", workspace_path=VALID_WD,
+        body=hpc.FORMAL_REVIEW_MARKER + "\nReview widgets",
+    )
+    task.update(task_overrides or {})
+    run = make_run(
+        id=run_id, profile="reviewer", status="done", outcome="completed",
+        summary=summary, metadata=_formal_review_metadata(verdict),
+    )
+    return make_show(task=task, parents=[IMPL_ID], runs=[run])
+
+
+def test_check_accepts_an_attested_formal_review(capsys):
+    show = _formal_review_show()
+    with stub_hermes(show, show["runs"]):
+        rc = hpc.main(["check", REVIEW_ID])
+    assert rc == hpc.EXIT_OK
+    _, obj = parse_stdout_line(capsys)
+    assert obj["errors"] == []
+
+
+def test_check_rejects_a_legacy_unbound_formal_review(capsys):
+    show = _formal_review_show(task_overrides={"model_override": None, "provider_override": None})
+    with stub_hermes(show, show["runs"]):
+        rc = hpc.main(["check", REVIEW_ID])
+    assert rc == hpc.EXIT_VALIDATION
+    _, obj = parse_stdout_line(capsys)
+    assert any(
+        "FORMAL_REVIEW_REVIEWER_UNATTESTED" in e and "reviewer_execution_config_mismatch" in e
+        for e in obj["errors"]
+    ), obj["errors"]
+
+
+def test_archive_review_accepts_an_attested_formal_review(capsys):
+    patcher, calls, _ = stub_archive_aware(show_obj=_formal_review_show())
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_OK
+    assert len(archive_helper_calls(calls)) == 1
+
+
+@pytest.mark.parametrize("mutate,reason_code", [
+    (lambda s: s["events"].insert(1, _override_set_event()), "reviewer_execution_override_mutated"),
+    (lambda s: s["events"].pop(), "reviewer_execution_claim_missing"),
+    (lambda s: s["events"].append(_claim_event(4)), "reviewer_execution_claim_stale"),
+    (lambda s: s["task"].__setitem__("model_override", EXPECTED_REVIEWER_MODEL_LABEL),
+     "reviewer_execution_config_mismatch"),
+])
+def test_archive_review_blocks_an_unattested_formal_review(capsys, mutate, reason_code):
+    show = _formal_review_show()
+    mutate(show)
+    patcher, calls, _ = stub_archive_aware(show_obj=show)
+    with patcher:
+        rc = run_archive_review()
+    assert rc == hpc.EXIT_VALIDATION
+    _, obj = parse_archive_blocked(capsys)
+    assert reason_code in obj["reason"]
+    assert archive_helper_calls(calls) == []
+
+
+def test_create_correction_blocks_an_unattested_formal_review(capsys):
+    show = _formal_review_show(verdict="CHANGES REQUIRED", summary="CHANGES REQUIRED")
+    show["events"] = make_reviewer_events()
+    patcher, calls = stub_create_aware(show_obj=show, create_obj={"id": "t_corr"})
+    with patcher:
+        rc = hpc.main([
+            "create-correction", "--workdir", VALID_WD, "--feature", "widgets",
+            "--implementation_task_id", IMPL_ID, "--review_task_id", REVIEW_ID,
+        ])
+    assert rc == hpc.EXIT_VALIDATION
+    _, obj = parse_single_json_line(capsys, ["phase", "blocked", "reason", "task_id"])
+    assert "reviewer_execution_claim_missing" in obj["reason"]
+    assert create_calls(calls) == []
+
+
+# --- READY_TO_COMMIT requires the attested reviewer execution ---
+
+@pytest.mark.parametrize("mutate,reason_code", [
+    (lambda s: s["events"].insert(1, _override_set_event()), "reviewer_execution_override_mutated"),
+    (lambda s: s["events"].pop(), "reviewer_execution_claim_missing"),
+    (lambda s: s["events"].append(_claim_event(11)), "reviewer_execution_claim_stale"),
+    (lambda s: s["events"][0]["payload"].__setitem__("model_override", "gpt-5"),
+     "reviewer_execution_created_event_mismatch"),
+    (lambda s: s["task"].__setitem__("provider_override", EXPECTED_REVIEWER_PROVIDER_LABEL),
+     "reviewer_execution_config_mismatch"),
+    (lambda s: s["task"].__setitem__("model_override", None), "reviewer_execution_config_mismatch"),
+    (lambda s: s["runs"][0]["metadata"].__setitem__("reviewer_provider", "Other Provider"),
+     "reviewer_self_report_contradiction"),
+])
+def test_rtc_rejects_unattested_reviewer_execution(tmp_path, monkeypatch, capsys, mutate, reason_code):
+    repo, state, impl_show, review_show, envelope = setup_rtc_ready(tmp_path, monkeypatch)
+    mutate(review_show)
+    run, calls = make_rtc_stub(impl_show, review_show)
+    with mock.patch.object(hpc.subprocess, "run", side_effect=run):
+        rc = run_rtc(repo)
+    assert rc == hpc.EXIT_VALIDATION
+    _, obj = parse_rtc_reject(capsys)
+    assert obj["reason_code"] == reason_code
+
+
+def test_reviewer_identity_matches_the_normative_contract_document():
+    path = os.path.join(os.path.dirname(__file__), "..", "docs", "implementation-routing-contract.md")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    for literal in (
+        EXPECTED_REVIEWER_PROFILE, EXPECTED_REVIEWER_MODEL_LABEL, EXPECTED_REVIEWER_PROVIDER_LABEL,
+        EXPECTED_REVIEWER_MODEL_SLUG, EXPECTED_REVIEWER_PROVIDER_SLUG,
+        "model_override_set", "`created`", "`claimed`",
+    ):
+        assert literal in text, literal
