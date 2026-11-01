@@ -70,6 +70,28 @@ REVIEW_ARCHIVE_ENVELOPE_KEYS = frozenset({
 REVIEW_ARCHIVE_FILENAME_RE_TEMPLATE = r"^\d{8}_\d{6}-%s\.md$"
 REVIEW_ARCHIVE_JSON_BLOCK_RE = re.compile(r"```json\r?\n(.*?)\r?\n```", re.DOTALL)
 FORMAL_REVIEW_MARKER = "HERMES_FORMAL_REVIEW_V1"
+# D029: effective formal-review reviewer identity. Human-facing labels and the
+# executable identifiers consumed by the installed Hermes resolver are separate,
+# independently pinned contracts; labels never cross `--model` / `--provider`.
+REVIEWER_PROFILE = "reviewer"
+REVIEWER_MODEL_LABEL = "GPT-5.6 Sol"
+REVIEWER_PROVIDER_LABEL = "OpenAI Codex"
+REVIEWER_MODEL_SLUG = "gpt-5.6-sol"
+REVIEWER_PROVIDER_SLUG = "openai-codex"
+# sha256("\n".join(triple)); a second encoding of each triple, so drifting one
+# constant fails closed instead of silently moving the accepted identity.
+REVIEWER_LABEL_PIN_SHA256 = "a97d3050be9547857cce049fa3e3cff87afcf254ea52a13a43d0a515ad3c5566"
+REVIEWER_EXECUTION_PIN_SHA256 = "8b1ea43f3b6a43887fd249705f336c6b4271d0e37e12aa257dcf326564becde7"
+# Optional reviewer self-report keys. Never sufficient as evidence; when present
+# they must agree with the label contract or the review fails closed.
+REVIEWER_SELF_REPORT_KEYS = ("reviewer_profile", "reviewer_model", "reviewer_provider")
+# The executable pin is proven from Hermes-owned records, never from the
+# reviewer: the current task columns, the single immutable first `created`
+# event, the absence of any `model_override_set` (or unrecognized) event, and
+# exactly one run-scoped `claimed` event for the accepted run. Installed Hermes
+# exposes no model/provider on task runs, so this is the strongest run-bound
+# execution evidence available without changing the runtime.
+REVIEWER_OVERRIDE_MUTATION_EVENT = "model_override_set"
 BOOTSTRAP_PROVENANCE_SCHEMA = "hermes.implementation-provenance/operator-bootstrap/v1"
 BOOTSTRAP_REASON = "IMPLEMENTATION_BOOTSTRAP_PROVENANCE_GAP"
 
@@ -356,7 +378,7 @@ def _is_formal_review_task(task):
     )
 
 
-def _formal_review_metadata_errors(task, parents, runs):
+def _formal_review_metadata_errors(task, parents, runs, events):
     """Return fail-closed errors for a marked formal review completion.
 
     This is deliberately scoped by FORMAL_REVIEW_MARKER so historical and
@@ -376,6 +398,10 @@ def _formal_review_metadata_errors(task, parents, runs):
         errors.append("formal review latest run status is %r, expected 'done'" % latest.get("status"))
     if latest.get("outcome") != "completed":
         errors.append("formal review latest run outcome is %r, expected 'completed'" % latest.get("outcome"))
+    try:
+        _require_reviewer_execution_attestation(task, events, latest, latest.get("metadata"))
+    except ReadyToCommitReject as exc:
+        errors.append("FORMAL_REVIEW_REVIEWER_UNATTESTED: %s: %s" % (exc.reason_code, exc.reason))
     metadata = latest.get("metadata")
     if not isinstance(metadata, dict):
         errors.append("FORMAL_REVIEW_METADATA_INVALID: metadata must be a JSON object")
@@ -789,7 +815,9 @@ def check_task(task_id):
     errors = validate_payloads(task_id, show, runs)
     task = show.get("task")
     if not errors and _is_formal_review_task(task):
-        errors.extend(_formal_review_metadata_errors(task, show.get("parents"), show.get("runs")))
+        errors.extend(_formal_review_metadata_errors(
+            task, show.get("parents"), show.get("runs"), show.get("events"),
+        ))
     valid = not errors
     emit_result(task_id, show_completed.returncode, runs_completed.returncode, valid, errors)
     return EXIT_OK if valid else EXIT_VALIDATION
@@ -1372,21 +1400,46 @@ def create_review(args):
         )
     body = FORMAL_REVIEW_MARKER + "\n" + body
 
+    # D029: pin the reviewer execution identity into the Hermes task using the
+    # executable resolver slugs; the human labels never cross this boundary.
+    try:
+        profile, model_slug, provider_slug = _reviewer_execution_contract()
+    except ReadyToCommitReject as exc:
+        raise ValidationBlock(phase, "%s: %s" % (exc.reason_code, exc.reason))
     argv = [
         "hermes", "kanban", "create",
         "Review %s in %s" % (feature, resolved.name),
         "--body", body,
-        "--assignee", "reviewer",
+        "--assignee", profile,
         "--parent", impl_id,
         "--workspace", "dir:" + str(resolved),
         "--idempotency-key", key,
         "--created-by", "pipeline_bridge",
         "--max-retries", "1",
+        "--model", model_slug,
+        "--provider", provider_slug,
         "--json",
     ]
     completed = run_hermes_command(argv)
     payload = parse_json_stdout(completed, "hermes kanban create")
     task_id = extract_real_id(payload)
+    # Authoritative post-create read: success is reported only once the created
+    # (or idempotently replayed) task and its immutable history prove the pin.
+    show_completed = run_hermes_command(["hermes", "kanban", "show", task_id, "--json"])
+    show = validate_show_top_level(parse_json_stdout(show_completed, "hermes kanban show " + task_id))
+    review_task = show.get("task")
+    if (not isinstance(review_task, dict)
+            or review_task.get("id") != task_id
+            or show.get("parents") != [impl_id]
+            or review_task.get("workspace_path") != str(resolved)):
+        raise ValidationBlock(phase, "created review ownership post-condition failed")
+    try:
+        _require_reviewer_creation_pin(review_task, show.get("events"))
+    except ReadyToCommitReject as exc:
+        raise ValidationBlock(
+            phase, "created review reviewer-execution post-condition failed: %s: %s"
+            % (exc.reason_code, exc.reason),
+        )
     emit_success(phase, task_id, key, str(resolved), feature, [impl_id])
     return EXIT_OK
 
@@ -1420,7 +1473,9 @@ def create_correction(args):
     if not all(isinstance(r.get("id"), (int, str)) for r in runs):
         raise ValidationBlock(phase, "ambiguous verdict, cannot create correction")
     if _is_formal_review_task(task):
-        formal_errors = _formal_review_metadata_errors(task, show.get("parents"), runs)
+        formal_errors = _formal_review_metadata_errors(
+            task, show.get("parents"), runs, show.get("events"),
+        )
         if formal_errors:
             raise ValidationBlock(phase, "; ".join(formal_errors))
     try:
@@ -1534,7 +1589,9 @@ def archive_review(args):
     latest_run = select_latest_run(phase, show.get("runs"))
 
     if _is_formal_review_task(task):
-        formal_errors = _formal_review_metadata_errors(task, show.get("parents"), show.get("runs"))
+        formal_errors = _formal_review_metadata_errors(
+            task, show.get("parents"), show.get("runs"), show.get("events"),
+        )
         if formal_errors:
             raise ValidationBlock(phase, "; ".join(formal_errors))
 
@@ -2149,6 +2206,147 @@ def _validate_review_latest_run(run, implementation_task_id):
     return metadata
 
 
+def _pinned_reviewer_contract(triple, expected_digest, reason_code, description):
+    digest = hashlib.sha256("\n".join(triple).encode("utf-8")).hexdigest()
+    if digest != expected_digest:
+        raise ReadyToCommitReject(
+            reason_code,
+            "reviewer constants %r do not match the pinned %s %s" % (triple, description, expected_digest),
+        )
+    return triple
+
+
+def _reviewer_execution_contract():
+    """Return the pinned executable (profile, model slug, provider slug)."""
+    return _pinned_reviewer_contract(
+        (REVIEWER_PROFILE, REVIEWER_MODEL_SLUG, REVIEWER_PROVIDER_SLUG),
+        REVIEWER_EXECUTION_PIN_SHA256, "reviewer_execution_pin_mismatch",
+        "formal-review execution contract",
+    )
+
+
+def _reviewer_label_contract():
+    """Return the independently pinned human-facing (profile, model, provider)."""
+    return _pinned_reviewer_contract(
+        (REVIEWER_PROFILE, REVIEWER_MODEL_LABEL, REVIEWER_PROVIDER_LABEL),
+        REVIEWER_LABEL_PIN_SHA256, "reviewer_label_pin_mismatch",
+        "formal-review label contract",
+    )
+
+
+def _require_reviewer_creation_pin(task, events):
+    """Prove the review task was created with, and still carries, the executable pin.
+
+    Evidence is Hermes-owned only: the current task columns, exactly one
+    `created` event that is the first event and records the same overrides,
+    and a history containing only recognized kinds and no override mutation.
+    Changing an override away and back therefore cannot erase the evidence.
+    """
+    expected = _reviewer_execution_contract()
+    if not isinstance(task, dict):
+        raise ReadyToCommitReject("reviewer_execution_task_shape", "review task must be a JSON object")
+    current = (task.get("assignee"), task.get("model_override"), task.get("provider_override"))
+    if current != expected:
+        raise ReadyToCommitReject(
+            "reviewer_execution_config_mismatch",
+            "review task execution configuration is %r, expected %r" % (current, expected),
+        )
+    if not isinstance(events, list) or not events:
+        raise ReadyToCommitReject(
+            "reviewer_execution_events_missing", "review task events must be a non-empty JSON array",
+        )
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or not isinstance(event.get("kind"), str):
+            raise ReadyToCommitReject(
+                "reviewer_execution_event_malformed", "review task events[%d] is malformed" % index,
+            )
+        if event["kind"] == REVIEWER_OVERRIDE_MUTATION_EVENT:
+            raise ReadyToCommitReject(
+                "reviewer_execution_override_mutated",
+                "review task history contains %s at events[%d]" % (REVIEWER_OVERRIDE_MUTATION_EVENT, index),
+            )
+        if event["kind"] not in EVENT_KINDS:
+            raise ReadyToCommitReject(
+                "reviewer_execution_event_unrecognized",
+                "review task events[%d].kind %r is not attestable" % (index, event["kind"]),
+            )
+    created = [event for event in events if event["kind"] == "created"]
+    if len(created) != 1 or created[0] is not events[0]:
+        raise ReadyToCommitReject(
+            "reviewer_execution_created_event_invalid",
+            "review task must have exactly one created event and it must be first",
+        )
+    payload = created[0].get("payload")
+    if (created[0].get("run_id") is not None
+            or not isinstance(payload, dict)
+            or (payload.get("assignee"), payload.get("model_override"), payload.get("provider_override")) != expected):
+        raise ReadyToCommitReject(
+            "reviewer_execution_created_event_mismatch",
+            "immutable review creation event does not pin %r" % (expected,),
+        )
+    return expected
+
+
+def _require_reviewer_execution_attestation(task, events, run, metadata):
+    """Bind the accepted reviewer run to the immutable created -> claimed history.
+
+    `run` is the accepted (latest) review run. It must carry the pinned profile
+    and own exactly one run-scoped `claimed` event, and no later run may have
+    been claimed. Reviewer-authored identity fields are never evidence; when
+    present they must equal the label contract, otherwise the review fails
+    closed as contradictory.
+    """
+    profile, _model_slug, _provider_slug = _require_reviewer_creation_pin(task, events)
+    if not isinstance(run, dict):
+        raise ReadyToCommitReject("reviewer_execution_run_shape", "review run must be a JSON object")
+    run_id = run.get("id")
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+        raise ReadyToCommitReject(
+            "reviewer_execution_run_id_invalid", "review run id must be a positive integer, got %r" % (run_id,),
+        )
+    if run.get("profile") != profile:
+        raise ReadyToCommitReject(
+            "reviewer_execution_run_profile_mismatch",
+            "review run profile is %r, expected %r" % (run.get("profile"), profile),
+        )
+    claims = []
+    for index, event in enumerate(events):
+        if event["kind"] != "claimed":
+            continue
+        claim_run_id = event.get("run_id")
+        payload = event.get("payload")
+        payload_run_id = payload.get("run_id") if isinstance(payload, dict) else None
+        if (isinstance(claim_run_id, bool) or not isinstance(claim_run_id, int) or claim_run_id <= 0
+                or isinstance(payload_run_id, bool) or not isinstance(payload_run_id, int)
+                or payload_run_id != claim_run_id):
+            raise ReadyToCommitReject(
+                "reviewer_execution_claim_event_malformed",
+                "claimed event events[%d] does not bind exactly one run id" % index,
+            )
+        if claim_run_id > run_id:
+            raise ReadyToCommitReject(
+                "reviewer_execution_claim_stale",
+                "review run %r is stale: run %r was claimed later" % (run_id, claim_run_id),
+            )
+        if claim_run_id == run_id:
+            claims.append(event)
+    if len(claims) != 1:
+        raise ReadyToCommitReject(
+            "reviewer_execution_claim_missing",
+            "review run %r must have exactly one claimed event, found %d" % (run_id, len(claims)),
+        )
+    labels = dict(zip(REVIEWER_SELF_REPORT_KEYS, _reviewer_label_contract()))
+    if isinstance(metadata, dict):
+        for key, expected_label in labels.items():
+            if key in metadata and metadata[key] != expected_label:
+                raise ReadyToCommitReject(
+                    "reviewer_self_report_contradiction",
+                    "reviewer-reported %s %r contradicts the pinned label %r"
+                    % (key, metadata[key], expected_label),
+                )
+    return run_id
+
+
 def _validate_review_metadata_repository_state(metadata, canonical_workdir):
     state = metadata.get("repository_state")
     if not isinstance(state, dict):
@@ -2372,6 +2570,10 @@ def ready_to_commit(args):
     _validate_review_parents(review_show.get("parents"), implementation_task_id)
     review_latest = _select_latest_run_reject("review_run_selection_invalid", review_show.get("runs"))
     metadata = _validate_review_latest_run(review_latest, implementation_task_id)
+    # D029: the accepted review run must be the attested reviewer execution.
+    _require_reviewer_execution_attestation(
+        review_show.get("task"), review_show.get("events"), review_latest, metadata,
+    )
 
     try:
         verdict, verdict_source = classify_verdict(review_latest)

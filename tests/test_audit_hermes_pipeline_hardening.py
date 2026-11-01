@@ -82,8 +82,23 @@ REVALIDATED_PIPELINE_CONTROLLER_TEMPLATE_SHA256 = FROZEN_PIPELINE_CONTROLLER_MCP
 SUPERSEDED_A7_HERMES_PIPELINE_CONTROLLER_SHA256 = (
     "4c677f1e8f72bb378eb39fb1a8e8f5bcd99c764918a3d3f9c271cb694864c900"
 )
-FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256 = (
+# D029 re-pin on main d598301: the controller gained the formal-review reviewer
+# execution-identity contract (separate pinned label/slug triples, --model /
+# --provider slugs at create_review, authoritative post-create proof, and the
+# created -> no-override-mutation -> run-claimed attestation in check,
+# correction, archive and READY_TO_COMMIT). The adapter template is unchanged.
+# The A7 revalidated value is kept as provenance only; it is never asserted
+# against the live file. See test_d029_controller_repin_is_justified.
+SUPERSEDED_PRE_D029_HERMES_PIPELINE_CONTROLLER_SHA256 = (
     "d7c41ecdc1a22cfa3521e8f5c13ad315fc8c0236b234597b3cc68bdf0cbbf667"
+)
+# SUPERSEDED by the final D029 controller change (provenance only; never
+# asserted against the live file): the initial D029 re-pin value.
+SUPERSEDED_D029_INITIAL_HERMES_PIPELINE_CONTROLLER_SHA256 = (
+    "44addf35fdacd90d5787816de71598b6fec608b52c66db66369f39c0ae1a409c"
+)
+FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256 = (
+    "5aa5d286303a31429269c6cc4a4dcb4ffa2d906a6f71d01821c9753253f331d6"
 )
 
 REPO_ONLY_FILES = [
@@ -1758,6 +1773,39 @@ def test_a7_frozen_source_files_sha256_unchanged():
         assert hashlib.sha256(f.read()).hexdigest() == FROZEN_PIPELINE_CONTROLLER_MCP_SHA256
     with open(HERMES_PIPELINE_CONTROLLER_PATH, "rb") as f:
         assert hashlib.sha256(f.read()).hexdigest() == FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256
+
+
+def test_d029_controller_repin_is_justified():
+    """The D029 controller re-pin is legitimate only while the reviewer
+    execution-identity contract it was made for is present: the lock moved,
+    the adapter lock did not, and the controller carries the D029 surface.
+    A re-pin without that change, or a silent removal of it, fails here."""
+    assert SUPERSEDED_PRE_D029_HERMES_PIPELINE_CONTROLLER_SHA256 != FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256
+    assert SUPERSEDED_A7_HERMES_PIPELINE_CONTROLLER_SHA256 != FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256
+    assert SUPERSEDED_D029_INITIAL_HERMES_PIPELINE_CONTROLLER_SHA256 != FROZEN_HERMES_PIPELINE_CONTROLLER_SHA256
+    assert REVALIDATED_PIPELINE_CONTROLLER_TEMPLATE_SHA256 == FROZEN_PIPELINE_CONTROLLER_MCP_SHA256
+    with open(HERMES_PIPELINE_CONTROLLER_PATH, encoding="utf-8") as f:
+        source = f.read()
+    for marker in (
+        'REVIEWER_MODEL_LABEL = "GPT-5.6 Sol"',
+        'REVIEWER_PROVIDER_LABEL = "OpenAI Codex"',
+        'REVIEWER_MODEL_SLUG = "gpt-5.6-sol"',
+        'REVIEWER_PROVIDER_SLUG = "openai-codex"',
+        'REVIEWER_LABEL_PIN_SHA256 = "a97d3050be9547857cce049fa3e3cff87afcf254ea52a13a43d0a515ad3c5566"',
+        'REVIEWER_EXECUTION_PIN_SHA256 = "8b1ea43f3b6a43887fd249705f336c6b4271d0e37e12aa257dcf326564becde7"',
+        'REVIEWER_OVERRIDE_MUTATION_EVENT = "model_override_set"',
+        '"--model", model_slug,',
+        '"--provider", provider_slug,',
+        "def _require_reviewer_creation_pin(task, events):",
+        "def _require_reviewer_execution_attestation(task, events, run, metadata):",
+    ):
+        assert marker in source, marker
+    # Definition + formal-review gate + READY_TO_COMMIT; the formal-review gate
+    # is consumed by check, create_correction and archive_review; the creation
+    # pin is consumed by create_review and by the attestation itself.
+    assert source.count("_require_reviewer_execution_attestation(") == 3
+    assert source.count("_require_reviewer_creation_pin(") == 3
+    assert source.count("_formal_review_metadata_errors(") == 4
 
 
 def test_a7_runtime_passes_on_compliant_fixture(tmp_path):
